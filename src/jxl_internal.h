@@ -305,16 +305,161 @@ typedef struct {
 } jxl_dec;
 
 int jxl_dec_init(jxl_ctx *ctx, jxl_dec *dec, jxl_br *br, uint32_t num_dist);
+void jxl_dec_begin(jxl_dec *dec, jxl_br *br);
 void jxl_dec_free(jxl_dec *dec);
 uint32_t jxl_dec_read(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx);
 uint32_t jxl_dec_read_mult(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx,
                            uint32_t dist_multiplier);
+/* Same, but the caller already resolved the context to a cluster (the MA
+   tree stores cluster indices directly in its leaves). */
+uint32_t jxl_dec_read_clustered(jxl_dec *dec, jxl_br *br, uint32_t cluster,
+                                uint32_t dist_multiplier);
 int jxl_dec_finalize(jxl_dec *dec);
 
 int jxl_read_clusters(jxl_ctx *ctx, jxl_br *br, uint32_t num_dist,
                       uint8_t *clusters, uint32_t *num_clusters_out);
 int jxl_read_permutation(jxl_ctx *ctx, jxl_dec *dec, jxl_br *br, uint32_t size,
                          uint32_t skip, uint32_t *out);
+
+/* ===================================================================== */
+/* modular -- MA trees, predictors, transforms, channel decoding           */
+/* ===================================================================== */
+
+typedef struct {
+    uint32_t p1, p2, p3a, p3b, p3c, p3d, p3e;
+    uint32_t w0, w1, w2, w3;
+} jxl_wp_header;
+
+/* Predictor ids, as encoded in MA tree leaves. */
+typedef enum {
+    JXL_PRED_ZERO = 0,
+    JXL_PRED_WEST,
+    JXL_PRED_NORTH,
+    JXL_PRED_AVG_W_N,
+    JXL_PRED_SELECT,
+    JXL_PRED_GRADIENT,
+    JXL_PRED_SELF_CORRECTING,
+    JXL_PRED_NORTH_EAST,
+    JXL_PRED_NORTH_WEST,
+    JXL_PRED_WEST_WEST,
+    JXL_PRED_AVG_W_NW,
+    JXL_PRED_AVG_N_NW,
+    JXL_PRED_AVG_N_NE,
+    JXL_PRED_AVG_ALL
+} jxl_predictor;
+
+typedef struct {
+    int32_t property;     /* -1 marks a leaf */
+    int32_t value;
+    uint32_t left, right;
+    uint8_t cluster;
+    uint8_t predictor;
+    int32_t offset;
+    uint32_t multiplier;
+} jxl_ma_node;
+
+typedef struct {
+    jxl_ma_node *nodes;
+    uint32_t count;
+    uint32_t root;
+    jxl_dec dec;          /* histograms for the sample stream */
+    int valid;
+} jxl_ma_config;
+
+int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
+                       size_t node_limit);
+void jxl_ma_config_free(jxl_ctx *ctx, jxl_ma_config *ma);
+
+/* A channel: a view (pointer + stride) into some owning buffer. */
+typedef struct {
+    int32_t *data;
+    size_t stride;         /* in int32_t units */
+    uint32_t w, h;
+    int hshift, vshift;
+    uint32_t ow, oh;       /* size before the shift was applied */
+} jxl_mchan;
+
+typedef struct {
+    int horizontal, in_place;
+    uint32_t begin_c, num_c;
+} jxl_sq_param;
+
+typedef struct {
+    int kind;              /* 0 = RCT, 1 = palette, 2 = squeeze */
+    uint32_t begin_c;
+    uint32_t rct_type;
+    uint32_t num_c, nb_colours, nb_deltas;
+    uint8_t d_pred;
+    jxl_sq_param *sp;
+    uint32_t nsp;
+    /* palette runtime state */
+    int32_t *pal_buf;      /* nb_colours * num_c, owned */
+    jxl_mchan pal;
+    jxl_mchan *saved;      /* member channels removed from the list */
+    uint32_t nsaved;
+} jxl_transform;
+
+typedef struct {
+    jxl_mchan *chans;
+    uint32_t n;
+    uint32_t cap;
+    uint32_t nb_meta;
+} jxl_chanlist;
+
+typedef struct {
+    int use_global_tree;
+    jxl_wp_header wp;
+    uint32_t ntransforms;
+    jxl_transform *transforms;
+} jxl_modular_header;
+
+/* Declared channel geometry, before any transform. */
+typedef struct {
+    uint32_t w, h;
+    int hshift, vshift;
+} jxl_mchan_spec;
+
+typedef struct {
+    jxl_ctx *ctx;
+    jxl_modular_header header;
+    jxl_ma_config *ma;         /* global config, or &local */
+    jxl_ma_config local;
+    int has_local;
+    uint32_t group_dim;
+    uint32_t bit_depth;
+
+    jxl_mchan *base;           /* declared channels, each owning a buffer */
+    uint32_t nbase;
+    int32_t **bufs;
+    uint32_t nbufs;
+} jxl_modular;
+
+/* Reads the modular header (transforms + optional local MA tree) and
+   allocates the declared channels. nspecs == 0 makes an empty image. */
+int jxl_modular_init(jxl_ctx *ctx, jxl_modular *m, jxl_br *br,
+                     const jxl_mchan_spec *specs, uint32_t nspecs,
+                     jxl_ma_config *global_ma, uint32_t group_dim,
+                     uint32_t bit_depth);
+/* Same, but over channel views that already exist (a group's sub-stream). */
+int jxl_modular_init_over(jxl_ctx *ctx, jxl_modular *m, jxl_br *br,
+                          const jxl_mchan *chans, uint32_t nchans,
+                          jxl_ma_config *global_ma, uint32_t group_dim,
+                          uint32_t bit_depth);
+void jxl_modular_free(jxl_ctx *ctx, jxl_modular *m);
+
+/* Applies every transform to the channel list, producing the list of
+   channels that are actually coded. */
+int jxl_modular_transform_channels(jxl_ctx *ctx, jxl_modular *m,
+                                   jxl_chanlist *cl);
+/* Undoes every transform, writing back into the declared channels. */
+int jxl_modular_inverse(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl);
+
+/* Decodes one modular stream into the given channel list. */
+int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
+                       jxl_br *br, uint32_t stream_idx);
+
+void jxl_chanlist_free(jxl_ctx *ctx, jxl_chanlist *cl);
+int jxl_chanlist_push(jxl_ctx *ctx, jxl_chanlist *cl, const jxl_mchan *ch);
 
 /* ===================================================================== */
 /* frame -- frame header, restoration filters, table of contents          */
@@ -450,6 +595,33 @@ uint32_t jxl_frame_num_groups(const jxl_frame_header *fh);
 uint32_t jxl_frame_num_lf_groups(const jxl_frame_header *fh);
 uint32_t jxl_frame_groups_per_row(const jxl_frame_header *fh);
 uint32_t jxl_frame_lf_groups_per_row(const jxl_frame_header *fh);
+
+/* ===================================================================== */
+/* decode -- frame decoding into float planes                             */
+/* ===================================================================== */
+
+typedef struct {
+    float *data;
+    uint32_t w, h;
+    size_t stride;      /* in floats */
+} jxl_fplane;
+
+/* One decoded frame: color planes first, then the extra channels. Planes
+   can differ in size when a channel is subsampled. */
+typedef struct {
+    jxl_ctx *ctx;
+    jxl_fplane *plane;
+    uint32_t nplane;
+    uint32_t ncolor;
+    uint32_t w, h;      /* the frame's color-plane dimensions */
+} jxl_fimage;
+
+int jxl_fimage_alloc(jxl_ctx *ctx, jxl_fimage *img, uint32_t nplane);
+int jxl_fplane_alloc(jxl_ctx *ctx, jxl_fplane *p, uint32_t w, uint32_t h);
+void jxl_fimage_free(jxl_ctx *ctx, jxl_fimage *img);
+
+int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
+                     const jxl_toc *toc, jxl_fimage *out);
 
 /* ===================================================================== */
 /* doc -- top level state                                                 */

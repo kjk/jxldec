@@ -11,6 +11,7 @@ export const SRCS = [
   "src/icc.c",
   "src/frame.c",
   "src/modular.c",
+  "src/decode.c",
   "src/vardct.c",
   "src/dct.c",
   "src/filter.c",

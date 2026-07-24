@@ -393,7 +393,8 @@ static int pfx_parse(jxl_ctx *ctx, jxl_br *br, jxl_pfx_hist *h,
 
 #define ANS_LOG_TAB_SIZE 12
 #define ANS_TAB_SIZE (1 << ANS_LOG_TAB_SIZE)
-#define ANS_SIGNATURE 0x13000
+/* A well-formed ANS stream ends with the state back at this value. */
+#define ANS_SIGNATURE 0x130000
 
 static uint32_t ans_read_u8(jxl_br *br) {
     if (jxl_br_bool(br)) {
@@ -773,6 +774,7 @@ int jxl_read_clusters(jxl_ctx *ctx, jxl_br *br, uint32_t num_dist,
         } else {
             if (jxl_dec_init(ctx, &sub, br, 1) != 0) return -1;
         }
+        jxl_dec_begin(&sub, br);
         for (i = 0; i < num_dist; i++) {
             uint32_t v = jxl_dec_read(&sub, br, 0);
             if (v > 255 || br->err) {
@@ -879,9 +881,20 @@ static int dec_parse_inner(jxl_ctx *ctx, jxl_dec *dec, jxl_br *br,
                 return -1;
             }
         }
-        dec->state = jxl_br_read(br, 32);
     }
     return br->err ? -1 : 0;
+}
+
+/* Start reading an entropy-coded stream: ANS streams begin with a 32-bit
+   initial state, and the LZ77 window starts empty. Prefix-code streams only
+   need the state reset. Must be called once per stream, right where libjxl
+   constructs its ANSSymbolReader. */
+void jxl_dec_begin(jxl_dec *dec, jxl_br *br) {
+    if (!dec->use_prefix) dec->state = jxl_br_read(br, 32);
+    dec->num_to_copy = 0;
+    dec->copy_pos = 0;
+    dec->num_decoded = 0;
+    dec->err = 0;
 }
 
 int jxl_dec_init(jxl_ctx *ctx, jxl_dec *dec, jxl_br *br, uint32_t num_dist) {
@@ -913,13 +926,12 @@ static uint32_t dec_read_symbol(jxl_dec *dec, jxl_br *br, uint32_t cluster) {
     return ans_read_symbol(&dec->ans[cluster], br, &dec->state);
 }
 
-uint32_t jxl_dec_read_mult(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx,
-                           uint32_t dist_multiplier) {
-    uint32_t cluster;
+/* Reads one integer using an already-resolved cluster index. */
+uint32_t jxl_dec_read_clustered(jxl_dec *dec, jxl_br *br, uint32_t cluster,
+                                uint32_t dist_multiplier) {
     uint32_t r;
 
-    if (ctx_idx >= dec->num_dist) { dec->err = 1; return 0; }
-    cluster = dec->clusters[ctx_idx];
+    if (cluster >= dec->num_clusters) { dec->err = 1; return 0; }
 
     if (!dec->lz77_enabled) {
         uint32_t token = dec_read_symbol(dec, br, cluster);
@@ -976,6 +988,13 @@ uint32_t jxl_dec_read_mult(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx,
     dec->window[dec->num_decoded & LZ77_WINDOW_MASK] = r;
     dec->num_decoded++;
     return r;
+}
+
+uint32_t jxl_dec_read_mult(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx,
+                           uint32_t dist_multiplier) {
+    if (ctx_idx >= dec->num_dist) { dec->err = 1; return 0; }
+    return jxl_dec_read_clustered(dec, br, dec->clusters[ctx_idx],
+                                  dist_multiplier);
 }
 
 uint32_t jxl_dec_read(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx) {

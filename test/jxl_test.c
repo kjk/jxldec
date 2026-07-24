@@ -1,11 +1,11 @@
 /* jxl_test.c -- CLI harness for the C JPEG XL decoder (jbig2dec-flavored).
  *
  *   jxl_test -info in.jxl
- *   jxl_test -out out.ppm in.jxl          (PGM for grayscale, PPM for color)
- *   jxl_test -frame N -out out.ppm in.jxl
+ *   jxl_test -out out.pam in.jxl
+ *   jxl_test -frame N -out out.pam in.jxl
  *
- * Writes binary PNM so the output can be compared byte-for-byte against
- * `djxl in.jxl out.ppm`.
+ * Writes binary PAM, the same thing `djxl in.jxl out.pam` produces, so the
+ * two can be compared byte for byte.
  */
 #include "jxl.h"
 #include "jxl_internal.h"
@@ -133,32 +133,49 @@ static int cmd_frames(jxl_ctx *ctx, const uint8_t *data, size_t len) {
     return 0;
 }
 
-static int write_pnm(const char *path, const jxl_image *img) {
+/* Binary PAM (P7), the format djxl writes for a ".pam" output path -- every
+   channel count and both bit depths, so files compare byte for byte. */
+static int write_pam(const char *path, const jxl_image *img) {
     FILE *f = fopen(path, "wb");
     int comps, maxval, y;
+    const char *tuple;
     if (!f) {
         fprintf(stderr, "cannot write %s\n", path);
         return 1;
     }
     switch (img->format) {
-        case JXL_FORMAT_GRAY8: comps = 1; maxval = 255; break;
-        case JXL_FORMAT_GRAY16: comps = 1; maxval = 65535; break;
-        case JXL_FORMAT_RGB24: comps = 3; maxval = 255; break;
-        case JXL_FORMAT_RGB48: comps = 3; maxval = 65535; break;
+        case JXL_FORMAT_GRAY8:
+            comps = 1; maxval = 255; tuple = "GRAYSCALE"; break;
+        case JXL_FORMAT_GRAY16:
+            comps = 1; maxval = 65535; tuple = "GRAYSCALE"; break;
+        case JXL_FORMAT_RGB24:
+            comps = 3; maxval = 255; tuple = "RGB"; break;
+        case JXL_FORMAT_RGB48:
+            comps = 3; maxval = 65535; tuple = "RGB"; break;
+        case JXL_FORMAT_GRAYA8:
+            comps = 2; maxval = 255; tuple = "GRAYSCALE_ALPHA"; break;
+        case JXL_FORMAT_GRAYA16:
+            comps = 2; maxval = 65535; tuple = "GRAYSCALE_ALPHA"; break;
+        case JXL_FORMAT_RGBA32:
+            comps = 4; maxval = 255; tuple = "RGB_ALPHA"; break;
+        case JXL_FORMAT_RGBA64:
+            comps = 4; maxval = 65535; tuple = "RGB_ALPHA"; break;
         default:
-            fprintf(stderr, "pnm: unsupported format %d\n", (int)img->format);
+            fprintf(stderr, "pam: unsupported format %d\n", (int)img->format);
             fclose(f);
             return 1;
     }
-    fprintf(f, "P%d\n%d %d\n%d\n", comps == 1 ? 5 : 6, img->width, img->height,
-            maxval);
+    fprintf(f,
+            "P7\nWIDTH %d\nHEIGHT %d\nDEPTH %d\nMAXVAL %d\nTUPLTYPE %s\n"
+            "ENDHDR\n",
+            img->width, img->height, comps, maxval, tuple);
     if (maxval == 255) {
         for (y = 0; y < img->height; y++) {
             fwrite(img->data + (size_t)y * img->stride, 1,
                    (size_t)img->width * comps, f);
         }
     } else {
-        /* PNM is big-endian; our 16-bit output is native-endian. */
+        /* PAM is big-endian; our 16-bit output is native-endian. */
         int x;
         for (y = 0; y < img->height; y++) {
             const uint16_t *row = (const uint16_t *)(img->data + (size_t)y * img->stride);
@@ -216,7 +233,7 @@ int main(int argc, char **argv) {
         jxl_image *img = NULL;
         if (doc) img = jxl_frame_render(doc, frame_no, JXL_FORMAT_NATIVE);
         if (!img) rc = 1;
-        else rc = write_pnm(out_path, img);
+        else rc = write_pam(out_path, img);
         jxl_image_destroy(ctx, img);
         jxl_doc_close(doc);
     }
