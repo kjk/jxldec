@@ -1,0 +1,15 @@
+deps/
+out/
+dist/
+fuzz/corpus/
+*.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.ppm
+*.pgm
+*.pnm
+*.png
