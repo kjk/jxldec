@@ -502,16 +502,32 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         return -1;
     }
 
-    /* Extra channels carrying a different upsampling factor from the colour
-       channels have to be upsampled separately and earlier (libjxl's
-       !late_ec_upsample path). That is not implemented, and decoding it as if
-       the factors matched would silently misplace the channel, so refuse. */
+    /* Two things about extra channels we decline rather than get wrong.
+       Every other type -- depth, selection mask, CFA, thermal, black -- is
+       carried through as a plane, which is what libjxl does with it too. */
     for (i = 0; i < meta->num_extra; i++) {
+        /* A different upsampling factor from the colour channels needs a
+           separate, earlier pass (libjxl's !late_ec_upsample path). Decoding
+           it as if the factors matched would silently misplace the channel. */
         if (fh->ec_upsampling[i] != fh->upsampling) {
             JXL_ERR(ctx, "frame: extra channel %u upsamples by %u but the "
                          "colour channels by %u; not supported",
                     (unsigned)i, (unsigned)fh->ec_upsampling[i],
                     (unsigned)fh->upsampling);
+            return -1;
+        }
+        /* Spot colour has to be mixed into the colour channels after the
+           colour transform -- libjxl's stage_spot.cc, which is simply
+              mix = spot[3] * s[x];  p[c][x] = mix * spot[c] + (1-mix) * p[c][x]
+           for c in 0..2. Ten lines, deliberately not written: nothing in
+           libjxl's testdata carries a spot channel and cjxl cannot produce
+           one, so it would be untested code that merely looks handled.
+           Carrying the channel through instead would leave the colour
+           silently unmixed, so refuse until there is something to verify
+           against. */
+        if (meta->ec_info[i].type == JXL_EC_SPOT) {
+            JXL_ERR(ctx, "frame: extra channel %u is a spot colour; "
+                         "not supported", (unsigned)i);
             return -1;
         }
     }

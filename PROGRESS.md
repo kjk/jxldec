@@ -131,6 +131,44 @@ rather than overhead-bound. Two further options, neither taken:
 
 ## Log
 
+### The corpus stopped hiding what it could not encode
+`corpusFiles` did `if (!runCjxl(...)) continue;`, so a source cjxl refused
+vanished from the corpus with no signal at all -- the same silent-coverage-loss
+shape as the basename collision below. It now collects cjxl's own reason for
+each failure and prints them. Nine, immediately:
+
+- **Seven grayscale sources fail `v_icc`** (`JxlEncoderSetICCProfile() failed`)
+  -- an RGB profile cannot be attached to a gray image, so that preset has
+  been covering 66 sources, not 73, for as long as it has existed. Not worth
+  working around: the only gray profile in Compact-ICC-Profiles is sGrey, and
+  cjxl reduces it to the enumerated Grayscale/D65/sRGB fields, so it never
+  takes the want_icc path the preset exists to exercise.
+- **`flower_small.cmyk.jpg`** -- this cjxl build cannot read a CMYK JPEG at
+  all ("Getting pixel data failed", with or without
+  `--allow_jpeg_reconstruction 0` or `--lossless_jpeg=0`), so there is no CMYK
+  coverage to be had from it.
+- **`flower.png.im_q85_rgb_subsample_blue.jpg`** -- its encoder rejects it.
+
+All three are libjxl-side limits rather than ours. The point is not that they
+are fixable; it is that the corpus is now 1040 files *and says so* when it
+would otherwise have been more.
+
+### Spot colour is refused, not guessed at
+`headers.c` parses the four spot-colour floats and nothing consumed them, so a
+file with a spot channel would have decoded with the colour silently unmixed
+-- the same shape as the upsampling bug. libjxl mixes it after the colour
+transform (`stage_spot.cc`), and the whole operation is
+
+    mix = spot[3] * s[x];   p[c][x] = mix * spot[c] + (1 - mix) * p[c][x]
+
+for the three colour channels. Ten lines, deliberately not written: nothing in
+libjxl's testdata carries a spot channel and cjxl cannot emit one, so it would
+be untested code that merely looks handled -- which is precisely what the two
+entries below were. `jxl_frame_decode` refuses such a frame instead. Every
+other extra-channel type (depth, selection mask, CFA, thermal, black) is
+carried through as a plane, which is what libjxl does with it too; only
+kSpotColor gets a compositing stage there.
+
 ### Upsampling was missing entirely, and failed silently
 `cjxl --resampling=2|4|8` codes the frame at 1/2, 1/4 or 1/8 resolution and
 leaves the decoder to upsample. We never did. `CustomTransformData` was parsed,

@@ -72,9 +72,11 @@ tolerance too, and like it we gate on RMS and peak together rather than peak
 alone (`-rms`, default 0.6; `-tol`, default 3).
 
 Not implemented: encoding, JPEG reconstruction (`jbrd` boxes are located but
-not applied), and multithreading. An extra channel whose upsampling factor
-differs from the colour channels' is rejected with an error rather than
-decoded — rare, and it needs a separate earlier upsampling pass.
+not applied), and multithreading. Two extra-channel cases are rejected with an
+error rather than decoded wrongly: a channel whose upsampling factor differs
+from the colour channels', and a spot-colour channel (which has to be mixed
+into the colour channels). Neither is producible by `cjxl`, so neither can be
+verified against `djxl` yet.
 
 ## Performance
 `bun cmd/bench.ts -all` links the `dist/` amalgamation and libjxl's static

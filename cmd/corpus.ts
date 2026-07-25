@@ -106,16 +106,19 @@ export function sourceImages(): string[] {
   return out.sort();
 }
 
-function runCjxl(src: string, dst: string, args: string[]): boolean {
+/** Returns null when the file was written, else cjxl's complaint. */
+function runCjxl(src: string, dst: string, args: string[]): string | null {
   const r = Bun.spawnSync({
     cmd: [refTool("cjxl"), src, dst, ...args],
     stdout: "ignore",
     stderr: "pipe",
   });
-  if (r.exitCode !== 0 || !existsSync(dst)) {
-    return false;
-  }
-  return true;
+  if (r.exitCode === 0 && existsSync(dst)) return null;
+  const lines = r.stderr.toString().trim().split("\n")
+    .map((l) => l.trim()).filter((l) => l.length > 0);
+  // cjxl's last line is the summary failure ("EncodeImageJXL() failed."); the
+  // line before it is the one that says why.
+  return lines.length > 1 ? lines[lines.length - 2] : (lines[0] ?? `exit ${r.exitCode}`);
 }
 
 /** Generates (once) and returns every corpus .jxl file. */
@@ -126,6 +129,16 @@ export function corpusFiles(presets = PRESETS.map((p) => p.name)): string[] {
   mkdirSync(GEN_DIR, { recursive: true });
   const srcs = sourceImages();
   const out: string[] = [];
+  // A source cjxl cannot encode used to `continue` in silence, so the corpus
+  // quietly shrank and nothing said which coverage had gone. Collect the
+  // reasons and print them: a file that stops being testable is news.
+  //
+  // The seven this currently reports for v_icc are the grayscale sources --
+  // JxlEncoderSetICCProfile() rejects an RGB profile for them. Not worth
+  // working around: the only gray profile in Compact-ICC-Profiles is sGrey,
+  // and cjxl reduces that to the enumerated Grayscale/D65/sRGB fields, so it
+  // never takes the want_icc path the preset exists to exercise.
+  const skipped: string[] = [];
   let generated = 0;
   for (const src of srcs) {
     const base = basename(src).replace(/\.pam$/, "");
@@ -133,7 +146,11 @@ export function corpusFiles(presets = PRESETS.map((p) => p.name)): string[] {
       if (!presets.includes(preset.name)) continue;
       const dst = join(GEN_DIR, `${base}.${preset.name}.jxl`);
       if (!existsSync(dst)) {
-        if (!runCjxl(src, dst, preset.args)) continue;
+        const err = runCjxl(src, dst, preset.args);
+        if (err) {
+          skipped.push(`${base}.${preset.name}: ${err}`);
+          continue;
+        }
         generated++;
         if (generated % 25 === 0) console.log(`corpus: generated ${generated} files...`);
       }
@@ -142,12 +159,22 @@ export function corpusFiles(presets = PRESETS.map((p) => p.name)): string[] {
   }
   // Transcoded JPEGs are the only source of YCbCr frames, and testdata's set
   // covers every chroma subsampling mode.
+  //
+  // Two of testdata's 21 never make it: flower_small.cmyk.jpg, because this
+  // cjxl build cannot read a CMYK JPEG at all ("Getting pixel data failed",
+  // with or without --allow_jpeg_reconstruction 0 / --lossless_jpeg=0), and
+  // flower.png.im_q85_rgb_subsample_blue.jpg, which its encoder rejects. Both
+  // are libjxl-side limits, not ours -- they are reported, not worked around.
   for (const jpg of walk(join(LIBJXL_DIR, "testdata"), (n) =>
     /\.jpe?g$/i.test(n),
   ).sort()) {
     const dst = join(GEN_DIR, `${basename(jpg).replace(/\.jpe?g$/i, "")}.jpeg.jxl`);
     if (!existsSync(dst)) {
-      if (!runCjxl(jpg, dst, [])) continue;
+      const err = runCjxl(jpg, dst, []);
+      if (err) {
+        skipped.push(`${relative(LIBJXL_DIR, jpg).replaceAll("\\", "/")}: ${err}`);
+        continue;
+      }
       generated++;
     }
     out.push(dst);
@@ -159,6 +186,10 @@ export function corpusFiles(presets = PRESETS.map((p) => p.name)): string[] {
     n.toLowerCase().endsWith(".jxl"),
   ));
   if (generated) console.log(`corpus: generated ${generated} file(s)`);
+  if (skipped.length) {
+    console.warn(`corpus: ${skipped.length} source(s) cjxl could not encode:`);
+    for (const s of skipped) console.warn(`  ${s}`);
+  }
   return out.sort();
 }
 
