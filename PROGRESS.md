@@ -53,7 +53,7 @@ is met for sRGB content.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-821-file corpus we are **2.54x libjxl** (was 3.22x, then 2.64x). libjxl is
+821-file corpus we are **2.33x libjxl** (was 3.22x, then 2.64x). libjxl is
 AVX2; we are scalar C, so a constant factor is expected.
 
 `bun cmd/prof.ts <file.jxl>` profiles our decoder alone through the sibling
@@ -171,6 +171,37 @@ Interleaved A/B, 5 runs, two passes, libjxl column flat throughout:
 | `flower_alpha.m_e9` | 1249ms | 1208ms |
 | `flower_alpha.m_e3` (control) | 852ms | 847ms |
 | total of the five | 4549ms | 4454ms (-2.1%) |
+
+### Reading all three tests up front, not two of them in sequence
+Flattening halved the *loads*, but the chain that was left ran
+`eval -> select -> eval -> load`: picking the second test only after the first
+had decided made the second property read depend on the first result, so two
+L1 loads that could have issued together were serialised.
+
+Both candidate tests are already in the entry, so read all three properties up
+front and select afterwards. The three loads are independent and issue
+together; the chain per entry becomes one property read plus the node load.
+Evaluating the not-taken branch's property is safe -- `props_get_extra`
+bounds-checks and returns 0 for anything out of range -- and cheap, because
+almost every property is a `cache[]` hit.
+
+This is worth more than the flattening it builds on. Interleaved A/B, 5 runs,
+two passes; absolute times drifted between passes here, so read the ratio
+column, which is measured against libjxl in the same process:
+
+| file | select-then-read | read-then-select |
+|---|---|---|
+| `flower_alpha.lm_d1` | 3.35x, 3.33x | 2.67x, 2.67x |
+| `flower.lm_d1` | 3.30x, 3.20x | 2.53x, 2.61x |
+| `splines.lm_d1` | 4.71x, 4.87x | 3.83x, 3.80x |
+| `flower_alpha.m_e9` | 1.59x, 1.55x | 1.42x, 1.41x |
+| five-file total | 2.44x, 2.40x | 2.08x, 2.11x (-13.6%) |
+| corpus total | 2.54x | **2.33x** |
+
+`ma_get_leaf` drops to 5627 samples and 57.4% self, from 8225 and 65.7%.
+The lesson generalises: in this walk the binding constraint has been the
+*length of the dependency chain* every time, not the instruction count and not
+the footprint.
 
 ### Two tree levels per entry: the walk's chain, halved
 The two shrinks above made the chain *narrower*. This one makes it *shorter*,

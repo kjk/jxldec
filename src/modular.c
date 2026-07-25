@@ -1584,14 +1584,21 @@ static const jxl_ma_leaf *ma_get_leaf(const jxl_ma_config *ma,
     const jxl_ma_flat *flat = ma->flat;
     const jxl_ma_flat *f = flat;
     while (f->property >= 0) {
-        int32_t p = f->property, s;
-        int32_t v = p < 16 ? pr->cache[p]
-                           : props_get_extra(ps, (uint32_t)p - 16);
-        uint32_t o0 = v > f->u.dec.split0 ? 0u : 1u;
-        if (o0) { p = f->u.dec.prop2; s = f->u.dec.split2; }
-        else    { p = f->u.dec.prop1; s = f->u.dec.split1; }
-        v = p < 16 ? pr->cache[p] : props_get_extra(ps, (uint32_t)p - 16);
-        f = &flat[f->u.dec.child + 2 * o0 + (v > s ? 0u : 1u)];
+        int32_t p0 = f->property, p1 = f->u.dec.prop1, p2 = f->u.dec.prop2;
+        int32_t v0, v1, v2;
+        uint32_t o0, o1;
+
+        /* All three tests are read up front rather than picking the second
+           one after the first has decided. The three loads are independent,
+           so they issue together; selecting first would make the second
+           address depend on the first result and serialise them. */
+        v0 = p0 < 16 ? pr->cache[p0] : props_get_extra(ps, (uint32_t)p0 - 16);
+        v1 = p1 < 16 ? pr->cache[p1] : props_get_extra(ps, (uint32_t)p1 - 16);
+        v2 = p2 < 16 ? pr->cache[p2] : props_get_extra(ps, (uint32_t)p2 - 16);
+        o0 = v0 > f->u.dec.split0 ? 0u : 1u;
+        o1 = o0 ? (v2 > f->u.dec.split2 ? 0u : 1u)
+                : (v1 > f->u.dec.split1 ? 0u : 1u);
+        f = &flat[f->u.dec.child + 2 * o0 + o1];
     }
     return &f->u.leaf;
 }
