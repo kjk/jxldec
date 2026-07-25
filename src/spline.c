@@ -237,13 +237,23 @@ static int upsample_points(jxl_ctx *ctx, const jxl_quant_spline *qs,
 
 int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,
                        const jxl_frame_header *fh, float corr_x, float corr_b) {
-    uint32_t si;
+    uint32_t si, cw, ch;
     int rc = -1;
     jxl_pt *up = NULL;
     jxl_pt *arc_pt = NULL;
     float *arc_len = NULL;
 
     if (img->ncolor < 3) return 0;
+
+    /* The three colour planes share dimensions; taking the smallest lets each
+       sample's bounding box be clamped once instead of bounds-checking every
+       pixel of every plane. fh->width/height bound it too. */
+    cw = fh->width;
+    ch = fh->height;
+    for (si = 0; si < 3; si++) {
+        if (img->plane[si].w < cw) cw = img->plane[si].w;
+        if (img->plane[si].h < ch) ch = img->plane[si].h;
+    }
 
     for (si = 0; si < sp->n; si++) {
         const jxl_quant_spline *qs = &sp->splines[si];
@@ -330,6 +340,7 @@ int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,
         for (i = 0; i < nsamples; i++) {
             float from_start = (float)i / total_arclength;
             float t, sigma, inv_sigma, values[3], max_color, max_distance;
+            float vs[3], px, py;
             int32_t xb, xe, yb, ye, x, y;
 
             if (from_start > 1.0f) from_start = 1.0f;
@@ -340,38 +351,53 @@ int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,
             for (c = 0; c < 3; c++) {
                 values[c] = continuous_idct(xyb_dct[c], t) * arc_len[i];
             }
+            /* The radius past which the Gaussian has dropped below 1e-3 of
+               max_color. libjxl's formula, which takes the log of max_color;
+               jxl-oxide uses max_color itself, giving a radius ~1.7x larger
+               and so ~3x the pixels for the same output. The guard keeps the
+               root real for implausibly bright splines. */
             max_color = 0.01f;
             for (c = 0; c < 3; c++) {
-                if (values[c] > max_color) max_color = values[c];
+                float a = fabsf(values[c]);
+                if (a > max_color) max_color = a;
             }
-            max_distance =
-                sqrtf(2.0f * (logf(10.0f) * 3.0f + max_color)) * fabsf(sigma);
+            max_distance = -2.0f * sigma * sigma *
+                           (logf(0.1f) * 3.0f - logf(max_color));
+            max_distance = max_distance > 0.0f ? sqrtf(max_distance) : 0.0f;
 
-            xb = (int32_t)floorf(arc_pt[i].x - max_distance + 0.5f);
-            xe = (int32_t)floorf(arc_pt[i].x + max_distance + 1.5f);
-            yb = (int32_t)floorf(arc_pt[i].y - max_distance + 0.5f);
-            ye = (int32_t)floorf(arc_pt[i].y + max_distance + 1.5f);
+            px = arc_pt[i].x;
+            py = arc_pt[i].y;
+            xb = (int32_t)floorf(px - max_distance + 0.5f);
+            xe = (int32_t)floorf(px + max_distance + 1.5f);
+            yb = (int32_t)floorf(py - max_distance + 0.5f);
+            ye = (int32_t)floorf(py + max_distance + 1.5f);
             if (xb < 0) xb = 0;
             if (yb < 0) yb = 0;
-            if (xe > (int32_t)fh->width) xe = (int32_t)fh->width;
-            if (ye > (int32_t)fh->height) ye = (int32_t)fh->height;
+            if (xe > (int32_t)cw) xe = (int32_t)cw;
+            if (ye > (int32_t)ch) ye = (int32_t)ch;
 
-            for (c = 0; c < 3; c++) {
-                jxl_fplane *pl = &img->plane[c];
-                for (y = yb; y < ye; y++) {
-                    float *row;
-                    if ((uint32_t)y >= pl->h) break;
-                    row = pl->data + (size_t)y * pl->stride;
-                    for (x = xb; x < xe; x++) {
-                        float dx, dy, distance, factor, extra;
-                        if ((uint32_t)x >= pl->w) break;
-                        dx = (float)x - arc_pt[i].x;
-                        dy = (float)y - arc_pt[i].y;
-                        distance = sqrtf(dx * dx + dy * dy);
-                        factor = spline_erf((0.5f * distance + 0.35355338f) * inv_sigma) -
-                                 spline_erf((0.5f * distance - 0.35355338f) * inv_sigma);
-                        extra = 0.25f * values[c] * sigma * factor * factor;
-                        row[x] += extra;
+            for (c = 0; c < 3; c++) vs[c] = 0.25f * values[c] * sigma;
+
+            /* The distance and the error-function pair depend only on the
+               sample position, so the channel loop is innermost: one sqrt and
+               two spline_erf calls per pixel instead of three of each. */
+            for (y = yb; y < ye; y++) {
+                float *rows[3];
+                float dy = (float)y - py;
+                float dy2 = dy * dy;
+                for (c = 0; c < 3; c++) {
+                    rows[c] = img->plane[c].data +
+                              (size_t)y * img->plane[c].stride;
+                }
+                for (x = xb; x < xe; x++) {
+                    float dx = (float)x - px;
+                    float distance = sqrtf(dx * dx + dy2);
+                    float half = 0.5f * distance;
+                    float factor = spline_erf((half + 0.35355338f) * inv_sigma) -
+                                   spline_erf((half - 0.35355338f) * inv_sigma);
+                    float ff = factor * factor;
+                    for (c = 0; c < 3; c++) {
+                        rows[c][x] += vs[c] * ff;
                     }
                 }
             }

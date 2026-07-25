@@ -12,6 +12,7 @@
 #include "jxl_internal.h"
 
 #include <math.h>
+#include <stddef.h>
 
 static uint32_t jxl_mirror(int64_t offset, uint32_t len) {
     for (;;) {
@@ -76,89 +77,142 @@ static const int8_t epf_dist_0[5][2] = {{0,-1},{1,0},{0,0},{-1,0},{0,1}};
 static const int8_t epf_dist_1[5][2] = {{0,-1},{0,0},{0,1},{-1,0},{1,0}};
 static const int8_t epf_dist_2[1][2] = {{0,0}};
 
-static float epf_weight(float dist, float sigma, float step_mul) {
-    float neg_inv_sigma = 6.6f * (0.70710678118654752f - 1.0f) / sigma * step_mul;
-    float w = 1.0f + dist * neg_inv_sigma;
-    return w < 0.0f ? 0.0f : w;
-}
+/* The weight is 1 + dist * (a negative constant / sigma * step_mul). Sigma
+   and step_mul are fixed for a whole sample, so the reciprocal is hoisted out
+   of the tap loop; only the multiply-add stays per tap. */
+#define EPF_SIGMA_MUL (6.6f * (0.70710678118654752f - 1.0f))
 
+/* A sample whose whole footprint is inside the image needs no mirroring, so
+   every neighbour it reads is a fixed sample offset from its centre. Those
+   offsets depend only on the pass, so they are tabulated once per pass. */
 static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                     size_t stride, const float *sigma, uint32_t sigma_stride,
                     const jxl_epf *epf, int step) {
     const int8_t (*kernel)[2];
     const int8_t (*dist_off)[2];
-    int nkernel, ndist;
-    float step_mul;
+    ptrdiff_t koff[12];      /* kernel tap -> sample offset */
+    ptrdiff_t doff[5];       /* SAD footprint tap around the centre */
+    float cscale[3];
+    int nkernel, ndist, pad;
+    float step_mul, border_mul;
     uint32_t x, y;
-    int c;
+    int c, k, d;
 
     if (step == 0) {
         kernel = epf_kernel_2; nkernel = 12;
         dist_off = epf_dist_0; ndist = 5;
         step_mul = epf->pass0_sigma_scale;
+        pad = 3;             /* kernel reaches 2, its footprint one further */
     } else if (step == 1) {
         kernel = epf_kernel_1; nkernel = 4;
         dist_off = epf_dist_1; ndist = 5;
         step_mul = 1.0f;
+        pad = 2;
     } else {
         kernel = epf_kernel_1; nkernel = 4;
         dist_off = epf_dist_2; ndist = 1;
         step_mul = epf->pass2_sigma_scale;
+        pad = 1;
     }
+    border_mul = step_mul * epf->border_sad_mul;
+    for (c = 0; c < 3; c++) cscale[c] = epf->channel_scale[c];
+    for (d = 0; d < ndist; d++)
+        doff[d] = (ptrdiff_t)dist_off[d][1] * (ptrdiff_t)stride + dist_off[d][0];
+    for (k = 0; k < nkernel; k++)
+        koff[k] = (ptrdiff_t)kernel[k][1] * (ptrdiff_t)stride + kernel[k][0];
 
     for (y = 0; y < h; y++) {
         int is_y_border = ((y + 1) & 6u) == 0;
+        /* Rows this close to an edge mirror; they are O(pad) of the image. */
+        int y_inside = (y >= (uint32_t)pad && y + (uint32_t)pad < h);
         const float *sigma_row = sigma + (size_t)(y / 8) * sigma_stride;
+        size_t row = (size_t)y * stride;
         for (x = 0; x < w; x++) {
             float sigma_val = sigma_row[x / 8];
-            float sum_weights = 1.0f;
+            float dist[12];   /* SAD to each kernel tap, all channels folded in */
+            size_t soff[12];  /* kernel tap -> absolute sample index */
             float sum[3];
-            float sm;
-            int k;
+            float sum_weights, inv_w, sm, neg_inv_sigma;
 
             if (sigma_val < 0.3f) {
-                for (c = 0; c < 3; c++) {
-                    out[c][(size_t)y * stride + x] = in[c][(size_t)y * stride + x];
-                }
+                for (c = 0; c < 3; c++) out[c][row + x] = in[c][row + x];
                 continue;
             }
-            if (is_y_border) sm = step_mul * epf->border_sad_mul;
-            else if ((x & 7u) == 0 || (x & 7u) == 7) sm = step_mul * epf->border_sad_mul;
+            if (is_y_border || (x & 7u) == 0 || (x & 7u) == 7) sm = border_mul;
             else sm = step_mul;
+            neg_inv_sigma = EPF_SIGMA_MUL / sigma_val * sm;
 
-            for (c = 0; c < 3; c++) sum[c] = in[c][(size_t)y * stride + x];
+            /* The SADs come first, one channel at a time: a channel's whole
+               footprint then comes from one plane, and its centre samples stay
+               in registers across the taps. Folding the channels into dist[]
+               in channel order keeps the sum bit-identical to doing it per
+               tap, which is what libjxl's vector loop also does. */
+            for (k = 0; k < nkernel; k++) dist[k] = 0.0f;
 
-            for (k = 0; k < nkernel; k++) {
-                int64_t kx = (int64_t)x + kernel[k][0];
-                int64_t ky = (int64_t)y + kernel[k][1];
-                float dist = 0.0f;
-                float weight;
-                int d;
+            if (y_inside && x >= (uint32_t)pad && x + (uint32_t)pad < w) {
+                /* Fast path: nothing mirrors, so every neighbour is a fixed
+                   offset off the centre sample. */
+                for (k = 0; k < nkernel; k++) soff[k] = row + x + koff[k];
                 for (c = 0; c < 3; c++) {
-                    float acc = 0.0f;
+                    const float *p = in[c] + row + x;
+                    float cs = cscale[c];
+                    float cen[5];
+                    for (d = 0; d < ndist; d++) cen[d] = p[doff[d]];
+                    for (k = 0; k < nkernel; k++) {
+                        const float *pk = p + koff[k];
+                        float acc = 0.0f;
+                        for (d = 0; d < ndist; d++)
+                            acc += fabsf(pk[doff[d]] - cen[d]);
+                        dist[k] += cs * acc;
+                    }
+                }
+            } else {
+                /* Slow path for the pad-wide frame around the image, where
+                   coordinates mirror. The mirrored indices do not depend on
+                   the channel, so they are resolved once per sample. */
+                size_t bo[5], ao[12][5];
+                for (d = 0; d < ndist; d++) {
+                    uint32_t bx = jxl_mirror((int64_t)x + dist_off[d][0], w);
+                    uint32_t by = jxl_mirror((int64_t)y + dist_off[d][1], h);
+                    bo[d] = (size_t)by * stride + bx;
+                }
+                for (k = 0; k < nkernel; k++) {
+                    int64_t kx = (int64_t)x + kernel[k][0];
+                    int64_t ky = (int64_t)y + kernel[k][1];
                     for (d = 0; d < ndist; d++) {
                         uint32_t ax = jxl_mirror(kx + dist_off[d][0], w);
                         uint32_t ay = jxl_mirror(ky + dist_off[d][1], h);
-                        uint32_t bx = jxl_mirror((int64_t)x + dist_off[d][0], w);
-                        uint32_t by = jxl_mirror((int64_t)y + dist_off[d][1], h);
-                        acc += fabsf(in[c][(size_t)ay * stride + ax] -
-                                     in[c][(size_t)by * stride + bx]);
+                        ao[k][d] = (size_t)ay * stride + ax;
                     }
-                    dist += epf->channel_scale[c] * acc;
+                    soff[k] = (size_t)jxl_mirror(ky, h) * stride +
+                              jxl_mirror(kx, w);
                 }
-                weight = epf_weight(dist, sigma_val, sm);
+                for (c = 0; c < 3; c++) {
+                    const float *p = in[c];
+                    float cs = cscale[c];
+                    float cen[5];
+                    for (d = 0; d < ndist; d++) cen[d] = p[bo[d]];
+                    for (k = 0; k < nkernel; k++) {
+                        float acc = 0.0f;
+                        for (d = 0; d < ndist; d++)
+                            acc += fabsf(p[ao[k][d]] - cen[d]);
+                        dist[k] += cs * acc;
+                    }
+                }
+            }
+
+            for (c = 0; c < 3; c++) sum[c] = in[c][row + x];
+            sum_weights = 1.0f;
+            for (k = 0; k < nkernel; k++) {
+                float weight = 1.0f + dist[k] * neg_inv_sigma;
+                if (weight < 0.0f) weight = 0.0f;
                 sum_weights += weight;
-                {
-                    uint32_t mx = jxl_mirror(kx, w);
-                    uint32_t my = jxl_mirror(ky, h);
-                    for (c = 0; c < 3; c++) {
-                        sum[c] += weight * in[c][(size_t)my * stride + mx];
-                    }
-                }
+                for (c = 0; c < 3; c++) sum[c] += weight * in[c][soff[k]];
             }
-            for (c = 0; c < 3; c++) {
-                out[c][(size_t)y * stride + x] = sum[c] / sum_weights;
-            }
+            /* One reciprocal and three multiplies, as libjxl does, rather
+               than three divisions. */
+            inv_w = 1.0f / sum_weights;
+            for (c = 0; c < 3; c++) out[c][row + x] = sum[c] * inv_w;
         }
     }
     return 0;
@@ -174,7 +228,12 @@ int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
     scratch[0] = scratch[1] = scratch[2] = NULL;
     if (!epf->enabled || w == 0 || h == 0) return 0;
     for (c = 0; c < 3; c++) {
-        scratch[c] = (float *)jxl_calloc(ctx, stride * h, sizeof(float));
+        /* Every pass writes all w columns of every row, so there is nothing
+           to zero; only the row padding stays undefined, and the copy back
+           below is per row so it never travels. */
+        size_t n;
+        if (!jxl_size_mul(stride * h, sizeof(float), &n)) goto done;
+        scratch[c] = (float *)jxl_malloc(ctx, n);
         if (!scratch[c]) goto done;
     }
     for (c = 0; c < 3; c++) { in[c] = plane[c]; out[c] = scratch[c]; }
@@ -192,8 +251,11 @@ int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
 
     /* `in` holds the result; copy it back when it is the scratch buffer. */
     for (c = 0; c < 3; c++) {
-        if (in[c] != plane[c]) {
-            memcpy(plane[c], in[c], stride * h * sizeof(float));
+        uint32_t y;
+        if (in[c] == plane[c]) continue;
+        for (y = 0; y < h; y++) {
+            memcpy(plane[c] + (size_t)y * stride, in[c] + (size_t)y * stride,
+                   (size_t)w * sizeof(float));
         }
     }
     rc = 0;

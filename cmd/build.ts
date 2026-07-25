@@ -276,6 +276,39 @@ export async function buildBenchHarness(): Promise<string> {
   return exePath;
 }
 
+/** Build jxl_prof: our decoder alone, with debug info so a sampling profiler
+ *  can symbolize it. Objects live in out/prof/ so the release build's
+ *  no-debug-info objects are not clobbered. */
+export async function buildProfHarness(): Promise<string> {
+  if (!isWindows) throw new Error("the profiling harness is MSVC-only for now");
+  await ensureDist();
+  const dir = `${OUT_ROOT}/prof`;
+  const exePath = `${dir}/${binName("jxl_prof")}`;
+  mkdirSync(dir, { recursive: true });
+
+  // -Zi for line-level symbols; -GL (whole-program opt) is dropped because it
+  // inlines across the whole amalgamation and blurs the profile attribution.
+  const clZi = JXLDEC_MSVC_CL_C.replace("-GL", "-Zi -Oy-");
+  const libObj = `${dir}/jxl_dist.obj`;
+  const profObj = `${dir}/jxl_prof.obj`;
+  if (needsRebuild(libObj, DIST_C, DIST_H)) {
+    await runCmd(`cl ${clZi} -Fd${dir}/ -Idist -Fo${libObj} -c dist/jxl.c`, ROOT);
+  }
+  if (needsRebuild(profObj, `${ROOT}/test/jxl_prof.c`, DIST_H)) {
+    await runCmd(
+      `cl ${clZi} -Fd${dir}/ -Idist -Fo${profObj} -c test/jxl_prof.c`,
+      ROOT,
+    );
+  }
+  if (needsRebuild(exePath, libObj, profObj)) {
+    await runCmd(
+      `cl -nologo ${libObj} ${profObj} -Fe:${exePath} -link -DEBUG`,
+      ROOT,
+    );
+  }
+  return exePath;
+}
+
 if (import.meta.main) {
   const args = process.argv.slice(2);
   if (args.includes("-clean")) cleanBuildOutput();

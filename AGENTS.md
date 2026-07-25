@@ -49,6 +49,12 @@ PNGs to PNM in TypeScript. Don't re-investigate this.
 - `bun cmd/bench.ts <selection> [-runs N]` — times our decode against libjxl's,
   both in one process, single-threaded, best of N. Windows/MSVC only: it links
   libjxl's static libraries, which need `-MD` and `-DJXL_STATIC_DEFINE`.
+- `bun cmd/prof.ts <file.jxl> [-runs N]` — sampling profile of *our* decoder
+  alone on one file, via the sibling `../samply` (build it once with
+  `cd ../samply && bun cmd/build.ts -release`). It builds `jxl_prof` with
+  `-Zi` into `out/prof/` and passes samply `-print-agent`, which prints the
+  top self-time functions, the hot source lines and the heaviest call path.
+  Needs Administrator rights and `xperf.exe` from the Windows ADK.
 - `bun cmd/build-dist.ts` — regenerate the `dist/jxl.c` + `dist/jxl.h`
   amalgamation and verify it compiles with every available toolchain.
 
@@ -158,6 +164,14 @@ keep `PROGRESS.md` current; it lists the exact pass rate and every known gap.
   internal boundary. Do not add a new `JXL_*` name to `src/jxl.h`.
 - Dequant matrices are built lazily. Do not make them eager again: all 17
   slots cost ~8ms, which is the entire decode of a small image.
+- The spline `max_distance` follows **libjxl**, not jxl-oxide: jxl-oxide uses
+  `max_color` where libjxl takes `log(max_color)`, inflating the draw radius
+  and the pixel count for output that is identical at 8 bits. Do not "restore"
+  the jxl-oxide form when diffing against that crate.
+- `epf_pass` and `jxl_render_splines` are written so the per-sample float
+  operation order matches what the obvious per-channel loop would produce.
+  Reordering an accumulation there changes pixels; the interior fast path and
+  the mirroring border path in `epf_pass` must stay in step.
 
 **Do not commit automatically.** Make and verify changes, but leave them in the
 working tree; only run `git commit` when the user asks. Never commit

@@ -80,6 +80,11 @@ static float plane_sample(const jxl_fplane *p, uint32_t x, uint32_t y,
     return p->data[(size_t)py * p->stride + px];
 }
 
+/* A plane that plane_sample() would read one-to-one, needing no scaling. */
+static int plane_is_full(const jxl_fplane *p, uint32_t w, uint32_t h) {
+    return p && p->w == w && p->h == h && w != 0 && h != 0;
+}
+
 /* Maps an output coordinate back to the decoded (unoriented) one. */
 static void unapply_orientation(uint32_t orientation, uint32_t sw, uint32_t sh,
                                 uint32_t ox, uint32_t oy, uint32_t *sx,
@@ -125,7 +130,7 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
     uint32_t sw = img->w, sh = img->h;
     uint32_t ow, oh, ox, oy;
     uint32_t orientation = ctx->keep_orientation ? 1 : meta->orientation;
-    int ncomp = 0, wide = 0, has_alpha = 0, gray = 0;
+    int ncomp = 0, wide = 0, has_alpha = 0, gray = 0, direct;
     uint32_t maxval;
     int bgr = ctx->bgr;
 
@@ -147,24 +152,52 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
     }
     maxval = wide ? 65535u : 255u;
 
+    /* With no orientation fixup and every plane at full resolution -- the
+       common case -- an output row maps straight onto one row of each plane,
+       so the coordinate mapping and the subsampling checks drop out and only
+       the row pointers are needed. */
+    direct = (orientation == 1) && plane_is_full(op.r, sw, sh) &&
+             (gray || (plane_is_full(op.g, sw, sh) &&
+                       plane_is_full(op.b, sw, sh))) &&
+             (!op.a || plane_is_full(op.a, sw, sh));
+
     for (oy = 0; oy < oh; oy++) {
         uint8_t *row8 = dst + (size_t)oy * stride;
         uint16_t *row16 = (uint16_t *)row8;
+        const float *pr = NULL, *pg = NULL, *pb = NULL, *pa = NULL;
+        if (direct) {
+            pr = op.r->data + (size_t)oy * op.r->stride;
+            if (!gray) {
+                pg = op.g->data + (size_t)oy * op.g->stride;
+                pb = op.b->data + (size_t)oy * op.b->stride;
+            }
+            if (op.a) pa = op.a->data + (size_t)oy * op.a->stride;
+        }
         for (ox = 0; ox < ow; ox++) {
             uint32_t sx, sy;
             float rv, gv, bv, av = 1.0f;
             uint32_t comps[4];
-            int c;
 
-            unapply_orientation(orientation, sw, sh, ox, oy, &sx, &sy);
-            rv = plane_sample(op.r, sx, sy, sw, sh);
-            if (gray) {
-                gv = bv = rv;
+            if (direct) {
+                rv = pr[ox];
+                if (gray) {
+                    gv = bv = rv;
+                } else {
+                    gv = pg[ox];
+                    bv = pb[ox];
+                }
+                if (pa) av = pa[ox];
             } else {
-                gv = plane_sample(op.g, sx, sy, sw, sh);
-                bv = plane_sample(op.b, sx, sy, sw, sh);
+                unapply_orientation(orientation, sw, sh, ox, oy, &sx, &sy);
+                rv = plane_sample(op.r, sx, sy, sw, sh);
+                if (gray) {
+                    gv = bv = rv;
+                } else {
+                    gv = plane_sample(op.g, sx, sy, sw, sh);
+                    bv = plane_sample(op.b, sx, sy, sw, sh);
+                }
+                if (op.a) av = plane_sample(op.a, sx, sy, sw, sh);
             }
-            if (op.a) av = plane_sample(op.a, sx, sy, sw, sh);
 
             if (gray) {
                 comps[0] = quantize(rv, maxval);
@@ -180,10 +213,20 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
                 comps[2] = quantize(bv, maxval);
                 if (has_alpha) comps[3] = quantize(av, maxval);
             }
+            /* ncomp is 1..4; predictable tests beat a loop the compiler has
+               to keep general, and the pixel offset is computed once. */
             if (wide) {
-                for (c = 0; c < ncomp; c++) row16[ox * ncomp + c] = (uint16_t)comps[c];
+                uint16_t *o = row16 + (size_t)ox * ncomp;
+                o[0] = (uint16_t)comps[0];
+                if (ncomp > 1) o[1] = (uint16_t)comps[1];
+                if (ncomp > 2) o[2] = (uint16_t)comps[2];
+                if (ncomp > 3) o[3] = (uint16_t)comps[3];
             } else {
-                for (c = 0; c < ncomp; c++) row8[ox * ncomp + c] = (uint8_t)comps[c];
+                uint8_t *o = row8 + (size_t)ox * ncomp;
+                o[0] = (uint8_t)comps[0];
+                if (ncomp > 1) o[1] = (uint8_t)comps[1];
+                if (ncomp > 2) o[2] = (uint8_t)comps[2];
+                if (ncomp > 3) o[3] = (uint8_t)comps[3];
             }
         }
     }

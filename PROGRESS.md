@@ -52,12 +52,82 @@ is met for sRGB content.
 ## Performance
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
-libraries into one process and times both, single-threaded. On a random
-sample we are ~3.7x libjxl overall: Modular 2-3x, VarDCT 1-5x with occasional
-outliers. libjxl is AVX2; we are scalar C, so a small constant factor is
-expected. Splines are the slowest path by a wide margin.
+libraries into one process and times both, single-threaded. Over the whole
+821-file corpus we are **2.64x libjxl** (was 3.22x). libjxl is AVX2; we are
+scalar C, so a constant factor is expected.
+
+`bun cmd/prof.ts <file.jxl>` profiles our decoder alone through the sibling
+`../samply` and prints samply's `-print-agent` report (top self-time
+functions, hot source lines, heaviest call path). That is how the numbers
+below were found.
+
+The worst ratios among files that take libjxl more than 5ms are now
+`P3-sRGB-color-bars.v_*` at 6.4-6.6x and `flower.v_prog` at 4.5x. Files
+below ~1ms sit at up to 9x purely on fixed setup cost.
+
+### The EPF and spline rewrites
+Three hot loops were doing the same work three or more times over.
+
+- **`epf_pass`** was 78% of the decode of every VarDCT file with EPF on. Step
+  0 visits 12 kernel taps x 3 channels x 5 SAD offsets per sample, and each of
+  those 180 iterations called `jxl_mirror` **four** times (720 mirror loops
+  per sample), recomputed the centre-pixel footprint 36 times instead of once,
+  and divided by sigma once per tap. Now: the tap and footprint offsets are
+  tabulated once per pass; samples whose whole footprint is inside the image
+  take a mirror-free path using fixed offsets off the centre sample; the
+  reciprocal of sigma is hoisted per sample; the SAD loop runs channel-outer
+  like libjxl's, so a channel's footprint comes from one plane with its centre
+  samples live in registers. The three closing divisions became one reciprocal
+  and three multiplies, which is what libjxl does. Every reordering preserves
+  the float operation order, so the output is bit-identical.
+- **`jxl_render_splines`** was 93% of `splines.jxl`. The channel loop was
+  *outermost*, so the `sqrt` and the two `spline_erf` calls ran three times per
+  pixel. Moving it innermost, hoisting `0.25 * values[c] * sigma` out, and
+  clamping each sample's bounding box once instead of bounds-checking every
+  pixel cut that file from 2935ms to 1020ms.
+- **`max_distance`** now uses libjxl's formula, `sqrt(-2*sigma^2*(log(0.1)*3 -
+  log(max_color)))`. jxl-oxide uses `max_color` where libjxl takes its log,
+  which inflates the draw radius (3.7 sigma vs 2.1 sigma at the 0.01 floor) and
+  so the pixel count, for output that is identical after 8-bit quantization.
+- **`write_pixels`**, the final float-to-integer pass for every format, called
+  `unapply_orientation` and `plane_sample` per sample even though both are
+  loop-invariant when there is no orientation fixup and no subsampled plane.
+  That case now walks precomputed row pointers.
+- `jxl_apply_epf`'s three scratch planes were `calloc`ed and immediately
+  overwritten; they are `jxl_malloc`ed now and copied back row by row so the
+  row padding never travels.
+
+Measured effect, best of 3, ours vs libjxl:
+
+| file | before | after |
+|---|---|---|
+| `splines.jxl` | 2935ms, 9.5x | 1020ms, 3.4x |
+| `splines.v_e3.jxl` | 663ms, 17.3x | 256ms, 6.9x |
+| `colorful_chessboards.v_e3.jxl` | 166ms, 15.9x | 66ms, 5.9x |
+| `P3-sRGB-color-bars.v_e3.jxl` | 124ms, 16.0x | 50ms, 6.4x |
+| `flower.v_e3.jxl` | 572ms, 13.2x | 229ms, 5.4x |
+| corpus total | 47.6s, 3.22x | 38.6s, 2.64x |
+
+All 821 files decode to the same bytes as before: the same 63 files differ
+from `djxl`, with the same max and mean deviation on each.
+
+### What is left
+`epf_pass` is still ~48% of a VarDCT decode, and it is now arithmetic-bound
+rather than overhead-bound. Two further options, neither taken:
+- The kernel taps are symmetric pairs and the SAD is symmetric under swapping
+  the two footprints, so `dist(x, y, k) == dist(x+kx, y+ky, -k)`. Caching six
+  SADs per sample in a rolling three-row window would halve the SAD work. The
+  `sigma < 0.3` early-out complicates it: a skipped sample's neighbours still
+  want its cached values.
+- libjxl runs this loop 8 samples wide under AVX2. Matching that needs
+  intrinsics, which would end the scalar-C property.
 
 ## Log
+
+### EPF and spline hot loops
+See **Performance** above: three loops were repeating per-channel work that
+does not depend on the channel, and `epf_pass` was calling `jxl_mirror` 720
+times per sample. 3.22x -> 2.64x over the corpus, bit-identical output.
 
 ### YCbCr, ICC, and lazy dequant matrices
 - JPEG-transcoded files (YCbCr frames) decode, including every chroma
