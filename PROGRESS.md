@@ -62,11 +62,12 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **2.31x libjxl** (2.74x before the SSE2 work below;
+1245-file corpus we are **2.23x libjxl** (2.74x before the SSE2 work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
 average up). libjxl is AVX2 throughout; we are scalar C apart from the SSE2
-hot loops (noise, upsampling, EPF, gaborish and both DCT passes), so a
+hot loops (noise, upsampling, EPF, gaborish, both DCT passes, the XYB
+inverse and the sRGB transfer function), so a
 constant factor is expected. Each of those keeps a scalar twin and is checked
 bit-identical against it -- see the log.
 
@@ -126,24 +127,21 @@ All 821 files decode to the same bytes as before: the same 63 files differ
 from `djxl`, with the same max and mean deviation on each.
 
 ### What is left
-The profile on `P3-sRGB-color-bars.v_d1` is now flat -- no single function
-above 14%, where `dct_1d` alone was 27% before the DCT work:
+The profile on `P3-sRGB-color-bars.v_d1` is flat -- `dct_1d` alone used to be
+27%, and nothing is above ~14% now. The two remaining candidates both come
+with a caveat rather than being straightforward:
 
-    dct_1d_v4          14.0%   both DCT passes, 4 lanes
-    epf_pass           11.3%
-    jxl_linear_to_tf   11.0%   a powf per sample
-    memset_repstos      8.4%   calloc, see below
-    write_pixels        8.2%
-    jxl_xyb_to_linear   6.1%
+- **`memset_repstos`**, from `jxl_fplane_alloc`'s `calloc`. The cheapest win
+  left, and the same waste already removed from the noise and gaborish
+  scratch buffers -- but it needs checking caller by caller. A plane only
+  partly written would start returning heap contents instead of zeros, which
+  is a disclosure bug, not a rendering one.
+- **`write_pixels`**, the float-to-integer output pass. Vectorisable, but it
+  is a gather across planes with per-format packing, so rather more code than
+  the loops done so far for a single-digit share.
 
-Nothing here is an outlier any more, so the next round is several ~10% items
-rather than one big one. `memset_repstos` is the cheapest: `jxl_fplane_alloc`
-uses `calloc` and most callers overwrite the plane completely, the same waste
-already removed from the noise and gaborish scratch buffers -- but it needs
-checking caller by caller, since a plane that is only partly written would
-start leaking heap contents instead of reading zeros. `jxl_linear_to_tf` is a
-`powf` per sample and would want a polynomial approximation, which would *not*
-be bit-identical and so needs the tolerance argument rather than a diff.
+Everything with an easy, provably-bit-identical vector form has now been
+done.
 
 Still not taken on EPF: the kernel taps are symmetric pairs and the SAD is
 symmetric under swapping the two footprints, so `dist(x, y, k) ==
@@ -152,6 +150,33 @@ window would halve the SAD work. The `sigma < 0.3` early-out complicates it:
 a skipped sample's neighbours still want its cached values.
 
 ## Log
+
+### The colour conversion, four lanes at a time
+`jxl_linear_to_tf` at 11% and `jxl_xyb_to_linear` at 6.1% both looked like
+transcendental-function costs and were not. `tf_srgb` is already libjxl's
+polynomial-and-table approximation rather than a `powf`, and the `cbrtf` in
+the XYB inverse is already hoisted out of the loop. Both loop bodies are pure
+arithmetic, which means they vectorise **bit-identically** -- no approximation
+argument needed, and no tolerance risk.
+
+The XYB inverse is a straight four-at-a-time rewrite. `tf_srgb` needed one
+concession: its 16-entry power table is indexed by the exponent, so those four
+lookups are extracted, done scalar and reassembled -- still far cheaper than
+the cubic polynomial around them, which is the bulk of the work.
+
+Worth noting how the mistake in this one surfaced. The SSE2 detection block
+sat *below* `jxl_xyb_to_linear` in the file, so its `#ifdef` was false and the
+vector path silently compiled to nothing -- a build that succeeds, tests that
+pass, and no speedup. Only the benchmark showed it. Moved above both uses.
+
+    P3-sRGB-color-bars.v_d1   31.6ms  3.80x -> 28.0ms  3.40x
+    flower.v_d1              155.8ms  3.39x -> 145.2ms 3.10x
+    flower.v_prog            162.8ms  2.86x -> 152.3ms 2.65x
+
+Corpus **2.31x -> 2.23x**, 38.1s -> 37.1s. Over the four rounds: 2.74x ->
+2.23x, 48.4s -> 37.1s, a quarter of the wall clock gone, every step verified
+bit-identical against its scalar twin. 1245/1245 ok, ASan clean, 115 fuzz
+reproducers clean.
 
 ### Both DCT passes, four lanes at a time
 With the loop filters vectorised, `dct_1d` was 27% self and `jxl_dct_2d` 31%

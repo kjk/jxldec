@@ -10,6 +10,19 @@
 
 #include <math.h>
 
+/* SSE2 is baseline on x64. -DJXL_COLOR_FORCE_SCALAR builds the scalar path
+   alone so the bit-identical claim can be diffed rather than asserted.
+   Nothing here approximates anything the scalar code does not already
+   approximate: tf_srgb is libjxl's polynomial-plus-table, not a powf, and
+   the cbrt in the XYB inverse is already hoisted out of the loop. */
+#if !defined(JXL_COLOR_FORCE_SCALAR) && \
+    (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
+     (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#define JXL_COLOR_SSE2 1
+#include <emmintrin.h>
+#endif
+
+
 void jxl_xyb_to_linear(float *x, float *y, float *b, size_t n,
                        const float opsin_inv[9], const float opsin_bias[3],
                        float intensity_target) {
@@ -20,7 +33,42 @@ void jxl_xyb_to_linear(float *x, float *y, float *b, size_t n,
 
     for (k = 0; k < 3; k++) cbrt_ob[k] = cbrtf(opsin_bias[k]);
 
-    for (i = 0; i < n; i++) {
+    i = 0;
+#ifdef JXL_COLOR_SSE2
+    {
+        /* Straight four-at-a-time: the loop body is pure arithmetic, so each
+           lane runs the identical sequence and the result is bit-identical.
+           The multiply-adds keep the scalar left-to-right association. */
+        const __m128 c0 = _mm_set1_ps(cbrt_ob[0]), c1 = _mm_set1_ps(cbrt_ob[1]);
+        const __m128 c2 = _mm_set1_ps(cbrt_ob[2]);
+        const __m128 b0 = _mm_set1_ps(opsin_bias[0]), b1 = _mm_set1_ps(opsin_bias[1]);
+        const __m128 b2 = _mm_set1_ps(opsin_bias[2]);
+        const __m128 its = _mm_set1_ps(itscale);
+        __m128 oi[9];
+        for (k = 0; k < 9; k++) oi[k] = _mm_set1_ps(opsin_inv[k]);
+        for (; i + 4 <= n; i += 4) {
+            __m128 vx = _mm_loadu_ps(x + i);
+            __m128 vy = _mm_loadu_ps(y + i);
+            __m128 vb = _mm_loadu_ps(b + i);
+            __m128 gl = _mm_sub_ps(_mm_add_ps(vy, vx), c0);
+            __m128 gm = _mm_sub_ps(_mm_sub_ps(vy, vx), c1);
+            __m128 gs = _mm_sub_ps(vb, c2);
+            __m128 l = _mm_add_ps(_mm_mul_ps(_mm_mul_ps(gl, gl), gl), b0);
+            __m128 m = _mm_add_ps(_mm_mul_ps(_mm_mul_ps(gm, gm), gm), b1);
+            __m128 s = _mm_add_ps(_mm_mul_ps(_mm_mul_ps(gs, gs), gs), b2);
+            l = _mm_mul_ps(l, its);
+            m = _mm_mul_ps(m, its);
+            s = _mm_mul_ps(s, its);
+            _mm_storeu_ps(x + i, _mm_add_ps(_mm_add_ps(
+                _mm_mul_ps(oi[0], l), _mm_mul_ps(oi[1], m)), _mm_mul_ps(oi[2], s)));
+            _mm_storeu_ps(y + i, _mm_add_ps(_mm_add_ps(
+                _mm_mul_ps(oi[3], l), _mm_mul_ps(oi[4], m)), _mm_mul_ps(oi[5], s)));
+            _mm_storeu_ps(b + i, _mm_add_ps(_mm_add_ps(
+                _mm_mul_ps(oi[6], l), _mm_mul_ps(oi[7], m)), _mm_mul_ps(oi[8], s)));
+        }
+    }
+#endif
+    for (; i < n; i++) {
         float gl = y[i] + x[i] - cbrt_ob[0];
         float gm = y[i] - x[i] - cbrt_ob[1];
         float gs = b[i] - cbrt_ob[2];
@@ -112,6 +160,61 @@ static float tf_hlg(float v) {
     return a * logf(12.0f * v - b) + c;
 }
 
+#ifdef JXL_COLOR_SSE2
+/* tf_srgb four at a time. Every step is arithmetic or bit manipulation that
+   SSE2 has, bar the 16-entry power table, whose index comes from the
+   exponent: those four lookups are done scalar and reassembled, which is
+   still far cheaper than the polynomial around them. */
+static void tf_srgb_x4(float *v, size_t n, size_t *pos) {
+    const __m128i signmask = _mm_set1_epi32((int)0x80000000u);
+    const __m128i absmask = _mm_set1_epi32(0x7fffffff);
+    const __m128i adj_or = _mm_set1_epi32(0x3e800000);
+    const __m128i adj_and = _mm_set1_epi32(0x3effffff);
+    const __m128 k3 = _mm_set1_ps(0.059914046f), k2 = _mm_set1_ps(-0.10889456f);
+    const __m128 k1 = _mm_set1_ps(0.107963754f), k0 = _mm_set1_ps(0.018092343f);
+    const __m128 c1292 = _mm_set1_ps(12.92f), c055 = _mm_set1_ps(0.055f);
+    const __m128 cutoff = _mm_set1_ps(0.0031308f);
+    size_t i = *pos;
+    for (; i + 4 <= n; i += 4) {
+        __m128i bits = _mm_castps_si128(_mm_loadu_ps(v + i));
+        __m128i sign = _mm_and_si128(bits, signmask);
+        __m128i vi = _mm_and_si128(bits, absmask);
+        __m128 v_adj = _mm_castsi128_ps(
+            _mm_and_si128(_mm_or_si128(vi, adj_or), adj_and));
+        __m128 pw = _mm_add_ps(_mm_mul_ps(k3, v_adj), k2);
+        __m128 fv = _mm_castsi128_ps(vi);
+        __m128i idx = _mm_and_si128(_mm_sub_epi32(_mm_srli_epi32(vi, 23),
+                                                  _mm_set1_epi32(118)),
+                                    _mm_set1_epi32(0xf));
+        int ix[4];
+        __m128i mul_bits;
+        __m128 small, acc, out;
+        pw = _mm_add_ps(_mm_mul_ps(pw, v_adj), k1);
+        pw = _mm_add_ps(_mm_mul_ps(pw, v_adj), k0);
+        _mm_storeu_si128((__m128i *)ix, idx);
+        mul_bits = _mm_setr_epi32(
+            (int)(0x40000000u | ((uint32_t)srgb_powtable_upper[ix[0] & 0xf] << 18) |
+                  ((uint32_t)srgb_powtable_lower[ix[0] & 0xf] << 10)),
+            (int)(0x40000000u | ((uint32_t)srgb_powtable_upper[ix[1] & 0xf] << 18) |
+                  ((uint32_t)srgb_powtable_lower[ix[1] & 0xf] << 10)),
+            (int)(0x40000000u | ((uint32_t)srgb_powtable_upper[ix[2] & 0xf] << 18) |
+                  ((uint32_t)srgb_powtable_lower[ix[2] & 0xf] << 10)),
+            (int)(0x40000000u | ((uint32_t)srgb_powtable_upper[ix[3] & 0xf] << 18) |
+                  ((uint32_t)srgb_powtable_lower[ix[3] & 0xf] << 10)));
+        small = _mm_mul_ps(fv, c1292);
+        acc = _mm_sub_ps(_mm_mul_ps(pw, _mm_castsi128_ps(mul_bits)), c055);
+        /* fv <= cutoff ? small : acc */
+        {
+            __m128 m = _mm_cmple_ps(fv, cutoff);
+            out = _mm_or_ps(_mm_and_ps(m, small), _mm_andnot_ps(m, acc));
+        }
+        _mm_storeu_ps(v + i, _mm_castsi128_ps(
+            _mm_or_si128(_mm_castps_si128(out), sign)));
+    }
+    *pos = i;
+}
+#endif
+
 void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
                       float intensity_target) {
     size_t i;
@@ -144,7 +247,11 @@ void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
             break;
         case JXL_TF_SRGB:
         default:
-            for (i = 0; i < n; i++) v[i] = tf_srgb(v[i]);
+            i = 0;
+#ifdef JXL_COLOR_SSE2
+            tf_srgb_x4(v, n, &i);
+#endif
+            for (; i < n; i++) v[i] = tf_srgb(v[i]);
             break;
     }
 }
