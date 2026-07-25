@@ -12,6 +12,14 @@
 
 #include <math.h>
 
+/* SSE2 is baseline on x64. -DJXL_DCT_FORCE_SCALAR builds the scalar path
+   alone, so the "bit-identical" claim can be checked by diffing the two
+   builds' output rather than taken on trust. */
+#if !defined(JXL_DCT_FORCE_SCALAR) &&     (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) ||      (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#define JXL_DCT_SSE2 1
+#include <emmintrin.h>
+#endif
+
 #define JXL_SQRT2 1.4142135623730951f
 
 /* 1 / (2 cos((2k+1)pi/(2n))) for k < n/2, tabulated for n = 4..32 and
@@ -198,6 +206,144 @@ static void dct_1d(float *io, int n, float *scratch, int inverse) {
 }
 
 /* 2D DCT over a w x h block with the given row stride (in floats). */
+#ifdef JXL_DCT_SSE2
+/* Four columns at a time, one per lane. The column pass already had to gather
+   each column out of the row-major block, and four consecutive floats from a
+   row are exactly the four columns' values at that row -- so the gather is the
+   transpose, and no shuffling is needed.
+ *
+ * These two mirror dct4 and dct_1d expression for expression, including how
+ * the additions associate: every lane then performs the same operations in the
+ * same order as the scalar code, so the result is bit-identical. Divisions by
+ * 2 and 4 become multiplies by 0.5 and 0.25, which is exact for powers of two.
+ */
+static void dct4_v4(const __m128 in[4], __m128 out[4], int inverse) {
+    const __m128 sec0 = _mm_set1_ps(0.5411961f);
+    const __m128 sec1 = _mm_set1_ps(1.306563f);
+    const __m128 sqrt2 = _mm_set1_ps(JXL_SQRT2);
+    const __m128 quarter = _mm_set1_ps(0.25f);
+    if (!inverse) {
+        __m128 sum03 = _mm_add_ps(in[0], in[3]);
+        __m128 sum12 = _mm_add_ps(in[1], in[2]);
+        __m128 tmp0 = _mm_mul_ps(_mm_sub_ps(in[0], in[3]), sec0);
+        __m128 tmp1 = _mm_mul_ps(_mm_sub_ps(in[1], in[2]), sec1);
+        __m128 out0 = _mm_mul_ps(_mm_add_ps(tmp0, tmp1), quarter);
+        __m128 out1 = _mm_mul_ps(_mm_sub_ps(tmp0, tmp1), quarter);
+        out[0] = _mm_mul_ps(_mm_add_ps(sum03, sum12), quarter);
+        out[1] = _mm_add_ps(_mm_mul_ps(out0, sqrt2), out1);
+        out[2] = _mm_mul_ps(_mm_sub_ps(sum03, sum12), quarter);
+        out[3] = out1;
+    } else {
+        __m128 tmp0 = _mm_mul_ps(in[1], sqrt2);
+        __m128 tmp1 = _mm_add_ps(in[1], in[3]);
+        __m128 out0 = _mm_mul_ps(_mm_add_ps(tmp0, tmp1), sec0);
+        __m128 out1 = _mm_mul_ps(_mm_sub_ps(tmp0, tmp1), sec1);
+        __m128 sum02 = _mm_add_ps(in[0], in[2]);
+        __m128 sub02 = _mm_sub_ps(in[0], in[2]);
+        out[0] = _mm_add_ps(sum02, out0);
+        out[1] = _mm_add_ps(sub02, out1);
+        out[2] = _mm_sub_ps(sub02, out1);
+        out[3] = _mm_sub_ps(sum02, out0);
+    }
+}
+
+static void dct_1d_v4(__m128 *io, int n, __m128 *scratch, int inverse) {
+    const __m128 sqrt2 = _mm_set1_ps(JXL_SQRT2);
+    const __m128 half_v = _mm_set1_ps(0.5f);
+    int i;
+    if (n <= 1) return;
+    if (n == 2) {
+        __m128 t0 = _mm_add_ps(io[0], io[1]);
+        __m128 t1 = _mm_sub_ps(io[0], io[1]);
+        if (!inverse) { io[0] = _mm_mul_ps(t0, half_v); io[1] = _mm_mul_ps(t1, half_v); }
+        else { io[0] = t0; io[1] = t1; }
+        return;
+    }
+    if (n == 4) {
+        __m128 in[4], out[4];
+        for (i = 0; i < 4; i++) in[i] = io[i];
+        dct4_v4(in, out, inverse);
+        for (i = 0; i < 4; i++) io[i] = out[i];
+        return;
+    }
+    {
+        const float *sec = sec_half(n);
+        int hn = n / 2;
+        __m128 *in0 = scratch;
+        __m128 *in1 = scratch + hn;
+        if (!inverse) {
+            for (i = 0; i < hn; i++) {
+                in0[i] = _mm_mul_ps(_mm_add_ps(io[i], io[n - i - 1]), half_v);
+                in1[i] = _mm_mul_ps(_mm_sub_ps(io[i], io[n - i - 1]), half_v);
+            }
+            for (i = 0; i < hn; i++)
+                in1[i] = _mm_mul_ps(in1[i], _mm_set1_ps(sec[i]));
+            dct_1d_v4(in0, hn, io, 0);
+            dct_1d_v4(in1, hn, io + hn, 0);
+            in1[0] = _mm_mul_ps(in1[0], sqrt2);
+            for (i = 0; i < hn - 1; i++) in1[i] = _mm_add_ps(in1[i], in1[i + 1]);
+            for (i = 0; i < hn; i++) io[i * 2] = in0[i];
+            for (i = 0; i < hn; i++) io[i * 2 + 1] = in1[i];
+        } else {
+            for (i = 0; i < hn; i++) {
+                in0[i] = io[i * 2];
+                in1[i] = io[i * 2 + 1];
+            }
+            for (i = 1; i < hn; i++)
+                in1[hn - i] = _mm_add_ps(in1[hn - i], in1[hn - i - 1]);
+            in1[0] = _mm_mul_ps(in1[0], sqrt2);
+            dct_1d_v4(in0, hn, io, 1);
+            dct_1d_v4(in1, hn, io + hn, 1);
+            for (i = 0; i < hn; i++)
+                in1[i] = _mm_mul_ps(in1[i], _mm_set1_ps(sec[i]));
+            for (i = 0; i < hn; i++) {
+                __m128 a = scratch[i];
+                __m128 b = scratch[i + hn];
+                io[i] = _mm_add_ps(a, b);
+                io[n - i - 1] = _mm_sub_ps(a, b);
+            }
+        }
+    }
+}
+/* Four *rows* at once. Rows are contiguous, so unlike the column pass this
+   needs a real transpose in and out -- but the transform in between is the
+   same 4-lane kernel, and each lane still sees its own row's values in the
+   original order, so the result stays bit-identical. */
+static void dct_rows4(float *data, size_t stride, int w, int inverse) {
+    __m128 vrow[256], vscratch[256];
+    int j;
+    for (j = 0; j + 4 <= w; j += 4) {
+        __m128 r0 = _mm_loadu_ps(data + j);
+        __m128 r1 = _mm_loadu_ps(data + stride + j);
+        __m128 r2 = _mm_loadu_ps(data + 2 * stride + j);
+        __m128 r3 = _mm_loadu_ps(data + 3 * stride + j);
+        _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
+        vrow[j] = r0; vrow[j + 1] = r1; vrow[j + 2] = r2; vrow[j + 3] = r3;
+    }
+    for (; j < w; j++) {
+        vrow[j] = _mm_setr_ps(data[j], data[stride + j],
+                              data[2 * stride + j], data[3 * stride + j]);
+    }
+    dct_1d_v4(vrow, w, vscratch, inverse);
+    for (j = 0; j + 4 <= w; j += 4) {
+        __m128 r0 = vrow[j], r1 = vrow[j + 1], r2 = vrow[j + 2], r3 = vrow[j + 3];
+        _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
+        _mm_storeu_ps(data + j, r0);
+        _mm_storeu_ps(data + stride + j, r1);
+        _mm_storeu_ps(data + 2 * stride + j, r2);
+        _mm_storeu_ps(data + 3 * stride + j, r3);
+    }
+    for (; j < w; j++) {
+        float t[4];
+        _mm_storeu_ps(t, vrow[j]);
+        data[j] = t[0];
+        data[stride + j] = t[1];
+        data[2 * stride + j] = t[2];
+        data[3 * stride + j] = t[3];
+    }
+}
+#endif /* JXL_DCT_SSE2 */
+
 void jxl_dct_2d(float *data, size_t stride, int w, int h, int inverse) {
     float mul = inverse ? 1.0f : 0.5f;
     float scratch[256];
@@ -253,8 +399,26 @@ void jxl_dct_2d(float *data, size_t stride, int w, int h, int inverse) {
         return;
     }
 
-    for (y = 0; y < h; y++) dct_1d(data + (size_t)y * stride, w, scratch, inverse);
-    for (x = 0; x < w; x++) {
+    y = 0;
+#ifdef JXL_DCT_SSE2
+    for (; y + 4 <= h; y += 4)
+        dct_rows4(data + (size_t)y * stride, stride, w, inverse);
+#endif
+    for (; y < h; y++) dct_1d(data + (size_t)y * stride, w, scratch, inverse);
+    x = 0;
+#ifdef JXL_DCT_SSE2
+    {
+        __m128 vcol[256], vscratch[256];
+        for (; x + 4 <= w; x += 4) {
+            for (y = 0; y < h; y++)
+                vcol[y] = _mm_loadu_ps(data + (size_t)y * stride + x);
+            dct_1d_v4(vcol, h, vscratch, inverse);
+            for (y = 0; y < h; y++)
+                _mm_storeu_ps(data + (size_t)y * stride + x, vcol[y]);
+        }
+    }
+#endif
+    for (; x < w; x++) {
         for (y = 0; y < h; y++) col[y] = data[(size_t)y * stride + x];
         dct_1d(col, h, scratch, inverse);
         for (y = 0; y < h; y++) data[(size_t)y * stride + x] = col[y];
