@@ -972,7 +972,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         }
         /* Grayscale XYB decodes into three identical planes; drop two so the
            extra channels (alpha!) keep their expected plane indices. */
-        if (meta->colour.colour_space == JXL_CS_GRAY && out->ncolor == 3) {
+        if (meta->colour.colour_space == JXLDEC_CS_GRAY && out->ncolor == 3) {
             uint32_t k;
             jxl_free(ctx, out->plane[1].data);
             jxl_free(ctx, out->plane[2].data);

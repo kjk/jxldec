@@ -7,12 +7,17 @@
  * single-threaded (no JxlThreadParallelRunner) because that is the only
  * configuration we implement.
  *
+ * Our public names are JXLDEC_-prefixed, so jxl.h and libjxl's jxl/decode.h
+ * coexist in this one translation unit.
+ *
  * Each file is decoded `runs` times per decoder and the best time is
  * reported: the fastest run is the one least perturbed by the scheduler.
  * Output is one line per file plus a total, in the shape djvudec's bench
  * prints.
  */
 #include "jxl.h"
+
+#include <jxl/decode.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,7 +74,7 @@ static double bench_ours(const uint8_t *data, size_t len) {
     double t0, dt;
     if (!ctx) return -1;
     t0 = now_ms();
-    img = jxl_decode(ctx, data, len, JXL_FORMAT_NATIVE);
+    img = jxl_decode(ctx, data, len, JXLDEC_FORMAT_NATIVE);
     dt = now_ms() - t0;
     if (!img) dt = -1;
     jxl_image_destroy(ctx, img);
@@ -77,9 +82,62 @@ static double bench_ours(const uint8_t *data, size_t len) {
     return dt;
 }
 
-/* Defined in bench_libjxl.c, which cannot share a translation unit with
-   jxl.h: our public JXL_SIG_* names collide with libjxl's. */
-double jxl_bench_libjxl(const uint8_t *data, size_t len);
+static double bench_libjxl(const uint8_t *data, size_t len) {
+    JxlDecoder *dec = JxlDecoderCreate(NULL);
+    JxlBasicInfo info;
+    JxlPixelFormat fmt;
+    uint8_t *out = NULL;
+    size_t out_size = 0;
+    double t0, dt = -1;
+    int done = 0;
+
+    if (!dec) return -1;
+    if (JxlDecoderSubscribeEvents(dec, JXL_DEC_BASIC_INFO | JXL_DEC_FULL_IMAGE) !=
+        JXL_DEC_SUCCESS) {
+        JxlDecoderDestroy(dec);
+        return -1;
+    }
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.data_type = JXL_TYPE_UINT8;
+    fmt.endianness = JXL_NATIVE_ENDIAN;
+    fmt.align = 0;
+
+    t0 = now_ms();
+    JxlDecoderSetInput(dec, data, len);
+    JxlDecoderCloseInput(dec);
+    while (!done) {
+        JxlDecoderStatus st = JxlDecoderProcessInput(dec);
+        switch (st) {
+            case JXL_DEC_BASIC_INFO:
+                if (JxlDecoderGetBasicInfo(dec, &info) != JXL_DEC_SUCCESS) goto fail;
+                fmt.num_channels = info.num_color_channels +
+                                   (info.alpha_bits ? 1 : 0);
+                break;
+            case JXL_DEC_NEED_IMAGE_OUT_BUFFER:
+                if (JxlDecoderImageOutBufferSize(dec, &fmt, &out_size) !=
+                    JXL_DEC_SUCCESS)
+                    goto fail;
+                free(out);
+                out = (uint8_t *)malloc(out_size ? out_size : 1);
+                if (!out) goto fail;
+                if (JxlDecoderSetImageOutBuffer(dec, &fmt, out, out_size) !=
+                    JXL_DEC_SUCCESS)
+                    goto fail;
+                break;
+            case JXL_DEC_FULL_IMAGE:
+                done = 1;
+                break;
+            default:
+                goto fail;
+        }
+    }
+    dt = now_ms() - t0;
+
+fail:
+    free(out);
+    JxlDecoderDestroy(dec);
+    return dt;
+}
 
 int main(int argc, char **argv) {
     int runs = 3;
@@ -113,7 +171,7 @@ int main(int argc, char **argv) {
         }
         for (r = 0; r < runs; r++) {
             double a = bench_ours(data, len);
-            double b = jxl_bench_libjxl(data, len);
+            double b = bench_libjxl(data, len);
             if (a >= 0 && (best_ours < 0 || a < best_ours)) best_ours = a;
             if (b >= 0 && (best_ref < 0 || b < best_ref)) best_ref = b;
         }

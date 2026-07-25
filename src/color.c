@@ -276,7 +276,7 @@ static void get_white_point(const jxl_colour_encoding *enc, float *wx, float *wy
 void jxl_opsin_matrix_for(const jxl_image_metadata *meta, float out[9]) {
     const jxl_colour_encoding *enc = &meta->colour;
     float luminances[3] = {0.2126f, 0.7152f, 0.0722f};
-    int is_gray = (enc->colour_space == JXL_CS_GRAY);
+    int is_gray = (enc->colour_space == JXLDEC_CS_GRAY);
 
     memcpy(out, meta->opsin_inv, 9 * sizeof(float));
 

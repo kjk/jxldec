@@ -74,7 +74,7 @@ int jxl_doc_info(jxl_doc *doc, jxl_image_info *info) {
     info->height = (int)h;
     info->bits_per_sample = (int)m->bit_depth.bits_per_sample;
     info->exponent_bits = (int)m->bit_depth.exp_bits;
-    info->num_color_channels = (m->colour.colour_space == JXL_CS_GRAY) ? 1 : 3;
+    info->num_color_channels = (m->colour.colour_space == JXLDEC_CS_GRAY) ? 1 : 3;
     info->num_extra_channels = (int)m->num_extra;
     if (m->alpha_index >= 0) {
         const jxl_ec_info *a = &m->ec_info[m->alpha_index];

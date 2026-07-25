@@ -34,16 +34,16 @@ int jxl_doc_frame_info(jxl_doc *doc, int frame_no, jxl_frame_info *info) {
 
 static jxl_format resolve_format(const jxl_image_info *ii, jxl_format fmt) {
     int wide, gray, alpha;
-    if (fmt != JXL_FORMAT_NATIVE) return fmt;
+    if (fmt != JXLDEC_FORMAT_NATIVE) return fmt;
     wide = ii->bits_per_sample > 8 || ii->exponent_bits > 0;
     gray = ii->num_color_channels == 1;
     alpha = ii->alpha_bits > 0;
     if (gray) {
-        return wide ? (alpha ? JXL_FORMAT_GRAYA16 : JXL_FORMAT_GRAY16)
-                    : (alpha ? JXL_FORMAT_GRAYA8 : JXL_FORMAT_GRAY8);
+        return wide ? (alpha ? JXLDEC_FORMAT_GRAYA16 : JXLDEC_FORMAT_GRAY16)
+                    : (alpha ? JXLDEC_FORMAT_GRAYA8 : JXLDEC_FORMAT_GRAY8);
     }
-    return wide ? (alpha ? JXL_FORMAT_RGBA64 : JXL_FORMAT_RGB48)
-                : (alpha ? JXL_FORMAT_RGBA32 : JXL_FORMAT_RGB24);
+    return wide ? (alpha ? JXLDEC_FORMAT_RGBA64 : JXLDEC_FORMAT_RGB48)
+                : (alpha ? JXLDEC_FORMAT_RGBA32 : JXLDEC_FORMAT_RGB24);
 }
 
 int jxl_frame_render_info(jxl_doc *doc, int frame_no, jxl_format fmt,
@@ -133,14 +133,14 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
     jxl_apply_orientation_dims(orientation, sw, sh, &ow, &oh);
 
     switch (fmt) {
-        case JXL_FORMAT_GRAY8: ncomp = 1; gray = 1; break;
-        case JXL_FORMAT_GRAYA8: ncomp = 2; gray = 1; has_alpha = 1; break;
-        case JXL_FORMAT_RGB24: ncomp = 3; break;
-        case JXL_FORMAT_RGBA32: ncomp = 4; has_alpha = 1; break;
-        case JXL_FORMAT_GRAY16: ncomp = 1; gray = 1; wide = 1; break;
-        case JXL_FORMAT_GRAYA16: ncomp = 2; gray = 1; has_alpha = 1; wide = 1; break;
-        case JXL_FORMAT_RGB48: ncomp = 3; wide = 1; break;
-        case JXL_FORMAT_RGBA64: ncomp = 4; has_alpha = 1; wide = 1; break;
+        case JXLDEC_FORMAT_GRAY8: ncomp = 1; gray = 1; break;
+        case JXLDEC_FORMAT_GRAYA8: ncomp = 2; gray = 1; has_alpha = 1; break;
+        case JXLDEC_FORMAT_RGB24: ncomp = 3; break;
+        case JXLDEC_FORMAT_RGBA32: ncomp = 4; has_alpha = 1; break;
+        case JXLDEC_FORMAT_GRAY16: ncomp = 1; gray = 1; wide = 1; break;
+        case JXLDEC_FORMAT_GRAYA16: ncomp = 2; gray = 1; has_alpha = 1; wide = 1; break;
+        case JXLDEC_FORMAT_RGB48: ncomp = 3; wide = 1; break;
+        case JXLDEC_FORMAT_RGBA64: ncomp = 4; has_alpha = 1; wide = 1; break;
         default:
             JXL_ERR(ctx, "render: unsupported output format %d", (int)fmt);
             return -1;

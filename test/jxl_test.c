@@ -16,7 +16,7 @@
 
 static void on_error(void *user, jxl_severity sev, const char *msg) {
     (void)user;
-    if (sev >= JXL_SEVERITY_WARNING) fprintf(stderr, "jxl: %s\n", msg);
+    if (sev >= JXLDEC_SEVERITY_WARNING) fprintf(stderr, "jxl: %s\n", msg);
 }
 
 static uint8_t *read_file(const char *path, size_t *len) {
@@ -51,9 +51,9 @@ static uint8_t *read_file(const char *path, size_t *len) {
 
 static const char *cs_name(jxl_color_space cs) {
     switch (cs) {
-        case JXL_CS_RGB: return "rgb";
-        case JXL_CS_GRAY: return "gray";
-        case JXL_CS_XYB: return "xyb";
+        case JXLDEC_CS_RGB: return "rgb";
+        case JXLDEC_CS_GRAY: return "gray";
+        case JXLDEC_CS_XYB: return "xyb";
         default: return "unknown";
     }
 }
@@ -149,21 +149,21 @@ static int write_pam(const char *path, const jxl_image *img) {
         return 1;
     }
     switch (img->format) {
-        case JXL_FORMAT_GRAY8:
+        case JXLDEC_FORMAT_GRAY8:
             comps = 1; maxval = 255; tuple = "GRAYSCALE"; break;
-        case JXL_FORMAT_GRAY16:
+        case JXLDEC_FORMAT_GRAY16:
             comps = 1; maxval = 65535; tuple = "GRAYSCALE"; break;
-        case JXL_FORMAT_RGB24:
+        case JXLDEC_FORMAT_RGB24:
             comps = 3; maxval = 255; tuple = "RGB"; break;
-        case JXL_FORMAT_RGB48:
+        case JXLDEC_FORMAT_RGB48:
             comps = 3; maxval = 65535; tuple = "RGB"; break;
-        case JXL_FORMAT_GRAYA8:
+        case JXLDEC_FORMAT_GRAYA8:
             comps = 2; maxval = 255; tuple = "GRAYSCALE_ALPHA"; break;
-        case JXL_FORMAT_GRAYA16:
+        case JXLDEC_FORMAT_GRAYA16:
             comps = 2; maxval = 65535; tuple = "GRAYSCALE_ALPHA"; break;
-        case JXL_FORMAT_RGBA32:
+        case JXLDEC_FORMAT_RGBA32:
             comps = 4; maxval = 255; tuple = "RGB_ALPHA"; break;
-        case JXL_FORMAT_RGBA64:
+        case JXLDEC_FORMAT_RGBA64:
             comps = 4; maxval = 65535; tuple = "RGB_ALPHA"; break;
         default:
             fprintf(stderr, "pam: unsupported format %d\n", (int)img->format);
@@ -200,7 +200,7 @@ int main(int argc, char **argv) {
     const char *in_path = NULL;
     const char *out_path = NULL;
     int do_info = 0, do_frames = 0, frame_no = 0;
-    jxl_format fmt = JXL_FORMAT_NATIVE;
+    jxl_format fmt = JXLDEC_FORMAT_NATIVE;
     int i, rc = 0;
     uint8_t *data;
     size_t len;

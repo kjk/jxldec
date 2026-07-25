@@ -150,8 +150,12 @@ keep `PROGRESS.md` current; it lists the exact pass rate and every known gap.
   produces a plausible, wrong image (mean 4/255).
 - Chroma-from-luma is skipped entirely when anything is subsampled, and the
   default Y-to-B correlation is 1.0 only for XYB frames (0 otherwise).
-- Our public `JXL_SIG_*` enum names collide with libjxl's `jxl/decode.h`; the
-  two headers cannot be included in one translation unit.
+- Public names are `JXLDEC_`-prefixed (`JXLDEC_FORMAT_RGB24`, `JXLDEC_SIG_*`)
+  precisely so `jxl.h` and libjxl's `jxl/decode.h` can share a translation
+  unit -- `test/jxl_bench.c` relies on that. Internal-only uppercase names
+  keep the plain `JXL_` prefix (`JXL_ERR`, `JXL_TR_*`, `JXL_MIN`); they never
+  reach a header a caller sees, so the two prefixes also mark the public/
+  internal boundary. Do not add a new `JXL_*` name to `src/jxl.h`.
 - Dequant matrices are built lazily. Do not make them eager again: all 17
   slots cost ~8ms, which is the entire decode of a small image.
 

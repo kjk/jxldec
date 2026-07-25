@@ -108,14 +108,14 @@ void jxl_errorf(jxl_ctx *ctx, jxl_severity sev, const char *fmt, ...) {
 
 int jxl_format_bpp(jxl_format fmt) {
     switch (fmt) {
-        case JXL_FORMAT_GRAY8: return 1;
-        case JXL_FORMAT_GRAYA8: return 2;
-        case JXL_FORMAT_RGB24: return 3;
-        case JXL_FORMAT_RGBA32: return 4;
-        case JXL_FORMAT_GRAY16: return 2;
-        case JXL_FORMAT_GRAYA16: return 4;
-        case JXL_FORMAT_RGB48: return 6;
-        case JXL_FORMAT_RGBA64: return 8;
+        case JXLDEC_FORMAT_GRAY8: return 1;
+        case JXLDEC_FORMAT_GRAYA8: return 2;
+        case JXLDEC_FORMAT_RGB24: return 3;
+        case JXLDEC_FORMAT_RGBA32: return 4;
+        case JXLDEC_FORMAT_GRAY16: return 2;
+        case JXLDEC_FORMAT_GRAYA16: return 4;
+        case JXLDEC_FORMAT_RGB48: return 6;
+        case JXLDEC_FORMAT_RGBA64: return 8;
         default: return 0;
     }
 }

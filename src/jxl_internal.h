@@ -36,8 +36,8 @@ void jxl_free(jxl_ctx *ctx, void *ptr);
 
 void jxl_errorf(jxl_ctx *ctx, jxl_severity sev, const char *fmt, ...);
 
-#define JXL_ERR(ctx, ...)  jxl_errorf((ctx), JXL_SEVERITY_ERROR, __VA_ARGS__)
-#define JXL_WARN(ctx, ...) jxl_errorf((ctx), JXL_SEVERITY_WARNING, __VA_ARGS__)
+#define JXL_ERR(ctx, ...)  jxl_errorf((ctx), JXLDEC_SEVERITY_ERROR, __VA_ARGS__)
+#define JXL_WARN(ctx, ...) jxl_errorf((ctx), JXLDEC_SEVERITY_WARNING, __VA_ARGS__)
 
 /* Overflow-checked multiply for allocation sizes. Returns 0 on overflow. */
 int jxl_size_mul(size_t a, size_t b, size_t *out);

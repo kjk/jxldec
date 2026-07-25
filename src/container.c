@@ -16,19 +16,19 @@ static const uint8_t jxl_sig_container[12] = {
 };
 
 jxl_signature jxl_signature_check(const uint8_t *data, size_t len) {
-    if (!data) return JXL_SIG_INVALID;
-    if (len == 0) return JXL_SIG_NOT_ENOUGH_BYTES;
+    if (!data) return JXLDEC_SIG_INVALID;
+    if (len == 0) return JXLDEC_SIG_NOT_ENOUGH_BYTES;
     if (data[0] == 0xff) {
-        if (len < 2) return JXL_SIG_NOT_ENOUGH_BYTES;
-        return data[1] == 0x0a ? JXL_SIG_CODESTREAM : JXL_SIG_INVALID;
+        if (len < 2) return JXLDEC_SIG_NOT_ENOUGH_BYTES;
+        return data[1] == 0x0a ? JXLDEC_SIG_CODESTREAM : JXLDEC_SIG_INVALID;
     }
     if (data[0] == 0x00) {
         size_t n = JXL_MIN(len, sizeof(jxl_sig_container));
-        if (memcmp(data, jxl_sig_container, n) != 0) return JXL_SIG_INVALID;
-        if (len < sizeof(jxl_sig_container)) return JXL_SIG_NOT_ENOUGH_BYTES;
-        return JXL_SIG_CONTAINER;
+        if (memcmp(data, jxl_sig_container, n) != 0) return JXLDEC_SIG_INVALID;
+        if (len < sizeof(jxl_sig_container)) return JXLDEC_SIG_NOT_ENOUGH_BYTES;
+        return JXLDEC_SIG_CONTAINER;
     }
-    return JXL_SIG_INVALID;
+    return JXLDEC_SIG_INVALID;
 }
 
 static uint32_t rd32be(const uint8_t *p) {
@@ -56,7 +56,7 @@ int jxl_container_parse(jxl_ctx *ctx, const uint8_t *data, size_t len,
 
     memset(out, 0, sizeof(*out));
 
-    if (jxl_signature_check(data, len) == JXL_SIG_CODESTREAM) {
+    if (jxl_signature_check(data, len) == JXLDEC_SIG_CODESTREAM) {
         out->cs = (uint8_t *)data;   /* not owned; const-cast is deliberate */
         out->cs_len = len;
         out->cs_owned = 0;

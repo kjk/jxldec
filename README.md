@@ -14,16 +14,16 @@ A decode-only JPEG XL library, in the spirit of
 Sketch (full documentation in [`src/jxl.h`](src/jxl.h)):
 ```c
 jxl_ctx *ctx = jxl_ctx_new(NULL, NULL, on_error, NULL);
-if (jxl_signature_check(data, len) == JXL_SIG_CODESTREAM) { ... }
+if (jxl_signature_check(data, len) == JXLDEC_SIG_CODESTREAM) { ... }
 
 jxl_doc *doc = jxl_doc_open(ctx, data, len);   /* data must outlive doc */
 jxl_image_info info;
 jxl_doc_info(doc, &info);                      /* size, depth, alpha, ... */
 
 jxl_ctx_set_bgr(ctx, 1);                       /* emit BGRA for a Windows DIB */
-jxl_image *img = jxl_frame_render(doc, 0, JXL_FORMAT_RGBA32);
+jxl_image *img = jxl_frame_render(doc, 0, JXLDEC_FORMAT_RGBA32);
 /* or render straight into your own buffer: */
-jxl_frame_render_into(doc, 0, JXL_FORMAT_RGBA32, dst, stride);
+jxl_frame_render_into(doc, 0, JXLDEC_FORMAT_RGBA32, dst, stride);
 ```
 
 ## Build & test

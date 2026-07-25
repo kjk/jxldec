@@ -257,26 +257,19 @@ export async function buildBenchHarness(): Promise<string> {
   const clMd = JXLDEC_MSVC_CL_C.replace("-MT", "-MD");
   const libObj = `${dir}/jxl_dist.obj`;
   const benchObj = `${dir}/jxl_bench.obj`;
-  const refObj = `${dir}/bench_libjxl.obj`;
   if (needsRebuild(libObj, DIST_C, DIST_H)) {
     await runCmd(`cl ${clMd} -Idist -Fo${libObj} -c dist/jxl.c`, ROOT);
   }
   if (needsRebuild(benchObj, `${ROOT}/test/jxl_bench.c`, DIST_H)) {
     await runCmd(
-      `cl ${clMd} -Idist -Fo${benchObj} -c test/jxl_bench.c`,
-      ROOT,
-    );
-  }
-  if (needsRebuild(refObj, `${ROOT}/test/bench_libjxl.c`)) {
-    await runCmd(
-      `cl ${clMd} -DJXL_STATIC_DEFINE -I${inc} -I${incBuild} -Fo${refObj} -c test/bench_libjxl.c`,
+      `cl ${clMd} -DJXL_STATIC_DEFINE -Idist -I${inc} -I${incBuild} -Fo${benchObj} -c test/jxl_bench.c`,
       ROOT,
     );
   }
   const libs = libjxlLibs();
-  if (needsRebuild(exePath, libObj, benchObj, refObj, ...libs)) {
+  if (needsRebuild(exePath, libObj, benchObj, ...libs)) {
     await runCmd(
-      `cl -nologo ${libObj} ${benchObj} ${refObj} -Fe:${exePath} -link -LTCG ${libs.join(" ")}`,
+      `cl -nologo ${libObj} ${benchObj} -Fe:${exePath} -link -LTCG ${libs.join(" ")}`,
       ROOT,
     );
   }

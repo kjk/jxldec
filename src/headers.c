@@ -141,7 +141,7 @@ static void read_extensions(jxl_br *br) {
 static void colour_encoding_default(jxl_colour_encoding *c) {
     memset(c, 0, sizeof(*c));
     c->want_icc = 0;
-    c->colour_space = JXL_CS_RGB;
+    c->colour_space = JXLDEC_CS_RGB;
     c->white_point = JXL_WP_D65;
     c->primaries = JXL_PRIMARIES_SRGB;
     c->tf = JXL_TF_SRGB;
@@ -163,14 +163,14 @@ static void colour_encoding_read(jxl_ctx *ctx, jxl_br *br,
     }
     if (c->want_icc) return;
 
-    if (c->colour_space != JXL_CS_XYB) {
+    if (c->colour_space != JXLDEC_CS_XYB) {
         c->white_point = (jxl_white_point)jxl_br_enum(br);
         if (c->white_point == JXL_WP_CUSTOM) {
             c->white_xy[0] = read_customxy(br);
             c->white_xy[1] = read_customxy(br);
         }
     }
-    if (c->colour_space != JXL_CS_XYB && c->colour_space != JXL_CS_GRAY) {
+    if (c->colour_space != JXLDEC_CS_XYB && c->colour_space != JXLDEC_CS_GRAY) {
         c->primaries = (jxl_primaries)jxl_br_enum(br);
         if (c->primaries == JXL_PRIMARIES_CUSTOM) {
             int i;

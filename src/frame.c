@@ -249,7 +249,7 @@ int jxl_read_frame_header(jxl_ctx *ctx, jxl_br *br, const jxl_size_header *size,
 
     fh->encoded_color_channels =
         (fh->encoding == JXL_ENC_MODULAR && !fh->do_ycbcr && !meta->xyb_encoded &&
-         meta->colour.colour_space == JXL_CS_GRAY) ? 1 : 3;
+         meta->colour.colour_space == JXLDEC_CS_GRAY) ? 1 : 3;
 
     if (fh->do_ycbcr && !(fh->flags & JXL_FF_USE_LF_FRAME)) {
         for (i = 0; i < 3; i++) fh->jpeg_upsampling[i] = jxl_br_read(br, 2);
