@@ -110,14 +110,17 @@ static int cmd_frames(jxl_ctx *ctx, const uint8_t *data, size_t len) {
             break;
         }
         printf("frame %d: type %d enc %s %ux%u+%d+%d flags 0x%x passes %u "
-               "groups %u lfgroups %u toc %u sections %u bytes last %d\n",
+               "groups %u lfgroups %u toc %u sections %u bytes last %d "
+               "blend %d/src %u ref %u ct %d\n",
                idx, (int)fh.frame_type,
                fh.encoding == JXL_ENC_MODULAR ? "modular" : "vardct",
                (unsigned)fh.width, (unsigned)fh.height, (int)fh.x0, (int)fh.y0,
                (unsigned)fh.flags, (unsigned)fh.passes.num_passes,
                (unsigned)jxl_frame_num_groups(&fh),
                (unsigned)jxl_frame_num_lf_groups(&fh), (unsigned)toc.count,
-               (unsigned)toc.total_size, fh.is_last);
+               (unsigned)toc.total_size, fh.is_last, (int)fh.blending.mode,
+               (unsigned)fh.blending.source, (unsigned)fh.save_as_reference,
+               fh.save_before_ct);
         end = toc.end_off + toc.total_size;
         idx++;
         {

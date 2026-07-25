@@ -6,18 +6,30 @@
 
 #include <math.h>
 
+static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
+                       int *count_out, jxl_frame_info *info_out);
+
 int jxl_doc_frame_count(jxl_doc *doc) {
+    int count = 0;
     if (!doc) return 0;
-    return 1;
+    if (doc->frame_count > 0) return doc->frame_count;
+    if (walk_frames(doc, -1, NULL, &count, NULL) != 0) return 1;
+    doc->frame_count = count > 0 ? count : 1;
+    return doc->frame_count;
 }
 
 int jxl_doc_frame_info(jxl_doc *doc, int frame_no, jxl_frame_info *info) {
-    if (!doc || !info || frame_no != 0) return -1;
+    jxl_fimage img;
+    int rc;
+    if (!doc || !info || frame_no < 0) return -1;
     memset(info, 0, sizeof(*info));
     info->tps_numerator = (int)doc->meta.animation.tps_numerator;
     info->tps_denominator = (int)doc->meta.animation.tps_denominator;
     info->is_last = 1;
-    return 0;
+    memset(&img, 0, sizeof(img));
+    rc = walk_frames(doc, frame_no, &img, NULL, info);
+    jxl_fimage_free(doc->ctx, &img);
+    return rc;
 }
 
 static jxl_format resolve_format(const jxl_image_info *ii, jxl_format fmt) {
@@ -188,18 +200,25 @@ static int frame_is_keyframe(const jxl_frame_header *fh) {
     return fh->is_last || fh->duration != 0;
 }
 
-/* Decodes frames in order until the `frame_no`-th displayed frame, keeping
-   LF and reference frames in `st` along the way. */
-static int decode_frame_planes(jxl_doc *doc, int frame_no, jxl_fimage *img) {
+/* Walks the frame chain. frame_no < 0 with count_out set only counts the
+   displayed frames. Displayed frames are composited onto the canvas their
+   blending info names, so animation frames that carry only a changed
+   rectangle land in the right place. */
+static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
+                       int *count_out, jxl_frame_info *info_out) {
     jxl_ctx *ctx = doc->ctx;
     jxl_frame_state st;
+    jxl_fimage canvas;
+    int canvas_valid = 0;
     jxl_br br;
     int idx = 0;
     int rc = -1;
 
     memset(&st, 0, sizeof(st));
+    memset(&canvas, 0, sizeof(canvas));
     jxl_br_init(&br, doc->container.cs, doc->container.cs_len);
     jxl_br_seek_byte(&br, doc->first_frame_off);
+
     for (;;) {
         jxl_frame_header fh;
         jxl_toc toc;
@@ -223,6 +242,16 @@ static int decode_frame_planes(jxl_doc *doc, int frame_no, jxl_fimage *img) {
         want = keyframe && idx == frame_no;
         apply_ct = want || !fh.save_before_ct;
 
+        if (count_out && !want) {
+            /* Counting only: skip the pixel work entirely. */
+            if (keyframe) idx++;
+            jxl_toc_free(ctx, &toc);
+            jxl_frame_header_free(ctx, &fh);
+            if (last || end >= doc->container.cs_len) break;
+            jxl_br_seek_byte(&br, end);
+            continue;
+        }
+
         if (jxl_frame_decode(ctx, doc, &fh, &toc, &st, apply_ct, &tmp) != 0) {
             jxl_toc_free(ctx, &toc);
             jxl_frame_header_free(ctx, &fh);
@@ -234,34 +263,104 @@ static int decode_frame_planes(jxl_doc *doc, int frame_no, jxl_fimage *img) {
             st.lf_image = tmp;
             st.lf_valid = 1;
             memset(&tmp, 0, sizeof(tmp));
-        } else if (!keyframe && fh.save_as_reference < 4) {
-            uint32_t slot = fh.save_as_reference;
-            jxl_fimage_free(ctx, &st.refs[slot]);
-            st.refs[slot] = tmp;
-            st.refs_valid[slot] = 1;
-            memset(&tmp, 0, sizeof(tmp));
+        } else if (!keyframe) {
+            if (fh.save_as_reference < 4) {
+                uint32_t slot = fh.save_as_reference;
+                jxl_fimage_free(ctx, &st.refs[slot]);
+                st.refs[slot] = tmp;
+                st.refs_valid[slot] = 1;
+                memset(&tmp, 0, sizeof(tmp));
+            }
+        } else {
+            uint32_t src = fh.blending.source;
+            int cropped = fh.have_crop || tmp.w != doc->size.width ||
+                          tmp.h != doc->size.height;
+            int needs_canvas = cropped || fh.blending.mode != JXL_BLEND_REPLACE;
+            int failed = 0;
+
+            if (!needs_canvas) {
+                jxl_fimage_free(ctx, &canvas);
+                canvas = tmp;
+                memset(&tmp, 0, sizeof(tmp));
+            } else {
+                jxl_fimage base;
+                memset(&base, 0, sizeof(base));
+                if (src < 4 && st.refs_valid[src]) {
+                    failed = jxl_fimage_copy(ctx, &base, &st.refs[src]) != 0;
+                } else if (canvas_valid) {
+                    failed = jxl_fimage_copy(ctx, &base, &canvas) != 0;
+                } else {
+                    failed = jxl_fimage_blank_like(ctx, &base, &tmp,
+                                                   doc->size.width,
+                                                   doc->size.height) != 0;
+                }
+                if (!failed) {
+                    jxl_blend_frame(ctx, &base, &tmp, &fh, &doc->meta);
+                    jxl_fimage_free(ctx, &canvas);
+                    canvas = base;
+                } else {
+                    jxl_fimage_free(ctx, &base);
+                }
+                jxl_fimage_free(ctx, &tmp);
+            }
+            if (failed) {
+                jxl_toc_free(ctx, &toc);
+                jxl_frame_header_free(ctx, &fh);
+                goto done;
+            }
+            canvas_valid = 1;
+            if (fh.save_as_reference < 4 && !fh.is_last) {
+                uint32_t slot = fh.save_as_reference;
+                jxl_fimage_free(ctx, &st.refs[slot]);
+                memset(&st.refs[slot], 0, sizeof(st.refs[slot]));
+                if (jxl_fimage_copy(ctx, &st.refs[slot], &canvas) == 0) {
+                    st.refs_valid[slot] = 1;
+                }
+            }
         }
 
         if (want) {
-            *img = tmp;
-            memset(&tmp, 0, sizeof(tmp));
+            *img = canvas;
+            memset(&canvas, 0, sizeof(canvas));
+            canvas_valid = 0;
+            if (info_out) {
+                info_out->duration_ticks = (int)fh.duration;
+                info_out->is_last = fh.is_last;
+            }
             jxl_toc_free(ctx, &toc);
             jxl_frame_header_free(ctx, &fh);
             rc = 0;
             goto done;
         }
         jxl_fimage_free(ctx, &tmp);
-        if (keyframe) idx++;
+        if (keyframe) {
+            idx++;
+            st.visible_frames++;
+            st.invisible_frames = 0;
+        } else {
+            st.invisible_frames++;
+        }
         jxl_toc_free(ctx, &toc);
         jxl_frame_header_free(ctx, &fh);
         if (last || end >= doc->container.cs_len) break;
         jxl_br_seek_byte(&br, end);
     }
-    JXL_ERR(ctx, "render: no such frame %d", frame_no);
+
+    if (count_out) {
+        *count_out = idx;
+        rc = 0;
+    } else {
+        JXL_ERR(ctx, "render: no such frame %d", frame_no);
+    }
 
 done:
+    jxl_fimage_free(ctx, &canvas);
     jxl_frame_state_free(ctx, &st);
     return rc;
+}
+
+static int decode_frame_planes(jxl_doc *doc, int frame_no, jxl_fimage *img) {
+    return walk_frames(doc, frame_no, img, NULL, NULL);
 }
 
 jxl_image *jxl_frame_render(jxl_doc *doc, int frame_no, jxl_format fmt) {

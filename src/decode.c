@@ -455,6 +455,10 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     jxl_group_lists gl;
     jxl_pass_shifts pshifts;
     jxl_vardct_state vd;
+    jxl_patches patches;
+    jxl_splines splines;
+    jxl_noise_params noise;
+    int have_patches = 0, have_splines = 0, have_noise = 0;
     int is_vardct;
     uint32_t nspecs = 0, i, split;
     uint32_t color_w, color_h, group_dim, group_dim_shift;
@@ -470,13 +474,12 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     memset(&prefix, 0, sizeof(prefix));
     memset(&gl, 0, sizeof(gl));
     memset(&vd, 0, sizeof(vd));
+    memset(&patches, 0, sizeof(patches));
+    memset(&splines, 0, sizeof(splines));
+    memset(&noise, 0, sizeof(noise));
     memset(out, 0, sizeof(*out));
 
     is_vardct = (fh->encoding == JXL_ENC_VARDCT);
-    if (fh->flags & (JXL_FF_PATCHES | JXL_FF_SPLINES | JXL_FF_NOISE)) {
-        JXL_ERR(ctx, "frame: patches/splines/noise are not implemented yet");
-        return -1;
-    }
     if ((fh->flags & JXL_FF_USE_LF_FRAME) && !st->lf_valid) {
         JXL_ERR(ctx, "frame: LF frame referenced but not decoded");
         return -1;
@@ -500,6 +503,18 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     br = section_reader(&sec, JXL_TOC_LF_GLOBAL, 0, 0);
     if (!br) return -1;
 
+    if (fh->flags & JXL_FF_PATCHES) {
+        if (jxl_patches_read(ctx, br, meta, fh, &patches) != 0) goto done;
+        have_patches = 1;
+    }
+    if (fh->flags & JXL_FF_SPLINES) {
+        if (jxl_splines_read(ctx, br, fh, &splines) != 0) goto done;
+        have_splines = 1;
+    }
+    if (fh->flags & JXL_FF_NOISE) {
+        if (jxl_noise_params_read(br, &noise) != 0) goto done;
+        have_noise = 1;
+    }
     lf_dequant_read(br, &lf_dequant);
 
     if (is_vardct) {
@@ -864,6 +879,27 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         }
     }
 
+    /* Patches blend pre-color-transform samples from a reference frame. */
+    if (have_patches) {
+        if (jxl_apply_patches(ctx, out, &patches, meta, st->refs,
+                              st->refs_valid) != 0)
+            goto done;
+    }
+
+    if (have_splines) {
+        float cx = is_vardct ? vd.chan_corr.base_correlation_x : 0.0f;
+        float cb = is_vardct ? vd.chan_corr.base_correlation_b : 1.0f;
+        if (jxl_render_splines(ctx, out, &splines, fh, cx, cb) != 0) goto done;
+    }
+
+    if (have_noise) {
+        float cx = is_vardct ? vd.chan_corr.base_correlation_x : 0.0f;
+        float cb = is_vardct ? vd.chan_corr.base_correlation_b : 1.0f;
+        if (jxl_render_noise(ctx, out, &noise, fh, st->visible_frames,
+                             st->invisible_frames, cx, cb) != 0)
+            goto done;
+    }
+
     /* ----- XYB -> the image's color space ----- */
     if (apply_ct && meta->xyb_encoded && out->ncolor >= 3) {
         size_t n = (size_t)out->plane[0].w * out->plane[0].h;
@@ -886,6 +922,8 @@ done:
     jxl_chanlist_free(ctx, &gcl);
     jxl_modular_free(ctx, &gmod);
     vardct_state_free(ctx, &vd);
+    jxl_patches_free(ctx, &patches);
+    jxl_splines_free(ctx, &splines);
     if (has_global_ma) jxl_ma_config_free(ctx, &global_ma);
     if (rc != 0) jxl_fimage_free(ctx, out);
     return rc;

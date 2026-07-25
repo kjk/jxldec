@@ -772,6 +772,80 @@ void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
 void jxl_opsin_matrix_for(const jxl_image_metadata *meta, float out[9]);
 
 /* ===================================================================== */
+/* patch -- rectangles blended in from a reference frame                  */
+/* ===================================================================== */
+
+typedef enum {
+    JXL_PATCH_NONE = 0,
+    JXL_PATCH_REPLACE,
+    JXL_PATCH_ADD,
+    JXL_PATCH_MUL,
+    JXL_PATCH_BLEND_ABOVE,
+    JXL_PATCH_BLEND_BELOW,
+    JXL_PATCH_MULADD_ABOVE,
+    JXL_PATCH_MULADD_BELOW
+} jxl_patch_mode;
+
+typedef struct {
+    uint8_t mode;
+    uint32_t alpha_channel;
+    int clamp;
+} jxl_patch_blend;
+
+typedef struct {
+    int32_t x, y;
+    jxl_patch_blend *blending;   /* num_extra + 1 entries */
+} jxl_patch_target;
+
+typedef struct {
+    uint32_t ref_idx;
+    uint32_t x0, y0, width, height;
+    jxl_patch_target *targets;
+    uint32_t ntargets;
+} jxl_patch_ref;
+
+typedef struct {
+    jxl_patch_ref *refs;
+    uint32_t n;
+    uint32_t nblend;
+} jxl_patches;
+
+int jxl_patches_read(jxl_ctx *ctx, jxl_br *br, const jxl_image_metadata *meta,
+                     const jxl_frame_header *fh, jxl_patches *out);
+void jxl_patches_free(jxl_ctx *ctx, jxl_patches *p);
+
+/* ===================================================================== */
+/* spline -- smooth colored strokes drawn over the frame                  */
+/* ===================================================================== */
+
+typedef struct {
+    int64_t *px, *py;
+    uint32_t npoints;
+    int32_t xyb_dct[3][32];
+    int32_t sigma_dct[32];
+} jxl_quant_spline;
+
+typedef struct {
+    jxl_quant_spline *splines;
+    uint32_t n;
+    int32_t quant_adjust;
+} jxl_splines;
+
+int jxl_splines_read(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
+                     jxl_splines *out);
+void jxl_splines_free(jxl_ctx *ctx, jxl_splines *sp);
+
+/* ===================================================================== */
+/* noise -- regenerated photon/film noise                                 */
+/* ===================================================================== */
+
+typedef struct {
+    float lut[8];
+} jxl_noise_params;
+
+int jxl_noise_params_read(jxl_br *br, jxl_noise_params *np);
+
+/* ===================================================================== */
 /* decode -- frame decoding into float planes                             */
 /* ===================================================================== */
 
@@ -803,9 +877,26 @@ typedef struct {
     int refs_valid[4];
     jxl_fimage lf_image;
     int lf_valid;
+    /* Noise is seeded from how many frames have been shown so far. */
+    uint32_t visible_frames;
+    uint32_t invisible_frames;
 } jxl_frame_state;
 
 void jxl_frame_state_free(jxl_ctx *ctx, jxl_frame_state *st);
+
+int jxl_apply_patches(jxl_ctx *ctx, jxl_fimage *img, const jxl_patches *p,
+                      const jxl_image_metadata *meta, jxl_fimage refs[4],
+                      const int refs_valid[4]);
+int jxl_blend_frame(jxl_ctx *ctx, jxl_fimage *canvas, const jxl_fimage *frame,
+                    const jxl_frame_header *fh, const jxl_image_metadata *meta);
+int jxl_fimage_blank_like(jxl_ctx *ctx, jxl_fimage *out, const jxl_fimage *like,
+                          uint32_t w, uint32_t h);
+int jxl_fimage_copy(jxl_ctx *ctx, jxl_fimage *dst, const jxl_fimage *src);
+int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,
+                       const jxl_frame_header *fh, float corr_x, float corr_b);
+int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
+                     const jxl_frame_header *fh, uint32_t visible_frames,
+                     uint32_t invisible_frames, float corr_x, float corr_b);
 
 /* apply_ct == 0 leaves the frame in its pre-color-transform (XYB) form, which
    is what a frame saved "before CT" -- every LF frame -- must store. */
@@ -833,6 +924,7 @@ struct jxl_doc {
        first frame starts. */
     size_t first_frame_off;
     size_t first_frame_bitpos;    /* bit offset of first frame            */
+    int frame_count;              /* displayed frames; 0 until counted    */
 };
 
 #endif /* JXL_INTERNAL_H */
