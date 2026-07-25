@@ -172,6 +172,26 @@ Interleaved A/B, 5 runs, two passes, libjxl column flat throughout:
 | `flower_alpha.m_e3` (control) | 852ms | 847ms |
 | total of the five | 4549ms | 4454ms (-2.1%) |
 
+### Two things tried on the MA walk that did not work
+Both were measured interleaved A/B, 5 runs, two passes, and both were
+reverted. The walk as it stands looks like a local optimum.
+
+**Three levels per entry, instead of two.** The obvious follow-on: if one load
+per two levels beat one per level, one per three should be better again. It is
+**6% slower** (2.20x, 2.22x against 2.08x, 2.09x on the five-file set). Eager
+evaluation is what makes the flattening pay, and it does not scale: covering
+three levels needs 7 tests to advance 3 levels (2.33 per level) where two
+levels need 3 to advance 2 (1.5 per level), and only 3 of those 7 are ever on
+the taken path. Enough wasted evaluation to turn the loop from latency-bound
+into throughput-bound. Two levels balances the two effects; do not "finish the
+job" by going wider.
+
+**Padding the entry from 28 to 32 bytes.** At 28 bytes an entry straddles a
+64-byte cache line about 44% of the time, which looks like an easy fix. It is
+a wash: `flower.lm_d1` and `splines.lm_d1` gain ~5%, `m_e9` and `m_e3` lose
+~2-3%, netting to nothing (2.08x, 2.07x against 2.06x, 2.07x). Not worth 14%
+more memory for no consistent direction.
+
 ### Reading all three tests up front, not two of them in sequence
 Flattening halved the *loads*, but the chain that was left ran
 `eval -> select -> eval -> load`: picking the second test only after the first
