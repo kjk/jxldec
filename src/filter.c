@@ -7,12 +7,27 @@
  * metadata.
  *
  * Gaborish clamps at the borders, EPF mirrors (without repeating the edge
- * sample) -- matching libjxl in both cases.
+ * sample) -- matching libjxl in both cases. Both resolve that edge handling
+ * per row and then run a mirror-free interior, which is where the SSE2 paths
+ * live; those are written to associate their adds exactly as the scalar code
+ * does, so the two produce bit-identical output (-DJXL_EPF_FORCE_SCALAR
+ * builds the scalar side alone to check it).
  */
 #include "jxl_internal.h"
 
 #include <math.h>
 #include <stddef.h>
+
+/* SSE2 is baseline on x64. epf_pass is about half the decode of a VarDCT
+   file, and step 0 alone is 12 taps x 5 SAD offsets x 3 channels per
+   sample, so it is where hand-vectorising pays most. */
+/* -DJXL_EPF_FORCE_SCALAR builds the scalar path only. The vector path is
+   meant to be bit-identical to it, and that is worth being able to prove
+   rather than assert: build both and diff the output. */
+#if !defined(JXL_EPF_FORCE_SCALAR) &&     (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) ||      (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#define JXL_EPF_SSE2 1
+#include <emmintrin.h>
+#endif
 
 static uint32_t jxl_mirror(int64_t offset, uint32_t len) {
     for (;;) {
@@ -22,40 +37,72 @@ static uint32_t jxl_mirror(int64_t offset, uint32_t len) {
     }
 }
 
-static float sample_clamped(const float *p, size_t stride, uint32_t w,
-                            uint32_t h, int64_t x, int64_t y) {
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if ((uint64_t)x >= w) x = (int64_t)w - 1;
-    if ((uint64_t)y >= h) y = (int64_t)h - 1;
-    return p[(size_t)y * stride + (size_t)x];
-}
-
 int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
                     size_t stride, const float weights[3][2]) {
     float *tmp;
     int c;
     if (w == 0 || h == 0) return 0;
-    tmp = (float *)jxl_calloc(ctx, (size_t)w * h, sizeof(float));
+    /* Every sample is written before it is read back, so no zeroing. */
+    tmp = (float *)jxl_malloc(ctx, (size_t)w * h * sizeof(float));
     if (!tmp) return -1;
 
     for (c = 0; c < 3; c++) {
         float w0 = weights[c][0], w1 = weights[c][1];
         float gw = 1.0f / (1.0f + w0 * 4.0f + w1 * 4.0f);
         uint32_t x, y;
+#ifdef JXL_EPF_SSE2
+        const __m128 v0 = _mm_set1_ps(w0), v1 = _mm_set1_ps(w1);
+        const __m128 vg = _mm_set1_ps(gw);
+#endif
         for (y = 0; y < h; y++) {
-            for (x = 0; x < w; x++) {
-                float cc = plane[c][(size_t)y * stride + x];
-                float n = sample_clamped(plane[c], stride, w, h, x, (int64_t)y - 1);
-                float s = sample_clamped(plane[c], stride, w, h, x, (int64_t)y + 1);
-                float we = sample_clamped(plane[c], stride, w, h, (int64_t)x - 1, y);
-                float e = sample_clamped(plane[c], stride, w, h, (int64_t)x + 1, y);
-                float nw = sample_clamped(plane[c], stride, w, h, (int64_t)x - 1, (int64_t)y - 1);
-                float ne = sample_clamped(plane[c], stride, w, h, (int64_t)x + 1, (int64_t)y - 1);
-                float sw = sample_clamped(plane[c], stride, w, h, (int64_t)x - 1, (int64_t)y + 1);
-                float se = sample_clamped(plane[c], stride, w, h, (int64_t)x + 1, (int64_t)y + 1);
-                tmp[(size_t)y * w + x] =
-                    (cc + (n + s + we + e) * w0 + (nw + ne + sw + se) * w1) * gw;
+            /* Clamping depends only on the row, so resolve the three row
+               pointers once instead of calling sample_clamped -- four
+               branches -- eight times per sample. */
+            const float *rn = plane[c] + (size_t)(y > 0 ? y - 1 : 0) * stride;
+            const float *rc = plane[c] + (size_t)y * stride;
+            const float *rs = plane[c] + (size_t)(y + 1 < h ? y + 1 : h - 1) * stride;
+            float *dst = tmp + (size_t)y * w;
+            uint32_t xlo = w > 1 ? 1 : 0, xhi = w > 1 ? w - 1 : 0;
+
+            for (x = 0; x < xlo; x++) {
+                uint32_t xm = 0, xp = (w > 1) ? 1 : 0;
+                dst[x] = (rc[x] + (rn[x] + rs[x] + rc[xm] + rc[xp]) * w0 +
+                          (rn[xm] + rn[xp] + rs[xm] + rs[xp]) * w1) * gw;
+            }
+            x = xlo;
+#ifdef JXL_EPF_SSE2
+            /* Interior only: no clamping, so every tap is a fixed offset.
+               Lanes run the same operations in the same order as the scalar
+               path, so the result is bit-identical. */
+            for (; x + 4 <= xhi; x += 4) {
+                __m128 cc = _mm_loadu_ps(rc + x);
+                /* Left-to-right, exactly as the scalar expression associates:
+                   ((n + s) + w) + e. Float addition is not associative, so
+                   pairing the loads up differently changes the last bit --
+                   which is how the scalar/vector diff caught it. */
+                __m128 side = _mm_add_ps(_mm_loadu_ps(rn + x), _mm_loadu_ps(rs + x));
+                __m128 diag;
+                __m128 r;
+                side = _mm_add_ps(side, _mm_loadu_ps(rc + x - 1));
+                side = _mm_add_ps(side, _mm_loadu_ps(rc + x + 1));
+                diag = _mm_add_ps(_mm_loadu_ps(rn + x - 1), _mm_loadu_ps(rn + x + 1));
+                diag = _mm_add_ps(diag, _mm_loadu_ps(rs + x - 1));
+                diag = _mm_add_ps(diag, _mm_loadu_ps(rs + x + 1));
+                r = _mm_add_ps(cc, _mm_mul_ps(side, v0));
+                r = _mm_add_ps(r, _mm_mul_ps(diag, v1));
+                _mm_storeu_ps(dst + x, _mm_mul_ps(r, vg));
+            }
+#endif
+            for (; x < xhi; x++) {
+                dst[x] = (rc[x] +
+                          (rn[x] + rs[x] + rc[x - 1] + rc[x + 1]) * w0 +
+                          (rn[x - 1] + rn[x + 1] + rs[x - 1] + rs[x + 1]) * w1) * gw;
+            }
+            for (x = xhi; x < w; x++) {
+                uint32_t xm = x > 0 ? x - 1 : 0;
+                uint32_t xp = x + 1 < w ? x + 1 : w - 1;
+                dst[x] = (rc[x] + (rn[x] + rs[x] + rc[xm] + rc[xp]) * w0 +
+                          (rn[xm] + rn[xp] + rs[xm] + rs[xp]) * w1) * gw;
             }
         }
         for (y = 0; y < h; y++) {
@@ -97,6 +144,9 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
     float step_mul, border_mul;
     uint32_t x, y;
     int c, k, d;
+#ifdef JXL_EPF_SSE2
+    __m128 epf_absmask, sm_border, sm_lo, sm_hi;
+#endif
 
     if (step == 0) {
         kernel = epf_kernel_2; nkernel = 12;
@@ -115,6 +165,12 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
         pad = 1;
     }
     border_mul = step_mul * epf->border_sad_mul;
+#ifdef JXL_EPF_SSE2
+    epf_absmask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+    sm_border = _mm_set1_ps(border_mul);
+    sm_lo = _mm_setr_ps(border_mul, step_mul, step_mul, step_mul);
+    sm_hi = _mm_setr_ps(step_mul, step_mul, step_mul, border_mul);
+#endif
     for (c = 0; c < 3; c++) cscale[c] = epf->channel_scale[c];
     for (d = 0; d < ndist; d++)
         doff[d] = (ptrdiff_t)dist_off[d][1] * (ptrdiff_t)stride + dist_off[d][0];
@@ -127,8 +183,72 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
         int y_inside = (y >= (uint32_t)pad && y + (uint32_t)pad < h);
         const float *sigma_row = sigma + (size_t)(y / 8) * sigma_stride;
         size_t row = (size_t)y * stride;
-        for (x = 0; x < w; x++) {
+        for (x = 0; x < w; ) {
             float sigma_val = sigma_row[x / 8];
+
+#ifdef JXL_EPF_SSE2
+            /* Four samples at a time down the row. Vectorising across x (not
+               across taps) means every lane runs the same operations in the
+               same order as the scalar path below, so the output is
+               bit-identical -- no tolerance risk, and the scalar path stays
+               the reference. Requires the whole quad to be in the mirror-free
+               interior and inside one sigma block: blocks are 8 wide and the
+               quad is 4-aligned, so x/8 is constant across it. */
+            if (y_inside && (x & 3u) == 0 &&
+                x >= (uint32_t)pad && x + 3 + (uint32_t)pad < w) {
+                __m128 dist4[12], sum4[3], sw, nis;
+                if (sigma_val < 0.3f) {
+                    for (c = 0; c < 3; c++) {
+                        _mm_storeu_ps(out[c] + row + x,
+                                      _mm_loadu_ps(in[c] + row + x));
+                    }
+                    x += 4;
+                    continue;
+                }
+                /* sm is per-lane: within an 8-wide block only lanes 0 and 7
+                   take border_mul, and a 4-aligned quad covers either 0..3 or
+                   4..7, so there are just two patterns. */
+                nis = _mm_mul_ps(_mm_set1_ps(EPF_SIGMA_MUL / sigma_val),
+                                 is_y_border ? sm_border
+                                             : ((x & 7u) == 0 ? sm_lo : sm_hi));
+                for (k = 0; k < nkernel; k++) dist4[k] = _mm_setzero_ps();
+                for (c = 0; c < 3; c++) {
+                    const float *p = in[c] + row + x;
+                    __m128 cs = _mm_set1_ps(cscale[c]);
+                    __m128 cen[5];
+                    for (d = 0; d < ndist; d++) cen[d] = _mm_loadu_ps(p + doff[d]);
+                    for (k = 0; k < nkernel; k++) {
+                        const float *pk = p + koff[k];
+                        __m128 acc = _mm_setzero_ps();
+                        for (d = 0; d < ndist; d++) {
+                            acc = _mm_add_ps(acc, _mm_and_ps(epf_absmask,
+                                _mm_sub_ps(_mm_loadu_ps(pk + doff[d]), cen[d])));
+                        }
+                        dist4[k] = _mm_add_ps(dist4[k], _mm_mul_ps(cs, acc));
+                    }
+                }
+                for (c = 0; c < 3; c++) sum4[c] = _mm_loadu_ps(in[c] + row + x);
+                sw = _mm_set1_ps(1.0f);
+                for (k = 0; k < nkernel; k++) {
+                    __m128 wgt = _mm_add_ps(_mm_set1_ps(1.0f),
+                                            _mm_mul_ps(dist4[k], nis));
+                    wgt = _mm_max_ps(wgt, _mm_setzero_ps());
+                    sw = _mm_add_ps(sw, wgt);
+                    for (c = 0; c < 3; c++) {
+                        sum4[c] = _mm_add_ps(sum4[c], _mm_mul_ps(wgt,
+                            _mm_loadu_ps(in[c] + row + x + koff[k])));
+                    }
+                }
+                /* Real division, not _mm_rcp_ps: the approximate reciprocal
+                   would diverge from the scalar path. */
+                sw = _mm_div_ps(_mm_set1_ps(1.0f), sw);
+                for (c = 0; c < 3; c++) {
+                    _mm_storeu_ps(out[c] + row + x, _mm_mul_ps(sum4[c], sw));
+                }
+                x += 4;
+                continue;
+            }
+#endif
             float dist[12];   /* SAD to each kernel tap, all channels folded in */
             size_t soff[12];  /* kernel tap -> absolute sample index */
             float sum[3];
@@ -136,6 +256,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
 
             if (sigma_val < 0.3f) {
                 for (c = 0; c < 3; c++) out[c][row + x] = in[c][row + x];
+                x++;
                 continue;
             }
             if (is_y_border || (x & 7u) == 0 || (x & 7u) == 7) sm = border_mul;
@@ -213,6 +334,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                than three divisions. */
             inv_w = 1.0f / sum_weights;
             for (c = 0; c < 3; c++) out[c][row + x] = sum[c] * inv_w;
+            x++;
         }
     }
     return 0;

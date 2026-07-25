@@ -12,7 +12,17 @@ import { dirname, resolve } from "path";
 import { buildProfHarness, isWindows } from "./build";
 
 const ROOT = dirname(import.meta.dir);
-const SAMPLY = resolve(ROOT, "../samply/out/rel64/samply.exe");
+// JXLDEC_SAMPLY overrides; otherwise try the two places it usually lives.
+const SAMPLY = (() => {
+  const env = process.env.JXLDEC_SAMPLY;
+  if (env && existsSync(env)) return env;
+  for (const p of ["../samply/out/rel64/samply.exe",
+                   "../exp/samply/out/rel64/samply.exe"]) {
+    const abs = resolve(ROOT, p);
+    if (existsSync(abs)) return abs;
+  }
+  return resolve(ROOT, "../samply/out/rel64/samply.exe");
+})();
 
 const argv = process.argv.slice(2);
 const flagVal = (name: string, dflt: string) => {

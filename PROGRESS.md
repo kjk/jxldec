@@ -62,20 +62,20 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **2.61x libjxl** (2.74x before the noise and
-upsampling work below; 2.33x over the smaller 821-file corpus that predates
-the `v_noise`, `v_rs*`, `v_orient`, `v_p3` and `v_2020` presets, which are
-lossy paths and pull the average up). libjxl is AVX2 throughout; we are scalar
-C apart from two SSE2 hot loops, so a constant factor is expected.
+1245-file corpus we are **2.43x libjxl** (2.74x before the SSE2 work below;
+2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
+`v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
+average up). libjxl is AVX2 throughout; we are scalar C apart from four SSE2
+hot loops, so a constant factor is expected.
 
 `bun cmd/prof.ts <file.jxl>` profiles our decoder alone through the sibling
 `../samply` and prints samply's `-print-agent` report (top self-time
 functions, hot source lines, heaviest call path). That is how the numbers
 below were found.
 
-The worst ratios among files that take libjxl more than 5ms are now
-`P3-sRGB-color-bars.v_*` at 6.5-6.8x and `P3-sRGB-green.v_rs2` at 6.6x. Files
-below ~1ms sit at up to 9x purely on fixed setup cost.
+The worst ratios among files that take libjxl more than 5ms are now the
+`v_rs2` set at 6.0-6.5x, whose upsampling filter is genuinely 25 taps per
+output sample. Files below ~1ms sit at up to 9x purely on fixed setup cost.
 
 ### The EPF and spline rewrites
 Three hot loops were doing the same work three or more times over.
@@ -124,17 +124,58 @@ All 821 files decode to the same bytes as before: the same 63 files differ
 from `djxl`, with the same max and mean deviation on each.
 
 ### What is left
-`epf_pass` is still ~48% of a VarDCT decode, and it is now arithmetic-bound
-rather than overhead-bound. Two further options, neither taken:
-- The kernel taps are symmetric pairs and the SAD is symmetric under swapping
-  the two footprints, so `dist(x, y, k) == dist(x+kx, y+ky, -k)`. Caching six
-  SADs per sample in a rolling three-row window would halve the SAD work. The
-  `sigma < 0.3` early-out complicates it: a skipped sample's neighbours still
-  want its cached values.
-- libjxl runs this loop 8 samples wide under AVX2. Matching that needs
-  intrinsics, which would end the scalar-C property.
+`epf_pass` was ~48% of a VarDCT decode and is now 9% (see the SSE2 entry in
+the log). The profile has moved on: `dct_1d` is **27% self**, `jxl_dct_2d`
+31% inclusive, so the IDCT is now the single biggest cost by a wide margin
+and is the obvious next target. After it, `jxl_linear_to_tf` at 8.8% (a
+`powf` per sample) and `memset_repstos` at 8.3% -- the latter is `calloc` in
+`jxl_fplane_alloc` zeroing planes that are then fully written, the same waste
+already removed from the noise and gaborish scratch buffers.
+
+Still not taken on EPF: the kernel taps are symmetric pairs and the SAD is
+symmetric under swapping the two footprints, so `dist(x, y, k) ==
+dist(x+kx, y+ky, -k)`. Caching six SADs per sample in a rolling three-row
+window would halve the SAD work. The `sigma < 0.3` early-out complicates it:
+a skipped sample's neighbours still want its cached values.
 
 ## Log
+
+### SSE2 in the two loop filters, proved bit-identical
+With the noise stage fixed, a samply profile of `P3-sRGB-color-bars.v_d1`
+(`bun cmd/prof.ts`, which now also finds samply under `../exp/samply`) put
+`epf_pass` at 6.8% self and **`jxl_apply_gabor` at 16.7%** -- and `dct_1d`
+above both. EPF's share was low only because the file is small; disabling EPF
+outright showed it was still **half the decode** of the slow files
+(`P3-sRGB-color-bars.v_d1` 0.14s -> 0.07s, `splines.v_e3` 0.30s -> 0.15s).
+
+Both filters are now SSE2, vectorised **across x rather than across taps**.
+That choice is what makes the result bit-identical: each lane executes the
+same operations in the same order as the scalar code, so there is no tolerance
+question and the scalar path remains the reference. `_mm_div_ps` rather than
+`_mm_rcp_ps` for the same reason.
+
+- **`epf_pass`**: four samples per iteration when the whole quad is in the
+  mirror-free interior. Sigma blocks are 8 wide and the quad is 4-aligned, so
+  `x/8` is constant across it; `border_sad_mul` applies only to lanes 0 and 7
+  of a block, which is two fixed patterns.
+- **`jxl_apply_gabor`** had the same shape as the noise and upsampling bugs:
+  `sample_clamped`, four branches, called eight times per sample even in the
+  interior. Row pointers are now clamped once per row and the interior needs
+  no clamping at all. Its scratch was `calloc`ed and fully overwritten, too.
+
+`-DJXL_EPF_FORCE_SCALAR` builds the scalar side alone so the claim can be
+checked rather than asserted, and it earned its keep immediately: the first
+gaborish vector version paired the loads as `(n+s)+(w+e)` where the scalar
+expression associates `((n+s)+w)+e`. Float addition is not associative, so 18
+of 80 files differed in the last bit. Fixed, then 120/120 identical.
+
+    P3-sRGB-color-bars.v_d1   50.9ms  6.57x -> 39.7ms  4.81x
+    splines.v_e3             256.8ms  6.80x -> 171.7ms 4.53x
+    flower.v_d1              244.3ms  5.27x -> 177.6ms 3.82x
+    flower.v_prog            248.2ms  4.33x -> 185.8ms 3.27x
+
+`jxl_apply_gabor` drops from 16.7% self to 2.3%. Corpus total **2.61x ->
+2.43x**, 43.2s -> 40.3s. 1245/1245 ok, ASan clean, 115 fuzz reproducers clean.
 
 ### The noise convolution was doing 25 taps where 10 would do
 Re-benchmarking after the corpus grew put `v_noise` at the top on both axes:
