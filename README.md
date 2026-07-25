@@ -51,11 +51,34 @@ The output is binary PAM, the same thing `djxl in.jxl out.pam` writes, so the
 two compare byte for byte.
 
 ## Status
-See [PROGRESS.md](PROGRESS.md) for the current pass rate and the list of
-features that are still missing. In short: Modular (lossless) decoding is
-byte-exact against libjxl; VarDCT matches within one 8-bit step for sRGB
-content; patches, splines, noise, animation and non-sRGB primaries are not
-implemented yet.
+See [PROGRESS.md](PROGRESS.md) for the full feature matrix. In short,
+`bun cmd/tests.ts -all` decodes 821 corpus files and compares each against
+`djxl`: **758 match, and no file fails to decode.**
+
+* **Byte-exact** against libjxl: Modular lossless (every effort level,
+  palette, squeeze, RCT), plus patches and reference frames.
+* **Within one 8-bit step**: VarDCT including progressive/LF frames, and
+  lossy Modular (XYB), for sRGB content.
+* Also working: gaborish and EPF, splines, noise, animation, embedded ICC
+  profiles, non-sRGB primaries (BT.2020, P3), and YCbCr/JPEG-transcoded
+  frames in every chroma subsampling mode.
+
+The 63 files that differ are all lossy VarDCT paths, off by 2-10 counts out of
+255 on scattered pixels with a mean under 0.3. libjxl, jxl-oxide and this
+decoder use different IDCT factorizations and different `powf` approximations,
+so exact equality is not achievable — libjxl's own conformance testing uses a
+tolerance too. Noise reproduces approximately rather than exactly.
+
+Not implemented: encoding, JPEG reconstruction (`jbrd` boxes are located but
+not applied), and multithreading.
+
+## Performance
+`bun cmd/bench.ts -all` links the `dist/` amalgamation and libjxl's static
+libraries into one process and times both single-threaded, best of N. Over the
+whole 821-file corpus this decoder takes **2.33x** libjxl's decode time, down
+from 3.22x. libjxl is AVX2 and this is scalar C, so a constant factor is
+expected; PROGRESS.md records what closed the gap and, just as usefully, which
+optimizations were measured and thrown away.
 
 ## How it was made
 An AI-assisted port of [jxl-oxide](https://github.com/tirr-c/jxl-oxide) (Rust),
