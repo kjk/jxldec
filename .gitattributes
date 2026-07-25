@@ -1,0 +1,2 @@
+# The sources are LF everywhere; keep tooling from reintroducing CRLF.
+* text=auto eol=lf
