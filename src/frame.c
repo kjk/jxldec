@@ -48,8 +48,32 @@ uint32_t jxl_frame_groups_per_row(const jxl_frame_header *fh) {
     return div_ceil(jxl_frame_color_width(fh), jxl_frame_group_dim(fh));
 }
 
+/* The largest subsampling shift over the three channels. The block grid is
+   rounded up to a multiple of it so that every subsampled channel still has a
+   whole number of blocks. */
+static uint32_t max_shift(const jxl_frame_header *fh, int vertical) {
+    uint32_t m = 0;
+    int i;
+    for (i = 0; i < 3; i++) {
+        uint32_t mode = fh->jpeg_upsampling[i];
+        uint32_t s = vertical ? (mode == 1 || mode == 3) : (mode == 1 || mode == 2);
+        if (s > m) m = s;
+    }
+    return m;
+}
+
+uint32_t jxl_frame_blocks_w(const jxl_frame_header *fh) {
+    uint32_t sh = max_shift(fh, 0);
+    return div_ceil(jxl_frame_color_width(fh), 8u << sh) << sh;
+}
+
+uint32_t jxl_frame_blocks_h(const jxl_frame_header *fh) {
+    uint32_t sh = max_shift(fh, 1);
+    return div_ceil(jxl_frame_color_height(fh), 8u << sh) << sh;
+}
+
 uint32_t jxl_frame_lf_groups_per_row(const jxl_frame_header *fh) {
-    return div_ceil(jxl_frame_color_width(fh), jxl_frame_group_dim(fh) * 8);
+    return div_ceil(jxl_frame_blocks_w(fh), jxl_frame_group_dim(fh));
 }
 
 uint32_t jxl_frame_num_groups(const jxl_frame_header *fh) {
@@ -59,9 +83,9 @@ uint32_t jxl_frame_num_groups(const jxl_frame_header *fh) {
 }
 
 uint32_t jxl_frame_num_lf_groups(const jxl_frame_header *fh) {
-    uint32_t dim = jxl_frame_group_dim(fh) * 8;
-    return div_ceil(jxl_frame_color_width(fh), dim) *
-           div_ceil(jxl_frame_color_height(fh), dim);
+    uint32_t dim = jxl_frame_group_dim(fh);
+    return div_ceil(jxl_frame_blocks_w(fh), dim) *
+           div_ceil(jxl_frame_blocks_h(fh), dim);
 }
 
 /* ----- frame header ----- */

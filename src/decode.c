@@ -234,6 +234,9 @@ typedef struct {
     uint32_t bw, bh;              /* frame size in 8x8 blocks (rounded up) */
     uint32_t pw, ph;              /* pixel size == bw*8, bh*8              */
     float *lf[3];                 /* bw x bh, the dequantized LF image      */
+    /* Chroma subsampling shifts; a subsampled channel uses only the top-left
+       (bw >> hs) x (bh >> vs) corner of every bw-strided buffer. */
+    int hs[3], vs[3];
     int32_t *lfq[3];              /* bw x bh, the raw quantized LF values    */
     float *coeff[3];              /* pw x ph, coefficients then samples    */
     jxl_block_info *block_info;   /* bw x bh                               */
@@ -328,10 +331,10 @@ static int decode_lf_coeff(jxl_ctx *ctx, jxl_br *br, jxl_vardct_state *v,
     m_lf[2] = lfd->m_b_lf;
 
     for (i = 0; i < 3; i++) {
-        specs[i].w = w;
-        specs[i].h = h;
-        specs[i].hshift = 0;
-        specs[i].vshift = 0;
+        specs[plane_of[i]].w = w >> v->hs[i];
+        specs[plane_of[i]].h = h >> v->vs[i];
+        specs[plane_of[i]].hshift = 0;
+        specs[plane_of[i]].vshift = 0;
     }
     if (jxl_modular_init(ctx, &mod, br, specs, 3, global_ma, 0, bit_depth) != 0)
         goto done;
@@ -342,13 +345,15 @@ static int decode_lf_coeff(jxl_ctx *ctx, jxl_br *br, jxl_vardct_state *v,
     /* Plane c (X, Y, B) comes from Modular channel [1, 0, 2][c]. */
     for (i = 0; i < 3; i++) {
         const jxl_mchan *src = &mod.base[plane_of[i]];
-        float *dst = v->lf[i] + (size_t)base_by * v->bw + base_bx;
+        uint32_t bx0 = base_bx >> v->hs[i], by0 = base_by >> v->vs[i];
+        uint32_t lim_w = v->bw >> v->hs[i], lim_h = v->bh >> v->vs[i];
+        float *dst = v->lf[i] + (size_t)by0 * v->bw + bx0;
         uint32_t xx, yy;
         jxl_copy_lf_dequant(dst, v->bw, src, &v->quantizer, m_lf[i],
                             (int)extra_precision);
-        for (yy = 0; yy < src->h && base_by + yy < v->bh; yy++) {
-            for (xx = 0; xx < src->w && base_bx + xx < v->bw; xx++) {
-                v->lfq[i][(size_t)(base_by + yy) * v->bw + base_bx + xx] =
+        for (yy = 0; yy < src->h && by0 + yy < lim_h; yy++) {
+            for (xx = 0; xx < src->w && bx0 + xx < lim_w; xx++) {
+                v->lfq[i][(size_t)(by0 + yy) * v->bw + bx0 + xx] =
                     src->data[(size_t)yy * src->stride + xx];
             }
         }
@@ -400,29 +405,41 @@ static void vardct_finish_blocks(jxl_vardct_state *v,
 
     for (c = 0; c < 3; c++) {
         for (by = 0; by < v->bh; by++) {
+            uint32_t sby = by >> v->vs[c];
+            if ((sby << v->vs[c]) != by) continue;
             for (bx = 0; bx < v->bw; bx++) {
                 const jxl_block_info *bi = &v->block_info[(size_t)by * v->bw + bx];
+                uint32_t sbx = bx >> v->hs[c];
+                if ((sbx << v->hs[c]) != bx) continue;
                 if (bi->dct_select >= JXL_TR_COUNT) continue;
                 jxl_dequant_varblock(
-                    v->coeff[c] + (size_t)(by * 8) * v->pw + bx * 8, v->pw,
+                    v->coeff[c] + (size_t)(sby * 8) * v->pw + sbx * 8, v->pw,
                     bi->dct_select, bi->hf_mul, c, &v->dm, &v->quantizer,
                     qm_scale[c], meta->quant_bias[c], meta->quant_bias_numerator);
             }
         }
     }
 
-    jxl_cfl_hf(v->coeff[0], v->coeff[1], v->coeff[2], v->pw, v->pw, v->ph,
-               v->x_from_y, v->b_from_y, v->cfl_w, &v->chan_corr);
+    /* Chroma-from-luma needs the three channels sample-aligned, so it only
+       applies when nothing is subsampled -- as in libjxl's DequantDC. */
+    if (!v->hs[0] && !v->vs[0] && !v->hs[2] && !v->vs[2]) {
+        jxl_cfl_hf(v->coeff[0], v->coeff[1], v->coeff[2], v->pw, v->pw, v->ph,
+                   v->x_from_y, v->b_from_y, v->cfl_w, &v->chan_corr);
+    }
 
     for (c = 0; c < 3; c++) {
         for (by = 0; by < v->bh; by++) {
+            uint32_t sby = by >> v->vs[c];
+            if ((sby << v->vs[c]) != by) continue;
             for (bx = 0; bx < v->bw; bx++) {
                 const jxl_block_info *bi = &v->block_info[(size_t)by * v->bw + bx];
+                uint32_t sbx = bx >> v->hs[c];
                 float *blk;
+                if ((sbx << v->hs[c]) != bx) continue;
                 if (bi->dct_select >= JXL_TR_COUNT) continue;
-                blk = v->coeff[c] + (size_t)(by * 8) * v->pw + bx * 8;
+                blk = v->coeff[c] + (size_t)(sby * 8) * v->pw + sbx * 8;
                 jxl_fill_varblock_lf(blk, v->pw, bi->dct_select, v->lf[c], v->bw,
-                                     bx, by);
+                                     sbx, sby);
                 jxl_transform_varblock(blk, v->pw, bi->dct_select);
             }
         }
@@ -484,10 +501,6 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         JXL_ERR(ctx, "frame: LF frame referenced but not decoded");
         return -1;
     }
-    if (fh->do_ycbcr) {
-        JXL_ERR(ctx, "frame: YCbCr frames are not implemented yet");
-        return -1;
-    }
 
     color_w = jxl_frame_color_width(fh);
     color_h = jxl_frame_color_height(fh);
@@ -518,12 +531,16 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     lf_dequant_read(br, &lf_dequant);
 
     if (is_vardct) {
-        if (vardct_state_alloc(ctx, &vd, div_ceil32(color_w, 8),
-                               div_ceil32(color_h, 8)) != 0)
+        for (i = 0; i < 3; i++) {
+            jxl_jpeg_upsampling_shifts(fh->jpeg_upsampling, i, &vd.hs[i],
+                                       &vd.vs[i]);
+        }
+        if (vardct_state_alloc(ctx, &vd, jxl_frame_blocks_w(fh),
+                               jxl_frame_blocks_h(fh)) != 0)
             goto done;
         jxl_quantizer_read(br, &vd.quantizer);
         if (jxl_hf_block_ctx_read(ctx, br, &vd.block_ctx) != 0) goto done;
-        jxl_lf_chan_corr_read(br, &vd.chan_corr);
+        jxl_lf_chan_corr_read(br, &vd.chan_corr, meta->xyb_encoded);
         if (vd.quantizer.global_scale == 0 || vd.quantizer.quant_lf == 0) {
             JXL_ERR(ctx, "frame: zero quantizer scale");
             goto done;
@@ -651,11 +668,14 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         for (i = 0; i < num_lf_groups; i++) {
             uint32_t lg_x = lf_per_row ? i % lf_per_row : 0;
             uint32_t lg_y = lf_per_row ? i / lf_per_row : 0;
-            uint32_t lf_dim = group_dim * 8;
-            uint32_t lf_w = JXL_MIN(lf_dim, color_w - lg_x * lf_dim);
-            uint32_t lf_h = JXL_MIN(lf_dim, color_h - lg_y * lf_dim);
+            /* LF groups are group_dim *blocks* across, over the padded block
+               grid -- not group_dim*8 pixels of the real image. */
+            uint32_t blocks_w = jxl_frame_blocks_w(fh);
+            uint32_t blocks_h = jxl_frame_blocks_h(fh);
             uint32_t base_bx = lg_x * group_dim;
             uint32_t base_by = lg_y * group_dim;
+            uint32_t lf_w = JXL_MIN(group_dim, blocks_w - base_bx) * 8;
+            uint32_t lf_h = JXL_MIN(group_dim, blocks_h - base_by) * 8;
 
             br = section_reader(&sec, JXL_TOC_LF_GROUP, 0, i);
             if (!br) goto done;
@@ -735,14 +755,19 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                     hp.bi_h = bhig;
                     hp.bi_stride = vd.bw;
                     for (c = 0; c < 3; c++) {
+                        /* A subsampled channel's samples for this group start
+                           at the shifted block origin, not at the group's. */
+                        uint32_t sbx0 = bx0 >> vd.hs[c];
+                        uint32_t sby0 = by0 >> vd.vs[c];
                         hp.jpeg_upsampling[c] = fh->jpeg_upsampling[c];
                         memset(&lfq_view[c], 0, sizeof(lfq_view[c]));
-                        lfq_view[c].data = vd.lfq[c] + (size_t)by0 * vd.bw + bx0;
+                        lfq_view[c].data = vd.lfq[c] + (size_t)sby0 * vd.bw + sbx0;
                         lfq_view[c].stride = vd.bw;
-                        lfq_view[c].w = bwid;
-                        lfq_view[c].h = bhig;
+                        lfq_view[c].w = (bwid + ((1u << vd.hs[c]) - 1)) >> vd.hs[c];
+                        lfq_view[c].h = (bhig + ((1u << vd.vs[c]) - 1)) >> vd.vs[c];
                         hp.lf_quant[c] = &lfq_view[c];
-                        outp[c] = vd.coeff[c] + (size_t)(by0 * 8) * vd.pw + bx0 * 8;
+                        outp[c] = vd.coeff[c] + (size_t)(sby0 * 8) * vd.pw +
+                                  sbx0 * 8;
                         strides[c] = vd.pw;
                     }
                     hp.pass = &vd.passes[p];
@@ -788,8 +813,10 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                 }
             }
         } else {
-            jxl_cfl_lf(vd.lf[0], vd.lf[1], vd.lf[2], vd.bw, vd.bh, vd.bw,
-                       &vd.chan_corr);
+            if (!vd.hs[0] && !vd.vs[0] && !vd.hs[2] && !vd.vs[2]) {
+                jxl_cfl_lf(vd.lf[0], vd.lf[1], vd.lf[2], vd.bw, vd.bh, vd.bw,
+                           &vd.chan_corr);
+            }
             if (!(fh->flags & JXL_FF_SKIP_ADAPTIVE_LF_SMOOTH)) {
                 if (jxl_adaptive_lf_smoothing(ctx, vd.lf, vd.bw, vd.bh, vd.bw,
                                               m_lf, &vd.quantizer) != 0)
@@ -797,6 +824,16 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
             }
         }
         vardct_finish_blocks(&vd, meta, fh);
+
+        /* Bring subsampled chroma back to full resolution before the loop
+           filters, which is where libjxl's pipeline puts it. */
+        for (c = 0; c < 3; c++) {
+            if (!vd.hs[c] && !vd.vs[c]) continue;
+            jxl_chroma_upsample(vd.coeff[c],
+                                div_ceil32(color_w, 1u << vd.hs[c]),
+                                div_ceil32(color_h, 1u << vd.vs[c]), vd.pw,
+                                vd.hs[c], vd.vs[c], vd.pw, vd.ph);
+        }
 
         for (c = 0; c < 3; c++) planes[c] = vd.coeff[c];
         if (fh->gab.enabled) {
@@ -900,8 +937,12 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
             goto done;
     }
 
-    /* ----- XYB -> the image's color space ----- */
-    if (apply_ct && meta->xyb_encoded && out->ncolor >= 3) {
+    /* ----- YCbCr / XYB -> the image's color space ----- */
+    if (apply_ct && fh->do_ycbcr && out->ncolor >= 3) {
+        size_t n = (size_t)out->plane[0].w * out->plane[0].h;
+        jxl_ycbcr_to_rgb(out->plane[0].data, out->plane[1].data,
+                         out->plane[2].data, n);
+    } else if (apply_ct && meta->xyb_encoded && out->ncolor >= 3) {
         size_t n = (size_t)out->plane[0].w * out->plane[0].h;
         float opsin[9];
         jxl_opsin_matrix_for(meta, opsin);

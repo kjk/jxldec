@@ -595,6 +595,9 @@ uint32_t jxl_frame_num_groups(const jxl_frame_header *fh);
 uint32_t jxl_frame_num_lf_groups(const jxl_frame_header *fh);
 uint32_t jxl_frame_groups_per_row(const jxl_frame_header *fh);
 uint32_t jxl_frame_lf_groups_per_row(const jxl_frame_header *fh);
+/* The VarDCT block grid, rounded up to a whole number of subsampled blocks. */
+uint32_t jxl_frame_blocks_w(const jxl_frame_header *fh);
+uint32_t jxl_frame_blocks_h(const jxl_frame_header *fh);
 
 /* ===================================================================== */
 /* dct                                                                    */
@@ -686,7 +689,17 @@ const uint16_t *jxl_natural_order(jxl_ctx *ctx, jxl_natural_orders *no,
 void jxl_natural_orders_free(jxl_ctx *ctx, jxl_natural_orders *no);
 
 void jxl_quantizer_read(jxl_br *br, jxl_quantizer *q);
-void jxl_lf_chan_corr_read(jxl_br *br, jxl_lf_chan_corr *c);
+/* xyb: whether the frame is XYB-encoded, which decides the default Y-to-B
+   correlation. */
+void jxl_lf_chan_corr_read(jxl_br *br, jxl_lf_chan_corr *c, int xyb);
+/* Per-channel subsampling shifts implied by the frame's jpeg_upsampling. */
+void jxl_jpeg_upsampling_shifts(const uint32_t ju[3], int idx, int *hs,
+                                int *vs);
+/* Doubles a subsampled chroma plane in place along the requested axes. */
+void jxl_chroma_upsample(float *p, uint32_t w, uint32_t h, size_t stride,
+                         int hs, int vs, uint32_t out_w, uint32_t out_h);
+/* (Cb, Y, Cr) -> (R, G, B), in place. */
+void jxl_ycbcr_to_rgb(float *cb, float *y, float *cr, size_t n);
 int jxl_hf_block_ctx_read(jxl_ctx *ctx, jxl_br *br, jxl_hf_block_ctx *bc);
 void jxl_hf_block_ctx_free(jxl_ctx *ctx, jxl_hf_block_ctx *bc);
 

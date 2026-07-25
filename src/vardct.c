@@ -132,10 +132,12 @@ void jxl_quantizer_read(jxl_br *br, jxl_quantizer *q) {
     q->quant_lf = jxl_br_u32(br, 16, 0, 1, 5, 1, 8, 1, 16);
 }
 
-void jxl_lf_chan_corr_read(jxl_br *br, jxl_lf_chan_corr *c) {
+void jxl_lf_chan_corr_read(jxl_br *br, jxl_lf_chan_corr *c, int xyb) {
     c->colour_factor = 84;
     c->base_correlation_x = 0.0f;
-    c->base_correlation_b = 1.0f;
+    /* The default Y-to-B correlation only makes sense for XYB; a YCbCr or
+       plain-RGB frame has none (libjxl zeroes it in ColorCorrelationMap). */
+    c->base_correlation_b = xyb ? 1.0f : 0.0f;
     c->x_factor_lf = 128;
     c->b_factor_lf = 128;
     if (jxl_br_bool(br)) return;
@@ -837,8 +839,8 @@ static const uint32_t coeff_num_nonzero_context[63] = {
     206
 };
 
-static void jpeg_upsampling_shifts(const uint32_t ju[3], int idx, int *hs,
-                                   int *vs) {
+void jxl_jpeg_upsampling_shifts(const uint32_t ju[3], int idx, int *hs,
+                                int *vs) {
     int hscale = (ju[0] == 1 || ju[0] == 2) || (ju[1] == 1 || ju[1] == 2) ||
                  (ju[2] == 1 || ju[2] == 2);
     int vscale = (ju[0] == 1 || ju[0] == 3) || (ju[1] == 1 || ju[1] == 3) ||
@@ -867,7 +869,7 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
     int c, rc = -1;
 
     for (c = 0; c < 3; c++) {
-        jpeg_upsampling_shifts(p->jpeg_upsampling, c, &hshifts[c], &vshifts[c]);
+        jxl_jpeg_upsampling_shifts(p->jpeg_upsampling, c, &hshifts[c], &vshifts[c]);
     }
 
     hfp_bits = jxl_bitlen(p->num_hf_presets > 1 ? p->num_hf_presets - 1 : 0);
@@ -1596,5 +1598,79 @@ void jxl_fill_varblock_lf(float *coeff, size_t stride, int tr,
             coeff[(size_t)y * stride + x] /=
                 jxl_scale_f((int)y, 5 - logbh) * jxl_scale_f((int)x, 5 - logbw);
         }
+    }
+}
+
+/* ===================================================================== */
+/* chroma upsampling and YCbCr                                            */
+/* ===================================================================== */
+
+/* Doubles a subsampled chroma plane in place, one axis at a time, with the
+   3/4 + 1/4 kernel libjxl's render pipeline uses. Samples outside the plane
+   are clamped, which for a one-sample border is what mirroring gives.
+
+   The plane holds `w` x `h` valid samples in the top-left of a `stride`-wide
+   buffer that must already be large enough for the doubled result. */
+static void chroma_upsample_h(float *p, uint32_t w, uint32_t h, size_t stride,
+                              uint32_t out_w) {
+    uint32_t x, y;
+    for (y = 0; y < h; y++) {
+        float *row = p + (size_t)y * stride;
+        /* Right to left, so the source samples are not overwritten first. */
+        for (x = w; x-- > 0;) {
+            float cur = row[x] * 0.75f;
+            float prev = row[x ? x - 1 : 0];
+            float next = row[x + 1 < w ? x + 1 : w - 1];
+            if (2 * x + 1 < out_w) row[2 * x + 1] = cur + 0.25f * next;
+            row[2 * x] = cur + 0.25f * prev;
+        }
+    }
+}
+
+static void chroma_upsample_v(float *p, uint32_t w, uint32_t h, size_t stride,
+                              uint32_t out_h) {
+    uint32_t x, y;
+    for (y = h; y-- > 0;) {
+        const float *mid = p + (size_t)y * stride;
+        const float *top = p + (size_t)(y ? y - 1 : 0) * stride;
+        const float *bot = p + (size_t)(y + 1 < h ? y + 1 : h - 1) * stride;
+        float *out0 = p + (size_t)(2 * y) * stride;
+        float *out1 = p + (size_t)(2 * y + 1) * stride;
+        for (x = 0; x < w; x++) {
+            float m = mid[x] * 0.75f;
+            float lo = m + 0.25f * top[x];
+            float hi = m + 0.25f * bot[x];
+            if (2 * y + 1 < out_h) out1[x] = hi;
+            out0[x] = lo;
+        }
+    }
+}
+
+void jxl_chroma_upsample(float *p, uint32_t w, uint32_t h, size_t stride,
+                         int hs, int vs, uint32_t out_w, uint32_t out_h) {
+    if (vs) {
+        chroma_upsample_v(p, w, h, stride, out_h);
+        h = JXL_MIN(2 * h, out_h);
+    }
+    if (hs) {
+        chroma_upsample_h(p, w, h, stride, out_w);
+    }
+}
+
+/* Full-range BT.601 as defined by JFIF clause 7. The planes arrive as
+   (Cb, Y, Cr) -- the same slots XYB uses for (X, Y, B) -- and leave as
+   (R, G, B) already in the image's encoded color space. */
+void jxl_ycbcr_to_rgb(float *cb, float *y, float *cr, size_t n) {
+    const float crcr = 1.402f;
+    const float cgcb = -0.114f * 1.772f / 0.587f;
+    const float cgcr = -0.299f * 1.402f / 0.587f;
+    const float cbcb = 1.772f;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        float yv = y[i] + 128.0f / 255.0f;
+        float b_ = cb[i], r_ = cr[i];
+        cb[i] = yv + crcr * r_;
+        y[i] = yv + cgcb * b_ + cgcr * r_;
+        cr[i] = yv + cbcb * b_;
     }
 }

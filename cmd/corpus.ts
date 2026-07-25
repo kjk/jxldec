@@ -109,6 +109,19 @@ export function corpusFiles(presets = PRESETS.map((p) => p.name)): string[] {
       out.push(dst);
     }
   }
+  // Transcoded JPEGs are the only source of YCbCr frames, and testdata's set
+  // covers every chroma subsampling mode.
+  for (const jpg of walk(join(LIBJXL_DIR, "testdata"), (n) =>
+    /\.jpe?g$/i.test(n),
+  ).sort()) {
+    const dst = join(GEN_DIR, `${basename(jpg).replace(/\.jpe?g$/i, "")}.jpeg.jxl`);
+    if (!existsSync(dst)) {
+      if (!runCjxl(jpg, dst, [])) continue;
+      generated++;
+    }
+    out.push(dst);
+  }
+
   // The .jxl files that ship with libjxl exercise things cjxl won't emit
   // (splines, animation, odd containers).
   out.push(...walk(join(LIBJXL_DIR, "testdata", "jxl"), (n) =>
