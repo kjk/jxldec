@@ -52,8 +52,8 @@ two compare byte for byte.
 
 ## Status
 See [PROGRESS.md](PROGRESS.md) for the full feature matrix. In short,
-`bun cmd/tests.ts -all` decodes 1040 corpus files and compares each against
-`djxl`: **1040 match — 385 byte-exact, and no sample in the other 655 differs
+`bun cmd/tests.ts -all` decodes 1113 corpus files and compares each against
+`djxl`: **1113 match — 387 byte-exact, and no sample in the other 726 differs
 by more than one 8-bit step.**
 
 * **Byte-exact** against libjxl: Modular lossless (every effort level,
@@ -61,10 +61,11 @@ by more than one 8-bit step.**
 * **Within one 8-bit step**: VarDCT including progressive/LF frames, and
   lossy Modular (XYB), for sRGB content.
 * Also working: gaborish and EPF, splines, synthetic photon noise, 2x/4x/8x
-  upsampling, animation, embedded ICC profiles, non-sRGB primaries (BT.2020,
-  P3), and YCbCr/JPEG-transcoded frames in every chroma subsampling mode.
+  upsampling, all eight EXIF orientations, animation, embedded ICC profiles,
+  non-sRGB primaries (BT.2020, P3), and YCbCr/JPEG-transcoded frames in every
+  chroma subsampling mode.
 
-The 655 non-byte-exact files are lossy VarDCT paths where roughly a quarter of
+The 726 non-byte-exact files are lossy VarDCT paths where roughly a quarter of
 the samples land one count either side of libjxl's. libjxl, jxl-oxide and this
 decoder use different IDCT factorizations and different `powf` approximations,
 so exact equality is not achievable — libjxl's own conformance testing uses a

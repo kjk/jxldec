@@ -4,15 +4,15 @@ Milestone log for the C JPEG XL decoder. Newest first.
 
 ## Status summary
 
-`bun cmd/tests.ts -all` — 1040 corpus files (libjxl's testdata images × 14 cjxl
+`bun cmd/tests.ts -all` — 1113 corpus files (libjxl's testdata images × 15 cjxl
 presets, its JPEGs transcoded, plus the `.jxl` files that ship with libjxl):
 
 ```
-1040/1040 ok, 0 failed
+1113/1113 ok, 0 failed
 ```
 
 "ok" means byte-identical to `djxl file.jxl out.pam`, or inside the float
-tolerance for the VarDCT paths. 385 files are byte-exact; across the other 655
+tolerance for the VarDCT paths. 387 files are byte-exact; across the other 726
 no sample differs from libjxl by more than one 8-bit step.
 
 | area | state |
@@ -29,6 +29,7 @@ no sample differs from libjxl by more than one 8-bit step.
 | patches / reference frames | **byte-exact** |
 | splines, noise | within 1 |
 | 2x/4x/8x upsampling (`--resampling`) | within 1 |
+| EXIF orientation, all 8 values | within 1 |
 | animation (frames after the first) | done |
 | YCbCr / JPEG transcode frames | done, all subsampling modes |
 
@@ -130,6 +131,28 @@ rather than overhead-bound. Two further options, neither taken:
   intrinsics, which would end the scalar-C property.
 
 ## Log
+
+### EXIF orientation: untested, and correct
+The first path this run that turned out fine. `unapply_orientation` had never
+been exercised: nothing in libjxl's testdata carries a non-default
+orientation, and the corpus is built from PAM, which has nowhere to put one.
+
+cjxl has no orientation flag, but it will take a raw Exif blob via
+`-x exif=<file>`, and libjxl reads it with `IsExif` + `FindExifTagPosition`
+(`lib/jxl/base/exif.h`) -- which wants the bare little-endian TIFF, not the
+4-byte-prefixed payload a JXL Exif *box* carries (that form is rejected). A
+26-byte blob holding nothing but tag 274 is enough, and `exifOrientationBlob`
+generates one per value.
+
+All eight match `djxl` at max 1, transposes included -- and they are genuinely
+being applied by both sides, not ignored by both: 510x532 comes out 532x510
+for orientations 5 through 8. Orientations 6 and 8 share those dimensions and
+differ only in pixel order, so the comparison would catch them being swapped.
+
+One preset rather than eight: `orientationFor` spreads the values across the
+sources by a hash of the filename, so `v_orient` reaches every arm of the
+switch (10 sources at 1, 6-13 at each of the rest) for 73 files instead of
+584. Stable per name, so a file keeps its orientation as the source set moves.
 
 ### The corpus stopped hiding what it could not encode
 `corpusFiles` did `if (!runCjxl(...)) continue;`, so a source cjxl refused

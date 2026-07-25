@@ -16,6 +16,43 @@ import { pngToPam } from "./png";
 const CORPUS_DIR = join(DEPS_DIR, "corpus");
 const SRC_DIR = join(CORPUS_DIR, "src");
 const GEN_DIR = join(CORPUS_DIR, "gen");
+const EXIF_DIR = join(CORPUS_DIR, "exif");
+
+// A minimal little-endian TIFF carrying nothing but tag 274, Orientation.
+// Nothing in testdata has a non-default orientation and cjxl has no flag for
+// one, so the only way to cover the writer's orientation fixup is to hand it
+// the Exif blob ourselves (`cjxl -x exif=...`). libjxl reads it with
+// IsExif + FindExifTagPosition (lib/jxl/base/exif.h), which needs the raw
+// TIFF -- not the 4-byte-prefixed form a JXL Exif *box* carries.
+function exifOrientationBlob(orientation: number): string {
+  mkdirSync(EXIF_DIR, { recursive: true });
+  const path = join(EXIF_DIR, `orientation${orientation}.bin`);
+  if (!existsSync(path)) {
+    const b = Buffer.alloc(26);
+    b.write("II", 0, "latin1");
+    b.writeUInt16LE(42, 2);            // TIFF magic
+    b.writeUInt32LE(8, 4);             // offset of IFD0
+    b.writeUInt16LE(1, 8);             // one tag in IFD0
+    b.writeUInt16LE(274, 10);          // Orientation
+    b.writeUInt16LE(3, 12);            // type SHORT
+    b.writeUInt32LE(1, 14);            // count
+    b.writeUInt16LE(orientation, 18);  // value, in the 4-byte value field
+    b.writeUInt32LE(0, 22);            // no next IFD
+    writeFileSync(path, b);
+  }
+  return path;
+}
+
+// Spreads the eight orientations across the sources instead of spending eight
+// presets on them: unapply_orientation is a switch with a case per value, and
+// one preset this way exercises every arm. Keyed on the name so a given file
+// always gets the same one however the source set changes.
+function orientationFor(src: string): number {
+  const name = basename(src);
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return (h % 8) + 1;
+}
 
 // ProPhoto is wide enough that cjxl keeps the profile verbatim instead of
 // matching it to an enum.
@@ -25,7 +62,8 @@ const ICC_PROFILE = join(
 );
 
 /** cjxl settings, one per generated variant. */
-export const PRESETS: { name: string; args: string[] }[] = [
+export const PRESETS:
+    { name: string; args: string[] | ((src: string) => string[]) }[] = [
   { name: "m_e1", args: ["-d", "0", "-e", "1"] },
   { name: "m_e3", args: ["-d", "0", "-e", "3"] },
   { name: "m_e7", args: ["-d", "0", "-e", "7"] },
@@ -51,6 +89,16 @@ export const PRESETS: { name: string; args: string[] }[] = [
   // in build_kernel.
   { name: "v_rs2", args: ["-d", "1", "-e", "7", "--resampling=2"] },
   { name: "v_rs4", args: ["-d", "1", "-e", "7", "--resampling=4"] },
+  // EXIF orientation, which the writer undoes. The eight values are spread
+  // across the sources by orientationFor, so this one preset reaches every
+  // arm of unapply_orientation's switch, including the four that transpose.
+  {
+    name: "v_orient",
+    args: (src) => [
+      "-d", "1", "-e", "7",
+      "-x", `exif=${exifOrientationBlob(orientationFor(src))}`,
+    ],
+  },
 ];
 
 function walk(dir: string, pred: (name: string) => boolean): string[] {
@@ -146,7 +194,9 @@ export function corpusFiles(presets = PRESETS.map((p) => p.name)): string[] {
       if (!presets.includes(preset.name)) continue;
       const dst = join(GEN_DIR, `${base}.${preset.name}.jxl`);
       if (!existsSync(dst)) {
-        const err = runCjxl(src, dst, preset.args);
+        const args = typeof preset.args === "function"
+          ? preset.args(src) : preset.args;
+        const err = runCjxl(src, dst, args);
         if (err) {
           skipped.push(`${base}.${preset.name}: ${err}`);
           continue;
