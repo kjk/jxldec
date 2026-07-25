@@ -44,6 +44,13 @@ export const PRESETS: { name: string; args: string[] }[] = [
   // testdata ships no noisy image and no other preset asks for one, so the
   // noise synthesis path had no regression coverage at all.
   { name: "v_noise", args: ["-d", "1", "-e", "7", "--photon_noise_iso=3200"] },
+  // Coded at 1/2 and 1/4 resolution and upsampled by the decoder. cjxl
+  // downsamples the input itself, so the output stays the source's size --
+  // no blow-up in the corpus. Both are needed: the 2x weight table has a
+  // single quadrant (H=1), so only 4x and up exercise the quadrant mirroring
+  // in build_kernel.
+  { name: "v_rs2", args: ["-d", "1", "-e", "7", "--resampling=2"] },
+  { name: "v_rs4", args: ["-d", "1", "-e", "7", "--resampling=4"] },
 ];
 
 function walk(dir: string, pred: (name: string) => boolean): string[] {

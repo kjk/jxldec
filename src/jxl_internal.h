@@ -956,6 +956,13 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
                      const jxl_frame_header *fh, uint32_t visible_frames,
                      uint32_t invisible_frames, float corr_x, float corr_b);
 
+/* upsample -- non-separable 2x/4x/8x upsampling                          */
+/* Replaces the plane with its upsample by 1 << shift, cropped to out_w x
+   out_h. shift == 0 is a no-op. */
+int jxl_upsample_plane(jxl_ctx *ctx, jxl_fplane *p, uint32_t shift,
+                       const jxl_image_metadata *meta, uint32_t out_w,
+                       uint32_t out_h);
+
 /* apply_ct == 0 leaves the frame in its pre-color-transform (XYB) form, which
    is what a frame saved "before CT" -- every LF frame -- must store. */
 int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,

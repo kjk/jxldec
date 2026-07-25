@@ -14,6 +14,7 @@ export const SRCS = [
   "src/patch.c",
   "src/spline.c",
   "src/noise.c",
+  "src/upsample.c",
   "src/decode.c",
   "src/vardct.c",
   "src/dct.c",

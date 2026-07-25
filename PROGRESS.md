@@ -4,15 +4,15 @@ Milestone log for the C JPEG XL decoder. Newest first.
 
 ## Status summary
 
-`bun cmd/tests.ts -all` — 894 corpus files (libjxl's testdata images × 12 cjxl
+`bun cmd/tests.ts -all` — 1040 corpus files (libjxl's testdata images × 14 cjxl
 presets, its JPEGs transcoded, plus the `.jxl` files that ship with libjxl):
 
 ```
-894/894 ok, 0 failed
+1040/1040 ok, 0 failed
 ```
 
 "ok" means byte-identical to `djxl file.jxl out.pam`, or inside the float
-tolerance for the VarDCT paths. 381 files are byte-exact; across the other 513
+tolerance for the VarDCT paths. 385 files are byte-exact; across the other 655
 no sample differs from libjxl by more than one 8-bit step.
 
 | area | state |
@@ -28,6 +28,7 @@ no sample differs from libjxl by more than one 8-bit step.
 | images with an embedded ICC profile | done |
 | patches / reference frames | **byte-exact** |
 | splines, noise | within 1 |
+| 2x/4x/8x upsampling (`--resampling`) | within 1 |
 | animation (frames after the first) | done |
 | YCbCr / JPEG transcode frames | done, all subsampling modes |
 
@@ -130,6 +131,41 @@ rather than overhead-bound. Two further options, neither taken:
 
 ## Log
 
+### Upsampling was missing entirely, and failed silently
+`cjxl --resampling=2|4|8` codes the frame at 1/2, 1/4 or 1/8 resolution and
+leaves the decoder to upsample. We never did. `CustomTransformData` was parsed,
+weights and all (`headers.c`), and `fh->upsampling` was used to size extra
+channels -- but no filter existed, so the frame stayed at its coded size.
+`walk_frames` then saw `tmp.w != doc->size.width`, concluded the frame was a
+crop, and blended the half-size image into the corner of a blank full-size
+canvas. Output was the right dimensions, exit code 0, and **max 255, rms 168,
+mean 150** -- three quarters blank. Silently wrong, which is the worst way to
+be wrong.
+
+`src/upsample.c` implements it: each input sample expands to an NxN block, and
+each output sample is a 5x5 weighted sum of the input neighbourhood using a
+different set of 25 weights per position in the block, clamped to the min and
+max of that neighbourhood (which is what keeps it from ringing at edges). The
+codestream stores only one quadrant of the weight set and only its upper
+triangle, since the kernel is symmetric under both reflections and under
+transposition; `build_kernel` expands it. The stage runs between splines and
+noise, where libjxl's pipeline puts it, so noise is synthesised at full
+resolution.
+
+2x, 4x and 8x all land at max 1 against `djxl`, alpha included. Two presets
+lock it down: `v_rs2` and `v_rs4`. Both are needed -- at 2x the weight table
+is a single quadrant (H=1), so the quadrant mirroring only gets exercised from
+4x up. cjxl downsamples the input itself, so neither preset inflates the
+corpus.
+
+Not implemented: an extra channel whose upsampling factor differs from the
+colour channels'. libjxl handles it with a separate, earlier pass
+(`!late_ec_upsample`), and our extra-channel plane sizing is wrong for it, so
+`jxl_frame_decode` refuses the frame instead of misplacing the channel.
+`--resampling=1 --ec_resampling=2` is the way to produce one.
+
+1040/1040 ok, 0 failed. ASan clean.
+
 ### Noise was seeded one frame too early, and untested
 Two problems, the second of which hid the first.
 
@@ -159,7 +195,7 @@ it; only asking what the field's *statistics* said, versus its *values*, did.
 Advancing the counters before the decode takes the correlation to 0.9928, the
 remainder being ordinary float rounding.
 
-`v_noise` now passes 73/73, peak 1, and the corpus is `894/894 ok, 0 failed`.
+`v_noise` now passes 73/73, peak 1, and the corpus is `1040/1040 ok, 0 failed`.
 ASan clean.
 
 ### Three testdata images were never being tested

@@ -502,6 +502,20 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         return -1;
     }
 
+    /* Extra channels carrying a different upsampling factor from the colour
+       channels have to be upsampled separately and earlier (libjxl's
+       !late_ec_upsample path). That is not implemented, and decoding it as if
+       the factors matched would silently misplace the channel, so refuse. */
+    for (i = 0; i < meta->num_extra; i++) {
+        if (fh->ec_upsampling[i] != fh->upsampling) {
+            JXL_ERR(ctx, "frame: extra channel %u upsamples by %u but the "
+                         "colour channels by %u; not supported",
+                    (unsigned)i, (unsigned)fh->ec_upsampling[i],
+                    (unsigned)fh->upsampling);
+            return -1;
+        }
+    }
+
     color_w = jxl_frame_color_width(fh);
     color_h = jxl_frame_color_height(fh);
     group_dim = jxl_frame_group_dim(fh);
@@ -952,6 +966,32 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         float cx = is_vardct ? vd.chan_corr.base_correlation_x : 0.0f;
         float cb = is_vardct ? vd.chan_corr.base_correlation_b : 1.0f;
         if (jxl_render_splines(ctx, out, &splines, fh, cx, cb) != 0) goto done;
+    }
+
+    /* Upsampling sits between splines and noise, where libjxl's pipeline puts
+       it (dec_cache.cc), so noise is synthesised at full resolution. When the
+       colour channels are upsampled and every extra channel shares the same
+       factor, libjxl upsamples them all here together ("late_ec_upsample");
+       that is the case handled below, and jxl_frame_decode rejects the mixed
+       one up front. */
+    if (color_upsampling_shift > 0) {
+        uint32_t full_w = jxl_frame_sample_width(fh, 1);
+        uint32_t full_h = jxl_frame_sample_height(fh, 1);
+        for (i = 0; i < out->nplane; i++) {
+            /* Scale each plane by the factor rather than stretching it to the
+               frame size: a colour plane is ceil(full / N) and lands exactly
+               on full once the rounding is cropped off, while a plane that
+               was subsampled relative to colour keeps that relationship. */
+            uint32_t tw = out->plane[i].w << color_upsampling_shift;
+            uint32_t th = out->plane[i].h << color_upsampling_shift;
+            if (tw > full_w) tw = full_w;
+            if (th > full_h) th = full_h;
+            if (jxl_upsample_plane(ctx, &out->plane[i], color_upsampling_shift,
+                                   meta, tw, th) != 0)
+                goto done;
+        }
+        out->w = full_w;
+        out->h = full_h;
     }
 
     if (have_noise) {

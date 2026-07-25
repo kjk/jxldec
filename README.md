@@ -52,19 +52,19 @@ two compare byte for byte.
 
 ## Status
 See [PROGRESS.md](PROGRESS.md) for the full feature matrix. In short,
-`bun cmd/tests.ts -all` decodes 894 corpus files and compares each against
-`djxl`: **894 match — 381 byte-exact, and no sample in the other 513 differs
+`bun cmd/tests.ts -all` decodes 1040 corpus files and compares each against
+`djxl`: **1040 match — 385 byte-exact, and no sample in the other 655 differs
 by more than one 8-bit step.**
 
 * **Byte-exact** against libjxl: Modular lossless (every effort level,
   palette, squeeze, RCT), plus patches and reference frames.
 * **Within one 8-bit step**: VarDCT including progressive/LF frames, and
   lossy Modular (XYB), for sRGB content.
-* Also working: gaborish and EPF, splines, synthetic photon noise, animation,
-  embedded ICC profiles, non-sRGB primaries (BT.2020, P3), and
-  YCbCr/JPEG-transcoded frames in every chroma subsampling mode.
+* Also working: gaborish and EPF, splines, synthetic photon noise, 2x/4x/8x
+  upsampling, animation, embedded ICC profiles, non-sRGB primaries (BT.2020,
+  P3), and YCbCr/JPEG-transcoded frames in every chroma subsampling mode.
 
-The 513 non-byte-exact files are lossy VarDCT paths where roughly a quarter of
+The 655 non-byte-exact files are lossy VarDCT paths where roughly a quarter of
 the samples land one count either side of libjxl's. libjxl, jxl-oxide and this
 decoder use different IDCT factorizations and different `powf` approximations,
 so exact equality is not achievable — libjxl's own conformance testing uses a
@@ -72,7 +72,9 @@ tolerance too, and like it we gate on RMS and peak together rather than peak
 alone (`-rms`, default 0.6; `-tol`, default 3).
 
 Not implemented: encoding, JPEG reconstruction (`jbrd` boxes are located but
-not applied), and multithreading.
+not applied), and multithreading. An extra channel whose upsampling factor
+differs from the colour channels' is rejected with an error rather than
+decoded — rare, and it needs a separate earlier upsampling pass.
 
 ## Performance
 `bun cmd/bench.ts -all` links the `dist/` amalgamation and libjxl's static
