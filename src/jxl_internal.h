@@ -348,16 +348,23 @@ typedef enum {
 } jxl_predictor;
 
 /* Split in two because the tree walk is memory-bound, not compute-bound: a
-   big tree (1901 nodes for flower_alpha.lm_d1) overflows L1 at 28 bytes per
-   node, and every level of every walk is a dependent load. These four fields
-   are all the walk reads, so at 16 bytes four decision nodes share a cache
-   line. The node array is breadth-first, which puts the decision nodes -- the
-   only ones a walk passes through -- in its first half, so the part that
-   stays resident is half of an already halved array. */
+   big tree (1901 nodes for flower_alpha.lm_d1, walked to an average leaf
+   depth of 16.7) overflows L1 at 28 bytes per node, and every level of every
+   walk is a dependent load. These three fields are all the walk reads, so at
+   12 bytes better than five decision nodes share a cache line. The node array
+   is breadth-first, which puts the decision nodes -- the only ones a walk
+   passes through -- in its first half, so the part that stays resident is
+   half of an already shrunken array.
+
+   Only one child index is stored: the rebuild in jxl_ma_config_read feeds a
+   FIFO with strictly decreasing indices and pops two per decision node, so
+   the children are always neighbours with the right one second. `child` is
+   the left child and `child + 1` the right; jxl_ma_config_read rejects a tree
+   where that does not hold. For a leaf, `child` indexes into leaves[]. */
 typedef struct {
     int32_t property;     /* -1 marks a leaf */
     int32_t value;
-    uint32_t left, right; /* for a leaf, `left` indexes jxl_ma_config.leaves */
+    uint32_t child;
 } jxl_ma_node;
 
 /* The rest of a leaf, read once per sample once the walk has finished. */

@@ -153,9 +153,33 @@ not, and it is the reason to trust the other rows. Corpus-wide the effect is
 small (~0.8%) because large-tree files are a minority; `ma_get_leaf` fell from
 72.4% to 69.1% self on `flower_alpha.lm_d1`, 11025 to 9582 samples.
 
-`ma_get_leaf` is still 69%, so the remaining lever is the length of the
-dependent-load chain rather than its width -- libjxl flattens two tree levels
-into one 32-byte node to halve it.
+### One child index instead of two: 16 bytes -> 12
+The rebuild feeds its FIFO with strictly decreasing indices and pops two per
+decision node, so a node's two children are **always** neighbours, right
+second. That is structural, and measuring it agreed: `right == left + 1` on
+3665 of 3665 decision nodes across 120 corpus files. So only the left index is
+stored and the walk derives the right one as `child + 1`, which also makes the
+step branchless (`child + (v <= value)`). `jxl_ma_config_read` rejects a tree
+where the invariant does not hold rather than trusting it silently.
+
+Interleaved A/B, 5 runs, two passes, libjxl column flat throughout:
+
+| file | 16-byte | 12-byte |
+|---|---|---|
+| `flower_alpha.lm_d1` | 1157ms | 1130ms |
+| `flower.lm_d1` | 601ms | 586ms |
+| `flower_alpha.m_e9` | 1249ms | 1208ms |
+| `flower_alpha.m_e3` (control) | 852ms | 847ms |
+| total of the five | 4549ms | 4454ms (-2.1%) |
+
+### What is left in the MA walk
+`ma_get_leaf` is still ~69% of a lossy-Modular decode. Both wins so far made
+the chain *narrower*; the remaining lever is making it *shorter*. Average leaf
+depth is 16.7 (max 31) on `flower_alpha.lm_d1`, 10.9 on `flower.lm_d1`, 5.1 on
+the small `m_e3` trees -- so the worst file serializes ~17 dependent loads per
+sample. libjxl flattens two tree levels into one 32-byte node, halving that;
+it does not shrink the working set (same bytes per level) but it halves both
+the latency chain and the number of cache lines a walk touches.
 
 ### MA tree walk: a leaf is now always a leaf (not a speedup)
 `ma_get_leaf` carried a step counter that `break`s out of the walk once it

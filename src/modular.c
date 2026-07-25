@@ -170,7 +170,7 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
             }
             leaf->multiplier = (mul_bits + 1) << mul_log;
             node.property = -1;
-            node.left = ctx_count;
+            node.child = ctx_count;
             ctx_count++;
         }
         raw[count++] = node;
@@ -185,9 +185,9 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
                 fprintf(stderr, "  [%u] prop=%d value=%d\n",
                         (unsigned)k, (int)raw[k].property, (int)raw[k].value);
             } else {
-                const jxl_ma_leaf *lf = &leaves[raw[k].left];
+                const jxl_ma_leaf *lf = &leaves[raw[k].child];
                 fprintf(stderr, "  [%u] leaf ctx=%u pred=%u off=%d mul=%u\n",
-                        (unsigned)k, (unsigned)raw[k].left,
+                        (unsigned)k, (unsigned)raw[k].child,
                         (unsigned)lf->predictor, (int)lf->offset,
                         (unsigned)lf->multiplier);
             }
@@ -219,12 +219,21 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
     for (i = count; i > 0; i--) {
         uint32_t idx = i - 1;
         if (raw[idx].property >= 0) {
+            uint32_t right, left;
             if (dq_tail - dq_head < 2) {
                 JXL_ERR(ctx, "modular: malformed MA tree");
                 goto done;
             }
-            raw[idx].right = dq[dq_head++];
-            raw[idx].left = dq[dq_head++];
+            right = dq[dq_head++];
+            left = dq[dq_head++];
+            /* dq receives indices in strictly decreasing order and is a FIFO,
+               so two consecutive pops are always neighbours. Only the left
+               index is kept; the walk derives the right one as child + 1. */
+            if (right != left + 1) {
+                JXL_ERR(ctx, "modular: malformed MA tree (split children)");
+                goto done;
+            }
+            raw[idx].child = left;
         }
         dq[dq_tail++] = idx;
     }
@@ -242,8 +251,7 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
        mid-walk and hand the caller a decision node in place of a leaf. */
     for (i = 0; i < count; i++) {
         if (raw[i].property < 0) continue;
-        if (raw[i].left <= i || raw[i].right <= i ||
-            raw[i].left >= count || raw[i].right >= count) {
+        if (raw[i].child <= i || raw[i].child + 1 >= count) {
             JXL_ERR(ctx, "modular: MA tree has a cycle at node %u",
                     (unsigned)i);
             goto done;
@@ -1487,9 +1495,9 @@ static const jxl_ma_leaf *ma_get_leaf(const jxl_ma_config *ma,
         int32_t p = node->property;
         int32_t v = p < 16 ? pr->cache[p]
                            : props_get_extra(ps, (uint32_t)p - 16);
-        node = &nodes[v > node->value ? node->left : node->right];
+        node = &nodes[node->child + (v <= node->value)];
     }
-    return &ma->leaves[node->left];
+    return &ma->leaves[node->child];
 }
 
 /* True when the tree can ask for the self-correcting predictor or property
