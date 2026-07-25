@@ -53,8 +53,13 @@ PNGs to PNM in TypeScript. Don't re-investigate this.
   exercised, and a function on that list is one nothing verifies against
   libjxl. `-reuse` re-reports from the profile already on disk (the decode is
   the slow part, ~3 min).
+- `bun cmd/fuzz.ts -check` — replay every known reproducer once and exit:
+  `fuzz/crashes/` plus two external sets already sitting in `deps/`, libjxl's
+  OSS-Fuzz testcases and jxl-oxide's fuzz findings (115 inputs, seconds). Run
+  it after touching a parser; it is the cheap half of the fuzzing story.
 - `bun cmd/fuzz.ts [-jobs N] [-runs N] [-repro FILE] [-minimize]` — libFuzzer
-  + ASan over `test/fuzz_target.c`, seeded from the corpus on first run.
+  + ASan over `test/fuzz_target.c`, seeded from the corpus *and* those external
+  reproducers on first run.
   `cmd/tests.ts` only ever feeds the decoder *valid* files, and a valid file
   takes no error path — `jxl_errorf`, which every `JXL_ERR` funnels into, never
   executes across the whole corpus. This covers what happens when the bytes

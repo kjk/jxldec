@@ -3,6 +3,7 @@
 //   bun cmd/fuzz.ts              build, seed corpus if empty, fuzz until killed
 //   bun cmd/fuzz.ts -jobs 8      run 8 parallel workers sharing the corpus
 //   bun cmd/fuzz.ts -runs N      stop after N inputs (for a bounded CI pass)
+//   bun cmd/fuzz.ts -check       replay every known reproducer once (fast gate)
 //   bun cmd/fuzz.ts -repro FILE  replay one crash artifact and exit
 //   bun cmd/fuzz.ts -minimize    shrink the corpus to a minimal covering set
 //
@@ -23,12 +24,25 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync,
 import { basename, join, resolve } from "path";
 import { buildFuzz, FUZZ_EXE } from "./build";
 import { corpusFiles } from "./corpus";
-import { getDeps } from "./get-deps";
+import { getDeps, JXL_OXIDE_DIR, LIBJXL_DIR } from "./get-deps";
 
 const ROOT = resolve(import.meta.dir, "..");
 const FUZZ = join(ROOT, "fuzz");
 const CORPUS = join(FUZZ, "corpus");
 const CRASHES = join(FUZZ, "crashes");
+
+// Other people's crash reproducers, which are worth far more per byte than
+// anything we generate: each is a minimised input that already broke a JPEG XL
+// decoder. Both live in deps/, which get-deps already fetches, so they are
+// referenced rather than copied into this repo.
+//   libjxl   -- OSS-Fuzz testcases against djxl_fuzzer
+//   jxl-oxide -- regression findings, each named for the bug it caught
+//                (dequant_matrix_band, hf_varblock_across_group, icc_parse_oob)
+const EXTERNAL_SEEDS = [
+  join(LIBJXL_DIR, "testdata", "oss-fuzz"),
+  join(JXL_OXIDE_DIR, "crates", "jxl-oxide-tests", "tests", "fuzz_findings"),
+];
+
 
 function usage(): never {
   console.error(
@@ -37,6 +51,7 @@ function usage(): never {
   -jobs N        run N parallel workers sharing the corpus
   -runs N        stop after N inputs instead of running until killed
   -max-len N     max input size in bytes (default 1000000)
+  -check         replay every known reproducer once and exit (fast gate)
   -repro FILE    replay a single crash artifact and exit
   -minimize      shrink the corpus to a minimal covering set
   -h, --help`);
@@ -49,6 +64,7 @@ let runs = 0;
 let maxLen = 1000000;
 let repro = "";
 let minimize = false;
+let check = false;
 
 function intArg(v: string | undefined, name: string): number {
   const n = Number.parseInt(v ?? "", 10);
@@ -66,6 +82,7 @@ for (let i = 0; i < args.length; i++) {
   else if (a === "-max-len") maxLen = intArg(args[++i], "-max-len");
   else if (a === "-repro") repro = args[++i] ?? usage();
   else if (a === "-minimize") minimize = true;
+  else if (a === "-check") check = true;
   else if (a === "-h" || a === "--help") usage();
   else usage();
 }
@@ -98,6 +115,42 @@ if (repro) {
   process.exit(await run([path]));
 }
 
+// -check: replay every known reproducer once and stop. No mutation, so it is
+// seconds rather than hours -- a regression gate for the crashes we have
+// already fixed plus the ones other decoders found.
+if (check) {
+  await getDeps();
+  const groups: { label: string; files: string[] }[] = [
+    { label: "fuzz/crashes", files: listArtifacts().map((f) => join(CRASHES, f)) },
+    ...EXTERNAL_SEEDS.filter(existsSync).map((dir) => ({
+      label: dir.replace(/\\/g, "/").replace(/^.*\/deps\//, "deps/"),
+      files: readdirSync(dir).map((n) => join(dir, n))
+        .filter((f) => statSync(f).isFile()),
+    })),
+  ];
+  let bad = 0, total = 0;
+  for (const g of groups) {
+    let failed = 0;
+    for (const f of g.files) {
+      total++;
+      const p = Bun.spawnSync({ cmd: [FUZZ_EXE, f], stdout: "ignore", stderr: "pipe" });
+      if (p.exitCode !== 0) {
+        failed++;
+        bad++;
+        console.log(`  CRASH ${f}`);
+        const line = p.stderr.toString().split("\n")
+          .find((l) => l.startsWith("SUMMARY:"));
+        if (line) console.log(`        ${line.trim()}`);
+      }
+    }
+    console.log(`${g.label}: ${g.files.length - failed}/${g.files.length} clean`);
+  }
+  console.log(bad === 0
+    ? `\nall ${total} reproducer(s) clean`
+    : `\n${bad} of ${total} reproducer(s) still crash`);
+  process.exit(bad === 0 ? 0 : 1);
+}
+
 if (minimize) {
   const tmp = join(FUZZ, "corpus.min");
   rmSync(tmp, { recursive: true, force: true });
@@ -121,15 +174,23 @@ if (minimize) {
 // names by construction, but the shipped .jxl files can collide with them.
 if (readdirSync(CORPUS).length === 0) {
   await getDeps();
-  let n = 0, skipped = 0;
-  for (const f of corpusFiles()) {
-    if (statSync(f).size > maxLen) { skipped++; continue; }
-    let dest = join(CORPUS, basename(f));
-    if (existsSync(dest)) dest = join(CORPUS, `${n}_${basename(f)}`);
+  let n = 0, skipped = 0, ext = 0;
+  const take = (f: string, prefix: string) => {
+    if (statSync(f).size > maxLen) { skipped++; return false; }
+    let dest = join(CORPUS, prefix + basename(f));
+    if (existsSync(dest)) dest = join(CORPUS, `${prefix}${n}_${basename(f)}`);
     copyFileSync(f, dest);
-    n++;
+    return true;
+  };
+  for (const f of corpusFiles()) if (take(f, "")) n++;
+  for (const dir of EXTERNAL_SEEDS) {
+    if (!existsSync(dir)) continue;
+    for (const name of readdirSync(dir)) {
+      const f = join(dir, name);
+      if (statSync(f).isFile() && take(f, "ext_")) ext++;
+    }
   }
-  console.log(`seeded corpus with ${n} file(s)` +
+  console.log(`seeded corpus with ${n} file(s) + ${ext} external reproducer(s)` +
               (skipped ? `; ${skipped} skipped as larger than -max-len` : ""));
 }
 

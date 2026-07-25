@@ -134,6 +134,39 @@ rather than overhead-bound. Two further options, neither taken:
 
 ## Log
 
+### Importing other decoders' crashes
+Two JPEG XL projects ship their crash reproducers, and both were already on
+disk under `deps/`:
+
+- `deps/libjxl/testdata/oss-fuzz` -- 44 ClusterFuzz testcases against
+  `djxl_fuzzer`, already minimised.
+- `deps/jxl-oxide/crates/jxl-oxide-tests/tests/fuzz_findings` -- 63 regression
+  findings, each *named for the bug it caught*: `dequant_matrix_band`,
+  `hf_varblock_across_group`, `ec_upsampling`, `icc_parse_oob`,
+  `hybrid_integer_bits`, and so on. That naming is a map of where a JPEG XL
+  decoder actually breaks.
+
+**All 115 pass, including our own eight.** The check is not vacuous: 93 of the
+106 external files get far enough to parse a header and 11 decode completely,
+so they are reaching real frame-decoding and error-handling code rather than
+bouncing off the signature check.
+
+They are referenced from `deps/`, not copied in -- `get-deps` already fetches
+both repos. `bun cmd/fuzz.ts -check` replays the lot in seconds as a
+regression gate, and the first fuzz run now seeds from them as well, which
+matters more than the check: each is a minimised input that already broke a
+decoder, so they are far better mutation starting points than anything cjxl
+emits.
+
+Also looked at, and worth recording so nobody repeats the search:
+`libjxl/jxl-rs` and `imazen/zenjxl-decoder` keep no checked-in crash
+artifacts (both use ClusterFuzzLite, whose corpora live server-side). jxl-rs
+does ship the 38 official conformance images under
+`jxl/resources/test/conformance_test_images`, which is a better feature corpus
+than ours in places -- but not for the PQ/HLG gap: 21 declare sRGB, 2 declare
+709, one a gamma curve, and the remaining 14 carry an ICC profile instead.
+`tf_pq` and `tf_hlg` stay dark.
+
 ### Fuzzing, and the first crash it found
 `cmd/tests.ts` only ever feeds the decoder *valid* files, and a valid file
 takes no error path: `jxl_errorf`, which every `JXL_ERR` in the decoder
