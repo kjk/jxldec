@@ -52,12 +52,15 @@ export async function getDeps(): Promise<void> {
 
 // A cmake cache remembers the compiler and the option values it was first
 // configured with, and re-running with different -D flags does not reliably
-// reset everything derived from them. A build directory left behind by an
-// interrupted or differently-configured attempt therefore fails in confusing
-// ways -- the observed one being "PNG library is required by some tests",
-// from a cache that had kept BUILD_TESTING=ON and cl.exe. Returns true when
+// reset everything derived from them, so a build directory left behind by a
+// differently-configured attempt fails in confusing ways. Returns true when
 // the existing cache matches what we are about to ask for, so that an
 // interrupted build resumes instead of starting over.
+//
+// This also catches the wreckage of the newline-in-$-template bug noted at
+// configure() below: that ran cmake with no -D flags at all, leaving a cache
+// holding cl.exe and BUILD_TESTING=ON, which fails with the thoroughly
+// misleading "PNG library is required by some tests".
 function cacheIsUsable(cc: string): boolean {
   const cache = join(LIBJXL_BUILD, "CMakeCache.txt");
   if (!existsSync(cache)) return false;
@@ -85,37 +88,51 @@ export async function buildRef(): Promise<void> {
     rmSync(LIBJXL_BUILD, { recursive: true, force: true });
   }
 
-  const configure = () => $`cmake -S ${LIBJXL_DIR} -B ${LIBJXL_BUILD} -G Ninja
-    -DCMAKE_BUILD_TYPE=Release
-    -DCMAKE_C_COMPILER=${cc} -DCMAKE_CXX_COMPILER=${cxx}
-    -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=OFF
-    -DJPEGXL_ENABLE_TOOLS=ON -DJPEGXL_ENABLE_BENCHMARK=OFF
-    -DJPEGXL_ENABLE_EXAMPLES=OFF -DJPEGXL_ENABLE_MANPAGES=OFF
-    -DJPEGXL_ENABLE_SJPEG=OFF -DJPEGXL_ENABLE_OPENEXR=OFF
-    -DJPEGXL_ENABLE_JNI=OFF -DJPEGXL_ENABLE_DOXYGEN=OFF
-    -DJPEGXL_ENABLE_PLUGINS=OFF -DJPEGXL_BUNDLE_LIBPNG=OFF
-    -DJPEGXL_ENABLE_SKCMS=ON`.quiet();
+  // One array, not a multi-line template: bun's $ parses a newline inside the
+  // template as a command separator, so a wrapped `cmake ... \n -DFOO=bar`
+  // silently configures with *no* -D flags at all and then tries to run
+  // `-DFOO=bar` as a command. The resulting default configuration (MSVC,
+  // Debug, BUILD_TESTING=ON) is what fails, not the build tree.
+  const flags = [
+    "-DCMAKE_BUILD_TYPE=Release",
+    `-DCMAKE_C_COMPILER=${cc}`, `-DCMAKE_CXX_COMPILER=${cxx}`,
+    "-DBUILD_TESTING=OFF", "-DBUILD_SHARED_LIBS=OFF",
+    "-DJPEGXL_ENABLE_TOOLS=ON", "-DJPEGXL_ENABLE_BENCHMARK=OFF",
+    "-DJPEGXL_ENABLE_EXAMPLES=OFF", "-DJPEGXL_ENABLE_MANPAGES=OFF",
+    "-DJPEGXL_ENABLE_SJPEG=OFF", "-DJPEGXL_ENABLE_OPENEXR=OFF",
+    "-DJPEGXL_ENABLE_JNI=OFF", "-DJPEGXL_ENABLE_DOXYGEN=OFF",
+    "-DJPEGXL_ENABLE_PLUGINS=OFF", "-DJPEGXL_BUNDLE_LIBPNG=OFF",
+    "-DJPEGXL_ENABLE_SKCMS=ON",
+  ];
+  const configure = () =>
+    $`cmake -S ${LIBJXL_DIR} -B ${LIBJXL_BUILD} -G Ninja ${flags}`.quiet();
+
+  // cmake reports what actually went wrong on stderr ("PNG library is required
+  // by some tests", "No CMAKE_C_COMPILER could be found"); stdout only carries
+  // the -- progress chatter. Printing stdout alone hides every real diagnostic.
+  const tail = (e: unknown) => {
+    const err = e as { stdout?: unknown; stderr?: unknown };
+    const out = [String(err.stdout ?? ""), String(err.stderr ?? "")]
+      .join("\n").trimEnd();
+    return out.split("\n").slice(-25).join("\n");
+  };
 
   try {
     await configure();
   } catch (e) {
     // The cache-shape check above cannot anticipate every way a build tree
     // goes stale, so a failed configure earns exactly one clean retry.
-    // Surface cmake's own message either way: the interesting line is
-    // usually the last one, and .quiet() would otherwise swallow it.
-    const out = String((e as { stdout?: unknown }).stdout ?? "").trimEnd();
-    const tail = out.split("\n").slice(-25).join("\n");
     if (!existsSync(join(LIBJXL_BUILD, "CMakeCache.txt"))) {
-      console.error(tail);
+      console.error(tail(e));
       throw e;
     }
     console.log("deps: cmake configure failed; retrying with a clean build dir");
-    console.error(tail);
+    console.error(tail(e));
     rmSync(LIBJXL_BUILD, { recursive: true, force: true });
     try {
       await configure();
     } catch (e2) {
-      console.error(String((e2 as { stdout?: unknown }).stdout ?? "").trimEnd());
+      console.error(tail(e2));
       throw e2;
     }
   }
