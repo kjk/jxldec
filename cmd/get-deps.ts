@@ -13,7 +13,7 @@
 // Exported as getDeps() so build.ts / tests.ts can self-provision.
 // deps/ is gitignored.
 import { $ } from "bun";
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 
 const ROOT = `${import.meta.dir}/..`;
@@ -49,12 +49,43 @@ export async function getDeps(): Promise<void> {
 // libpng is deliberately NOT bundled (its cmake glue can't find the bundled
 // zlib's generated zconf.h); PNG input is handled by cmd/png.ts instead, and
 // PNM covers everything the oracle needs.
+
+// A cmake cache remembers the compiler and the option values it was first
+// configured with, and re-running with different -D flags does not reliably
+// reset everything derived from them. A build directory left behind by an
+// interrupted or differently-configured attempt therefore fails in confusing
+// ways -- the observed one being "PNG library is required by some tests",
+// from a cache that had kept BUILD_TESTING=ON and cl.exe. Returns true when
+// the existing cache matches what we are about to ask for, so that an
+// interrupted build resumes instead of starting over.
+function cacheIsUsable(cc: string): boolean {
+  const cache = join(LIBJXL_BUILD, "CMakeCache.txt");
+  if (!existsSync(cache)) return false;
+  let text: string;
+  try {
+    text = readFileSync(cache, "utf8");
+  } catch {
+    return false;
+  }
+  const entry = (key: string) =>
+    text.match(new RegExp(`^${key}:[^=]*=(.*)$`, "m"))?.[1]?.trim() ?? "";
+  if (!/^(OFF|NO|FALSE|0)$/i.test(entry("BUILD_TESTING"))) return false;
+  const cached = entry("CMAKE_C_COMPILER").replaceAll("\\", "/");
+  return cached.toLowerCase().includes(`/${cc.toLowerCase()}`);
+}
+
 export async function buildRef(): Promise<void> {
   if (existsSync(refTool("cjxl")) && existsSync(refTool("djxl"))) return;
   console.log("deps: building libjxl reference tools (one-time, slow)...");
   const cc = isWindows ? "clang-cl" : "clang";
   const cxx = isWindows ? "clang-cl" : "clang++";
-  await $`cmake -S ${LIBJXL_DIR} -B ${LIBJXL_BUILD} -G Ninja
+
+  if (existsSync(LIBJXL_BUILD) && !cacheIsUsable(cc)) {
+    console.log("deps: discarding a stale deps/libjxl-build cache");
+    rmSync(LIBJXL_BUILD, { recursive: true, force: true });
+  }
+
+  const configure = () => $`cmake -S ${LIBJXL_DIR} -B ${LIBJXL_BUILD} -G Ninja
     -DCMAKE_BUILD_TYPE=Release
     -DCMAKE_C_COMPILER=${cc} -DCMAKE_CXX_COMPILER=${cxx}
     -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=OFF
@@ -64,6 +95,30 @@ export async function buildRef(): Promise<void> {
     -DJPEGXL_ENABLE_JNI=OFF -DJPEGXL_ENABLE_DOXYGEN=OFF
     -DJPEGXL_ENABLE_PLUGINS=OFF -DJPEGXL_BUNDLE_LIBPNG=OFF
     -DJPEGXL_ENABLE_SKCMS=ON`.quiet();
+
+  try {
+    await configure();
+  } catch (e) {
+    // The cache-shape check above cannot anticipate every way a build tree
+    // goes stale, so a failed configure earns exactly one clean retry.
+    // Surface cmake's own message either way: the interesting line is
+    // usually the last one, and .quiet() would otherwise swallow it.
+    const out = String((e as { stdout?: unknown }).stdout ?? "").trimEnd();
+    const tail = out.split("\n").slice(-25).join("\n");
+    if (!existsSync(join(LIBJXL_BUILD, "CMakeCache.txt"))) {
+      console.error(tail);
+      throw e;
+    }
+    console.log("deps: cmake configure failed; retrying with a clean build dir");
+    console.error(tail);
+    rmSync(LIBJXL_BUILD, { recursive: true, force: true });
+    try {
+      await configure();
+    } catch (e2) {
+      console.error(String((e2 as { stdout?: unknown }).stdout ?? "").trimEnd());
+      throw e2;
+    }
+  }
   await $`cmake --build ${LIBJXL_BUILD} --target cjxl djxl jxlinfo`;
   console.log("deps: libjxl tools ready");
 }
