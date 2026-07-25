@@ -124,6 +124,26 @@ rather than overhead-bound. Two further options, neither taken:
 
 ## Log
 
+### MA tree walk: a leaf is now always a leaf (not a speedup)
+`ma_get_leaf` carried a step counter that `break`s out of the walk once it
+exceeds the node count, which returns a **decision** node to the caller --
+which then reads `cluster`, `multiplier` and `predictor` off a node that has
+none, decoding garbage instead of failing. The termination condition belongs
+at parse time: the rebuild in `jxl_ma_config_read` fills each node from a
+queue holding only indices greater than that node's, so children always point
+forwards and every walk strictly increases the index. That invariant is now
+checked once, after the rebuild, and a tree violating it is rejected. The walk
+itself lost the guard, the `property == 0 / == 1` special cases (`props_compute`
+writes both into `cache[0..1]` with the rest) and the `props_get` wrapper.
+
+This was attempted as an optimization and **is not one**. Interleaved A/B over
+the three heaviest Modular files, 7 runs each: 1086/1093ms with the change,
+1090/1098ms without -- inside the run-to-run spread of either version alone,
+and the per-file ratios against libjxl (the in-process control) are flat. MSVC
+was already hoisting the two static-property tests and the guard increment out
+of the loop. Keep the change for the correctness and the simpler walk; do not
+expect time back, and do not re-profile this loop hoping for it.
+
 ### EPF and spline hot loops
 See **Performance** above: three loops were repeating per-channel work that
 does not depend on the channel, and `epf_pass` was calling `jxl_mirror` 720

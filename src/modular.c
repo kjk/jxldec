@@ -216,6 +216,22 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
                 (unsigned)(dq_tail - dq_head));
         goto done;
     }
+
+    /* The queue only ever holds indices greater than the node being filled
+       in, so the rebuild above cannot produce a child that points backwards
+       and every walk from the root strictly increases the node index.
+       Checking that invariant here, once, lets ma_get_leaf walk without a
+       termination guard of its own -- and a guard there could only stop
+       mid-walk and hand the caller a decision node in place of a leaf. */
+    for (i = 0; i < count; i++) {
+        if (raw[i].property < 0) continue;
+        if (raw[i].left <= i || raw[i].right <= i ||
+            raw[i].left >= count || raw[i].right >= count) {
+            JXL_ERR(ctx, "modular: MA tree has a cycle at node %u",
+                    (unsigned)i);
+            goto done;
+        }
+    }
     ma->root = dq[dq_head];
     ma->nodes = raw;
     ma->count = count;
@@ -475,7 +491,8 @@ static int32_t chan_get(const jxl_mchan *c, uint32_t x, uint32_t y) {
     return c->data[(size_t)y * c->stride + x];
 }
 
-static void props_compute(const jxl_pred_state *ps, jxl_props *pr) {
+static void props_compute(const jxl_pred_state *ps, jxl_props *pr,
+                          int32_t channel, int32_t stream_idx) {
     int32_t w_nw = (int32_t)((uint32_t)ps->w - (uint32_t)ps->nw);
     if (ps->use_sc) {
         sc_predict(&ps->sc, ps->n, ps->nw, pred_ne(ps), ps->w, pred_nn(ps),
@@ -486,8 +503,10 @@ static void props_compute(const jxl_pred_state *ps, jxl_props *pr) {
         pr->sc.prediction = 0;
         pr->sc.max_error = 0;
     }
-    pr->cache[0] = 0;   /* channel index; resolved during the tree walk  */
-    pr->cache[1] = 0;   /* stream index; resolved during the tree walk   */
+    /* The two static properties go in the same array as the rest so the tree
+       walk can index every property uniformly. */
+    pr->cache[0] = channel;
+    pr->cache[1] = stream_idx;
     pr->cache[2] = (int32_t)ps->y;
     pr->cache[3] = (int32_t)ps->x;
     pr->cache[4] = (int32_t)(ps->n < 0 ? 0u - (uint32_t)ps->n : (uint32_t)ps->n);
@@ -532,13 +551,6 @@ static int32_t props_get_extra(const jxl_pred_state *ps, uint32_t prop_extra) {
         return (int32_t)(d < 0 ? -d : d);
     }
     return (int32_t)((uint32_t)c - (uint32_t)g);
-}
-
-static int32_t props_get(const jxl_pred_state *ps, const jxl_props *pr,
-                         int32_t property) {
-    if (property < 0) return 0;
-    if (property < 16) return pr->cache[property];
-    return props_get_extra(ps, (uint32_t)property - 16);
 }
 
 static int32_t predict_sample(const jxl_pred_state *ps, const jxl_props *pr,
@@ -1173,7 +1185,8 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
                     jxl_props pr;
                     int32_t *sample = &targets[c].data[(size_t)y * targets[c].stride + x];
                     int32_t value = *sample;
-                    props_compute(&ps, &pr);
+                    /* No tree walk here, so the static properties are unused. */
+                    props_compute(&ps, &pr, 0, 0);
                     if (need_delta[(size_t)y * width + x]) {
                         int32_t diff = predict_sample(&ps, &pr, tr->d_pred);
                         value = (int32_t)((uint32_t)value + (uint32_t)diff);
@@ -1434,20 +1447,23 @@ int jxl_modular_transform_channels(jxl_ctx *ctx, jxl_modular *m,
 /* sample decoding                                                        */
 /* ===================================================================== */
 
-/* Walks the MA tree for the current pixel and returns the matching leaf. */
+/* Walks the decision tree to the leaf governing this sample. Every property
+   is read the same way, from cache[] or from the previous-channel accessor:
+   the two static properties are no longer special-cased here because
+   props_compute stores them in cache[0..1] like the rest. The walk always
+   terminates -- jxl_ma_config_read rejects any tree whose child indices are
+   not strictly greater than the parent's -- so this returns a real leaf,
+   never a decision node abandoned part-way down. */
 static const jxl_ma_node *ma_get_leaf(const jxl_ma_config *ma,
                                       const jxl_pred_state *ps,
-                                      const jxl_props *pr, int32_t channel,
-                                      int32_t stream_idx) {
-    const jxl_ma_node *node = &ma->nodes[ma->root];
-    uint32_t guard = 0;
+                                      const jxl_props *pr) {
+    const jxl_ma_node *nodes = ma->nodes;
+    const jxl_ma_node *node = &nodes[ma->root];
     while (node->property >= 0) {
-        int32_t v;
-        if (node->property == 0) v = channel;
-        else if (node->property == 1) v = stream_idx;
-        else v = props_get(ps, pr, node->property);
-        node = &ma->nodes[v > node->value ? node->left : node->right];
-        if (++guard > ma->count + 2) break;
+        int32_t p = node->property;
+        int32_t v = p < 16 ? pr->cache[p]
+                           : props_get_extra(ps, (uint32_t)p - 16);
+        node = &nodes[v > node->value ? node->left : node->right];
     }
     return node;
 }
@@ -1542,8 +1558,8 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                 uint32_t token;
                 int32_t diff, value;
 
-                props_compute(&ps, &pr);
-                leaf = ma_get_leaf(ma, &ps, &pr, (int32_t)ci, (int32_t)stream_idx);
+                props_compute(&ps, &pr, (int32_t)ci, (int32_t)stream_idx);
+                leaf = ma_get_leaf(ma, &ps, &pr);
                 token = jxl_dec_read_clustered(dec, br, leaf->cluster, dist_multiplier);
                 diff = jxl_unpack_signed(token);
                 diff = (int32_t)((uint32_t)diff * leaf->multiplier +
