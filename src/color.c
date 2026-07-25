@@ -148,3 +148,168 @@ void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
             break;
     }
 }
+
+/* ----- primaries and white point -> the opsin inverse matrix ----- */
+
+static void mat3_mul(const float a[9], const float b[9], float out[9]) {
+    int i, j, k;
+    float t[9];
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) {
+            float s = 0.0f;
+            for (k = 0; k < 3; k++) s += a[i * 3 + k] * b[k * 3 + j];
+            t[i * 3 + j] = s;
+        }
+    }
+    memcpy(out, t, sizeof(t));
+}
+
+static int mat3_inv(const float m[9], float out[9]) {
+    float det;
+    float a = m[0], b = m[1], c = m[2];
+    float d = m[3], e = m[4], f = m[5];
+    float g = m[6], h = m[7], i = m[8];
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if (det == 0.0f) return -1;
+    out[0] = (e * i - f * h) / det;
+    out[1] = (c * h - b * i) / det;
+    out[2] = (b * f - c * e) / det;
+    out[3] = (f * g - d * i) / det;
+    out[4] = (a * i - c * g) / det;
+    out[5] = (c * d - a * f) / det;
+    out[6] = (d * h - e * g) / det;
+    out[7] = (b * g - a * h) / det;
+    out[8] = (a * e - b * d) / det;
+    return 0;
+}
+
+/* RGB -> XYZ for the given primaries and white point. */
+static int primaries_to_xyz(const float p[6], float wx, float wy, float out[9]) {
+    float prim[9], inv[9], w[3], scale[3];
+    int i;
+    prim[0] = p[0]; prim[1] = p[2]; prim[2] = p[4];
+    prim[3] = p[1]; prim[4] = p[3]; prim[5] = p[5];
+    prim[6] = 1.0f - p[0] - p[1];
+    prim[7] = 1.0f - p[2] - p[3];
+    prim[8] = 1.0f - p[4] - p[5];
+    if (wy == 0.0f || mat3_inv(prim, inv) != 0) return -1;
+    w[0] = wx / wy;
+    w[1] = 1.0f;
+    w[2] = (1.0f - wx - wy) / wy;
+    for (i = 0; i < 3; i++) {
+        scale[i] = inv[i * 3] * w[0] + inv[i * 3 + 1] * w[1] + inv[i * 3 + 2] * w[2];
+    }
+    for (i = 0; i < 3; i++) {
+        out[i * 3] = prim[i * 3] * scale[0];
+        out[i * 3 + 1] = prim[i * 3 + 1] * scale[1];
+        out[i * 3 + 2] = prim[i * 3 + 2] * scale[2];
+    }
+    return 0;
+}
+
+/* Bradford chromatic adaptation from the given white point to D50. */
+static int adapt_to_xyz_d50(float wx, float wy, float out[9]) {
+    static const float bradford[9] = {
+        0.8951f, 0.2664f, -0.1614f,
+        -0.7502f, 1.7135f, 0.0367f,
+        0.0389f, -0.0685f, 1.0296f
+    };
+    static const float w50[3] = {0.96422f, 1.0f, 0.82521f};
+    float w[3], lms[3], lms50[3], a[9], inv[9];
+    int i;
+    if (wy == 0.0f) return -1;
+    w[0] = wx / wy;
+    w[1] = 1.0f;
+    w[2] = (1.0f - wx - wy) / wy;
+    for (i = 0; i < 3; i++) {
+        lms[i] = bradford[i * 3] * w[0] + bradford[i * 3 + 1] * w[1] +
+                 bradford[i * 3 + 2] * w[2];
+        lms50[i] = bradford[i * 3] * w50[0] + bradford[i * 3 + 1] * w50[1] +
+                   bradford[i * 3 + 2] * w50[2];
+        if (lms[i] == 0.0f) return -1;
+    }
+    memset(a, 0, sizeof(a));
+    for (i = 0; i < 3; i++) a[i * 3 + i] = lms50[i] / lms[i];
+    if (mat3_inv(bradford, inv) != 0) return -1;
+    mat3_mul(a, bradford, out);
+    mat3_mul(inv, out, out);
+    return 0;
+}
+
+static void get_primaries(const jxl_colour_encoding *enc, float p[6]) {
+    switch (enc->primaries) {
+        case JXL_PRIMARIES_2100:
+            p[0] = 0.708f; p[1] = 0.292f;
+            p[2] = 0.170f; p[3] = 0.797f;
+            p[4] = 0.131f; p[5] = 0.046f;
+            break;
+        case JXL_PRIMARIES_P3:
+            p[0] = 0.680f; p[1] = 0.320f;
+            p[2] = 0.265f; p[3] = 0.690f;
+            p[4] = 0.150f; p[5] = 0.060f;
+            break;
+        case JXL_PRIMARIES_CUSTOM:
+            memcpy(p, enc->prim_xy, 6 * sizeof(float));
+            break;
+        default:
+            p[0] = 0.640f; p[1] = 0.330f;
+            p[2] = 0.300f; p[3] = 0.600f;
+            p[4] = 0.150f; p[5] = 0.060f;
+            break;
+    }
+}
+
+static void get_white_point(const jxl_colour_encoding *enc, float *wx, float *wy) {
+    switch (enc->white_point) {
+        case JXL_WP_E: *wx = 1.0f / 3.0f; *wy = 1.0f / 3.0f; break;
+        case JXL_WP_DCI: *wx = 0.314f; *wy = 0.351f; break;
+        case JXL_WP_CUSTOM: *wx = enc->white_xy[0]; *wy = enc->white_xy[1]; break;
+        default: *wx = 0.3127f; *wy = 0.3290f; break;
+    }
+}
+
+/* The stored opsin inverse matrix lands in linear sRGB. When the image
+   declares different primaries or a different white point we fold the
+   sRGB -> target conversion into it, exactly like libjxl's
+   OutputEncodingInfo::SetFromMetadata. Grayscale output instead collapses the
+   three rows to the target's luminance weights. */
+void jxl_opsin_matrix_for(const jxl_image_metadata *meta, float out[9]) {
+    const jxl_colour_encoding *enc = &meta->colour;
+    float luminances[3] = {0.2126f, 0.7152f, 0.0722f};
+    int is_gray = (enc->colour_space == JXL_CS_GRAY);
+
+    memcpy(out, meta->opsin_inv, 9 * sizeof(float));
+
+    if (!is_gray &&
+        (enc->primaries != JXL_PRIMARIES_SRGB || enc->white_point != JXL_WP_D65)) {
+        static const float srgb_p[6] = {0.640f, 0.330f, 0.300f, 0.600f,
+                                        0.150f, 0.060f};
+        float srgb_to_xyzd50[9], orig_to_xyz[9], adapt[9], tmp[9];
+        float p[6], wx, wy;
+        if (primaries_to_xyz(srgb_p, 0.3127f, 0.3290f, tmp) != 0) return;
+        if (adapt_to_xyz_d50(0.3127f, 0.3290f, adapt) != 0) return;
+        mat3_mul(adapt, tmp, srgb_to_xyzd50);
+
+        get_primaries(enc, p);
+        get_white_point(enc, &wx, &wy);
+        if (primaries_to_xyz(p, wx, wy, orig_to_xyz) != 0) return;
+        memcpy(luminances, orig_to_xyz + 3, 3 * sizeof(float));
+
+        if (meta->xyb_encoded) {
+            float xyzd50_to_orig[9], srgb_to_orig[9];
+            if (adapt_to_xyz_d50(wx, wy, adapt) != 0) return;
+            mat3_mul(adapt, orig_to_xyz, tmp);
+            if (mat3_inv(tmp, xyzd50_to_orig) != 0) return;
+            mat3_mul(xyzd50_to_orig, srgb_to_xyzd50, srgb_to_orig);
+            mat3_mul(srgb_to_orig, meta->opsin_inv, out);
+        }
+    }
+
+    if (is_gray) {
+        float luma[9], tmp[9];
+        int i;
+        for (i = 0; i < 3; i++) memcpy(luma + i * 3, luminances, 3 * sizeof(float));
+        memcpy(tmp, out, sizeof(tmp));
+        mat3_mul(luma, tmp, out);
+    }
+}

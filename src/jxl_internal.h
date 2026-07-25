@@ -767,6 +767,9 @@ void jxl_xyb_to_linear(float *x, float *y, float *b, size_t n,
                        float intensity_target);
 void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
                       float intensity_target);
+/* The opsin inverse matrix adjusted for the image's primaries/white point
+   (and collapsed to luminance weights for grayscale output). */
+void jxl_opsin_matrix_for(const jxl_image_metadata *meta, float out[9]);
 
 /* ===================================================================== */
 /* decode -- frame decoding into float planes                             */

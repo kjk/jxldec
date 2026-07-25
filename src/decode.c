@@ -867,8 +867,10 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     /* ----- XYB -> the image's color space ----- */
     if (apply_ct && meta->xyb_encoded && out->ncolor >= 3) {
         size_t n = (size_t)out->plane[0].w * out->plane[0].h;
+        float opsin[9];
+        jxl_opsin_matrix_for(meta, opsin);
         jxl_xyb_to_linear(out->plane[0].data, out->plane[1].data,
-                          out->plane[2].data, n, meta->opsin_inv,
+                          out->plane[2].data, n, opsin,
                           meta->opsin_bias, meta->tone_mapping.intensity_target);
         for (i = 0; i < 3; i++) {
             jxl_linear_to_tf(out->plane[i].data, n, &meta->colour,

@@ -23,7 +23,8 @@ for the float (VarDCT) paths.
 | VarDCT, 8-bit sRGB | within 1 |
 | VarDCT, progressive (LF frames) | within 1 |
 | gaborish, EPF | done |
-| non-sRGB primaries (BT.2020, P3, ACEScg) | **missing** — max diff 3..6 |
+| non-sRGB primaries (BT.2020, P3) | done (Bradford-adapted matrix) |
+| images with an embedded ICC profile | **missing** — the enum fields are unused, so the conversion is wrong |
 | patches / reference frames | **missing** — decodes the wrong image |
 | splines, noise | **missing** — errors out |
 | animation (frames after the first) | **missing** — only frame 0 |
@@ -39,10 +40,15 @@ is met for sRGB content.
 
 ## Known-cause failures
 
-1. **Non-sRGB primaries** (`*_2020_*`, `*_709_*`, `*_acescg_*`, `P3-*`):
-   the opsin inverse matrix lands in linear *sRGB* primaries; converting to the
-   image's declared primaries needs an RGB→XYZ→RGB matrix that is not
-   implemented. Shows up as max diff 3..6.
+1. **ICC-profile images** (`*_v4_krita`, `*_acescg_*`): when `want_icc` is set
+   the enumerated primaries/transfer fields are absent and the real color space
+   lives in the embedded profile. We decode the profile bytes but do not
+   interpret them, so the color transform uses sRGB defaults.
+   Enumerated non-sRGB primaries (BT.2020, P3, DCI) *are* handled:
+   `jxl_opsin_matrix_for` folds the sRGB→target conversion (Bradford-adapted
+   through XYZ D50) into the opsin inverse matrix, matching libjxl's
+   `OutputEncodingInfo::SetFromMetadata`. Linear-transfer 16-bit images can
+   still differ by a few counts at gamut edges, where out-of-range values clip.
 2. **Patches** (`ellipses`, `grayscale_patches` at effort ≥ 7): the encoder
    emits a `ReferenceOnly` frame plus a main frame with the patches flag. We
    decode and store the reference frame but do not blit patches, and we bail
