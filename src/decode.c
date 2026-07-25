@@ -823,6 +823,23 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                     goto done;
             }
         }
+        /* Build only the dequant matrices this frame's transforms need. */
+        {
+            uint8_t used[JXL_TR_COUNT];
+            size_t nb = (size_t)vd.bw * vd.bh, k;
+            memset(used, 0, sizeof(used));
+            for (k = 0; k < nb; k++) {
+                uint8_t t = vd.block_info[k].dct_select;
+                if (t < JXL_TR_COUNT) used[t] = 1;
+            }
+            for (k = 0; k < JXL_TR_COUNT; k++) {
+                if (!used[k]) continue;
+                if (jxl_dequant_matrices_ensure(ctx, &vd.dm, (int)k) != 0) {
+                    JXL_ERR(ctx, "vardct: bad dequant matrix");
+                    goto done;
+                }
+            }
+        }
         vardct_finish_blocks(&vd, meta, fh);
 
         /* Bring subsampled chroma back to full resolution before the loop

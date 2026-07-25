@@ -232,7 +232,7 @@ typedef struct {
     uint32_t n;
 } jxl_dq_params;
 
-typedef struct {
+typedef struct jxl_dq_encoding {
     int mode;            /* 0 dct, 1 hornuss, 2 dct2, 3 dct4, 4 dct4x8,
                             5 afv, 7 raw */
     jxl_dq_params dct[3];
@@ -430,7 +430,7 @@ static const float afv_freqs[16] = {
 };
 
 /* Builds the reciprocal dequant weights of one matrix (all 3 channels). */
-static int dq_into_matrix(jxl_ctx *ctx, jxl_dq_encoding *e, int tr,
+static int dq_into_matrix(jxl_ctx *ctx, struct jxl_dq_encoding *e, int tr,
                           float *out[3]) {
     uint32_t width, height, n;
     int c;
@@ -615,11 +615,13 @@ int jxl_dequant_matrices_read(jxl_ctx *ctx, jxl_br *br,
     int all_default;
     uint32_t slot;
     int rc = -1;
-    jxl_dq_encoding e;
+    jxl_dq_encoding *e;
     jxl_modular mod;
     jxl_chanlist cl;
 
     memset(dm, 0, sizeof(*dm));
+    dm->enc = (struct jxl_dq_encoding *)jxl_calloc(ctx, 17, sizeof(*dm->enc));
+    if (!dm->enc) return -1;
     all_default = jxl_br_bool(br);
 
     for (slot = 0; slot < 17; slot++) {
@@ -630,9 +632,10 @@ int jxl_dequant_matrices_read(jxl_ctx *ctx, jxl_br *br,
         memset(&mod, 0, sizeof(mod));
         memset(&cl, 0, sizeof(cl));
         jxl_tr_matrix_size(tr, &mw, &mh);
+        e = &dm->enc[slot];
 
         if (all_default) {
-            dq_default(&e, tr);
+            dq_default(e, tr);
         } else {
             uint32_t mode = jxl_br_read(br, 3);
             int midx = jxl_tr_matrix_index(tr);
@@ -642,41 +645,41 @@ int jxl_dequant_matrices_read(jxl_ctx *ctx, jxl_br *br,
                 JXL_ERR(ctx, "vardct: invalid dequant encoding mode");
                 goto done;
             }
-            memset(&e, 0, sizeof(e));
+            memset(e, 0, sizeof(*e));
             switch (mode) {
-                case 0: dq_default(&e, tr); break;
-                case 1: e.mode = 1; read_fixed(br, e.fixed, 3); break;
-                case 2: e.mode = 2; read_fixed(br, e.fixed, 6); break;
+                case 0: dq_default(e, tr); break;
+                case 1: e->mode = 1; read_fixed(br, e->fixed, 3); break;
+                case 2: e->mode = 2; read_fixed(br, e->fixed, 6); break;
                 case 3:
-                    e.mode = 3;
-                    read_fixed(br, e.fixed, 2);
-                    if (read_dct_params(ctx, br, e.dct) != 0) goto done;
+                    e->mode = 3;
+                    read_fixed(br, e->fixed, 2);
+                    if (read_dct_params(ctx, br, e->dct) != 0) goto done;
                     break;
                 case 4:
-                    e.mode = 4;
-                    read_fixed(br, e.fixed, 1);
-                    if (read_dct_params(ctx, br, e.dct) != 0) goto done;
+                    e->mode = 4;
+                    read_fixed(br, e->fixed, 1);
+                    if (read_dct_params(ctx, br, e->dct) != 0) goto done;
                     break;
                 case 5: {
                     int ci, i;
-                    e.mode = 5;
-                    read_fixed(br, e.fixed, 9);
+                    e->mode = 5;
+                    read_fixed(br, e->fixed, 9);
                     for (ci = 0; ci < 3; ci++) {
-                        for (i = 0; i < 6; i++) e.fixed[ci][i] *= 64.0f;
+                        for (i = 0; i < 6; i++) e->fixed[ci][i] *= 64.0f;
                     }
-                    if (read_dct_params(ctx, br, e.dct) != 0) goto done;
-                    if (read_dct_params(ctx, br, e.dct4x4) != 0) goto done;
+                    if (read_dct_params(ctx, br, e->dct) != 0) goto done;
+                    if (read_dct_params(ctx, br, e->dct4x4) != 0) goto done;
                     break;
                 }
                 case 6:
-                    e.mode = 0;
-                    if (read_dct_params(ctx, br, e.dct) != 0) goto done;
+                    e->mode = 0;
+                    if (read_dct_params(ctx, br, e->dct) != 0) goto done;
                     break;
                 default: {
                     jxl_mchan_spec specs[3];
                     int k;
-                    e.mode = 7;
-                    e.denominator = jxl_br_f16(br);
+                    e->mode = 7;
+                    e->denominator = jxl_br_f16(br);
                     for (k = 0; k < 3; k++) {
                         specs[k].w = mw;
                         specs[k].h = mh;
@@ -691,27 +694,21 @@ int jxl_dequant_matrices_read(jxl_ctx *ctx, jxl_br *br,
                                            1 + num_lf_groups * 3 + slot) != 0)
                         goto done;
                     if (jxl_modular_inverse(ctx, &mod, &cl) != 0) goto done;
-                    for (k = 0; k < 3; k++) e.raw[k] = mod.base[k].data;
-                    e.raw_w = mw;
-                    e.raw_h = mh;
+                    for (k = 0; k < 3; k++) e->raw[k] = mod.base[k].data;
+                    e->raw_w = mw;
+                    e->raw_h = mh;
                     break;
                 }
             }
         }
 
-        if (dq_into_matrix(ctx, &e, tr, dm->matrix[slot]) != 0) goto done;
-        /* The transposed copy is what varblocks with need_transpose use. */
-        for (c = 0; c < 3; c++) {
-            uint32_t i, x, y;
-            dm->matrix_tr[slot][c] =
-                (float *)jxl_calloc(ctx, (size_t)mw * mh, sizeof(float));
-            if (!dm->matrix_tr[slot][c]) goto done;
-            for (i = 0; i < mw * mh; i++) {
-                x = i % mh;
-                y = i / mh;
-                dm->matrix_tr[slot][c][i] = dm->matrix[slot][c][x * mw + y];
-            }
+        /* Mode 7's samples belong to the Modular image freed just below, so
+           that slot has to be built now; the rest wait until a varblock asks
+           for them. */
+        if (e->mode == 7) {
+            if (jxl_dequant_matrices_ensure(ctx, dm, tr) != 0) goto done;
         }
+        (void)c;
         jxl_chanlist_free(ctx, &cl);
         jxl_modular_free(ctx, &mod);
     }
@@ -724,6 +721,31 @@ done:
     return rc;
 }
 
+int jxl_dequant_matrices_ensure(jxl_ctx *ctx, jxl_dequant_matrices *dm,
+                                int tr) {
+    int slot = jxl_tr_matrix_index(tr);
+    uint32_t mw, mh, i, x, y;
+    int c;
+
+    if (slot < 0 || slot >= 17 || !dm->enc) return -1;
+    if (dm->matrix[slot][0]) return 0;
+
+    jxl_tr_matrix_size(tr, &mw, &mh);
+    if (dq_into_matrix(ctx, &dm->enc[slot], tr, dm->matrix[slot]) != 0) return -1;
+    /* The transposed copy is what varblocks with need_transpose use. */
+    for (c = 0; c < 3; c++) {
+        dm->matrix_tr[slot][c] =
+            (float *)jxl_calloc(ctx, (size_t)mw * mh, sizeof(float));
+        if (!dm->matrix_tr[slot][c]) return -1;
+        for (i = 0; i < mw * mh; i++) {
+            x = i % mh;
+            y = i / mh;
+            dm->matrix_tr[slot][c][i] = dm->matrix[slot][c][x * mw + y];
+        }
+    }
+    return 0;
+}
+
 void jxl_dequant_matrices_free(jxl_ctx *ctx, jxl_dequant_matrices *dm) {
     int i, c;
     for (i = 0; i < 17; i++) {
@@ -734,6 +756,8 @@ void jxl_dequant_matrices_free(jxl_ctx *ctx, jxl_dequant_matrices *dm) {
             dm->matrix_tr[i][c] = NULL;
         }
     }
+    jxl_free(ctx, dm->enc);
+    dm->enc = NULL;
 }
 
 /* ===================================================================== */

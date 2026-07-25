@@ -649,9 +649,14 @@ typedef struct {
     uint32_t num_block_clusters;
 } jxl_hf_block_ctx;
 
+/* Slots are materialized on demand. The largest is 256x256 floats per
+   channel, and a frame typically uses a handful of transform sizes, so
+   building all 17 up front dominates the decode of a small image. */
+struct jxl_dq_encoding;
 typedef struct {
     float *matrix[17][3];
     float *matrix_tr[17][3];
+    struct jxl_dq_encoding *enc;   /* 17 parsed, not-yet-built encodings */
 } jxl_dequant_matrices;
 
 typedef struct {
@@ -707,6 +712,8 @@ int jxl_dequant_matrices_read(jxl_ctx *ctx, jxl_br *br,
                               uint32_t num_lf_groups,
                               jxl_ma_config *global_ma);
 void jxl_dequant_matrices_free(jxl_ctx *ctx, jxl_dequant_matrices *dm);
+/* Builds the slot serving transform `tr`, if it is not built already. */
+int jxl_dequant_matrices_ensure(jxl_ctx *ctx, jxl_dequant_matrices *dm, int tr);
 
 int jxl_hf_pass_read(jxl_ctx *ctx, jxl_br *br, jxl_hf_pass *hp,
                      const jxl_hf_block_ctx *bc, uint32_t num_hf_presets,
