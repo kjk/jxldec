@@ -4,15 +4,15 @@ Milestone log for the C JPEG XL decoder. Newest first.
 
 ## Status summary
 
-`bun cmd/tests.ts -all` — 821 corpus files (libjxl's testdata images × 11 cjxl
+`bun cmd/tests.ts -all` — 894 corpus files (libjxl's testdata images × 12 cjxl
 presets, its JPEGs transcoded, plus the `.jxl` files that ship with libjxl):
 
 ```
-821/821 ok, 0 failed
+894/894 ok, 0 failed
 ```
 
 "ok" means byte-identical to `djxl file.jxl out.pam`, or inside the float
-tolerance for the VarDCT paths. 381 files are byte-exact; across the other 440
+tolerance for the VarDCT paths. 381 files are byte-exact; across the other 513
 no sample differs from libjxl by more than one 8-bit step.
 
 | area | state |
@@ -27,7 +27,7 @@ no sample differs from libjxl by more than one 8-bit step.
 | non-sRGB primaries (BT.2020, P3) | done (Bradford-adapted matrix) |
 | images with an embedded ICC profile | done |
 | patches / reference frames | **byte-exact** |
-| splines, noise | done (noise is approximate, see below) |
+| splines, noise | within 1 |
 | animation (frames after the first) | done |
 | YCbCr / JPEG transcode frames | done, all subsampling modes |
 
@@ -50,16 +50,17 @@ corpus file anyway.
    This used to read "63 files, max 2-10 counts, not worth chasing". That was
    wrong: the long tail was a loop-filter edge bug, not float divergence. See
    the entry below.
-2. **Noise** reproduces approximately (max 5, mean 0.47 on a photon-noise
-   file). The XorShift128+ RNG and the 5x5 high-pass match jxl-oxide's
-   structure but a small difference remains, uninvestigated.
+2. ~~**Noise** reproduces approximately.~~ Fixed: it was the RNG seed being
+   advanced one frame too late, not an approximation. Noise now lands inside
+   the same one-count tolerance as every other VarDCT path. See the log.
 
 ## Performance
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-821-file corpus we are **2.33x libjxl** (was 3.22x, then 2.64x). libjxl is
-AVX2; we are scalar C, so a constant factor is expected.
+corpus we are **2.33x libjxl** (was 3.22x, then 2.64x), measured over the 821
+files that predate the `v_noise` preset. libjxl is AVX2; we are scalar C, so a
+constant factor is expected.
 
 `bun cmd/prof.ts <file.jxl>` profiles our decoder alone through the sibling
 `../samply` and prints samply's `-print-agent` report (top self-time
@@ -128,6 +129,38 @@ rather than overhead-bound. Two further options, neither taken:
   intrinsics, which would end the scalar-C property.
 
 ## Log
+
+### Noise was seeded one frame too early, and untested
+Two problems, the second of which hid the first.
+
+**No coverage.** `PROGRESS.md` claimed noise "reproduces approximately (max 5,
+mean 0.47 on a photon-noise file)" and called it uninvestigated -- but nothing
+exercised it: testdata ships no noisy image and no preset asked for one, so
+that figure came from an ad-hoc file and no regression could have been caught.
+`cjxl --photon_noise_iso=3200` sets `JXL_FF_NOISE`, so a `v_noise` preset costs
+one line. It failed 47 of 73 immediately, peaking at 55 counts -- an order of
+magnitude worse than the claim.
+
+**The bug.** `walk_frames` counted `visible_frames` / `invisible_frames` after
+rendering each frame. libjxl advances them in `InitFrame`, *before* decoding
+(`dec_frame.cc`), so the first visible frame synthesises its noise with
+`visible_frame_index` already 1. Every single-frame image was therefore seeded
+0 where libjxl seeds `1 << 32`.
+
+Everything downstream of the seed was already right, which is exactly why it
+was hard to see: the XorShift128+ state init, `Fill`, `BitsToFloat`, the 5x5
+high-pass and the 1/128-vs-127/128 channel mix all match libjxl line for line.
+So the noise had the correct distribution and no relation to libjxl's. On a
+flat 2048x2048 gray image the two fields agreed on standard deviation to 0.3%
+(4.131 vs 4.145), agreed on the 5x5 autocorrelation to three decimals, agreed
+on the 0.98 cross-channel correlation -- and correlated with each other at
+-0.0025, at every spatial shift. Chasing the magnitude would never have found
+it; only asking what the field's *statistics* said, versus its *values*, did.
+Advancing the counters before the decode takes the correlation to 0.9928, the
+remainder being ordinary float rounding.
+
+`v_noise` now passes 73/73, peak 1, and the corpus is `894/894 ok, 0 failed`.
+ASan clean.
 
 ### Three testdata images were never being tested
 `sourceImages()` named each converted `.pam` after the source PNG's basename

@@ -285,6 +285,19 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
         want = keyframe && idx == frame_no;
         apply_ct = want || !fh.save_before_ct;
 
+        /* These two feed the noise RNG seed, and libjxl advances them in
+           InitFrame -- before the frame is decoded, not after. So the first
+           visible frame synthesises its noise with visible_frame_index
+           already 1. Counting them afterwards seeded every single-frame
+           image with 0 and produced a noise field with exactly the right
+           distribution and no relation to libjxl's. */
+        if (keyframe) {
+            st.visible_frames++;
+            st.invisible_frames = 0;
+        } else {
+            st.invisible_frames++;
+        }
+
         if (count_out && !want) {
             /* Counting only: skip the pixel work entirely. */
             if (keyframe) idx++;
@@ -376,13 +389,7 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
             goto done;
         }
         jxl_fimage_free(ctx, &tmp);
-        if (keyframe) {
-            idx++;
-            st.visible_frames++;
-            st.invisible_frames = 0;
-        } else {
-            st.invisible_frames++;
-        }
+        if (keyframe) idx++;
         jxl_toc_free(ctx, &toc);
         jxl_frame_header_free(ctx, &fh);
         if (last || end >= doc->container.cs_len) break;

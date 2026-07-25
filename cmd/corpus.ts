@@ -40,6 +40,10 @@ export const PRESETS: { name: string; args: string[] }[] = [
   // codestream carries the profile itself and the decoder takes the
   // want_icc path.
   { name: "v_icc", args: ["-d", "1", "-e", "7", "-x", `icc_pathname=${ICC_PROFILE}`] },
+  // Sets JXL_FF_NOISE in the frame header, which nothing else here does:
+  // testdata ships no noisy image and no other preset asks for one, so the
+  // noise synthesis path had no regression coverage at all.
+  { name: "v_noise", args: ["-d", "1", "-e", "7", "--photon_noise_iso=3200"] },
 ];
 
 function walk(dir: string, pred: (name: string) => boolean): string[] {
