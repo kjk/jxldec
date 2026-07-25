@@ -792,8 +792,23 @@ int jxl_fimage_alloc(jxl_ctx *ctx, jxl_fimage *img, uint32_t nplane);
 int jxl_fplane_alloc(jxl_ctx *ctx, jxl_fplane *p, uint32_t w, uint32_t h);
 void jxl_fimage_free(jxl_ctx *ctx, jxl_fimage *img);
 
+/* State carried across the frames of one document: the reference slots a
+   frame can blend from, and the low-resolution image an LF frame leaves
+   behind for the next frame to use as its LF. */
+typedef struct {
+    jxl_fimage refs[4];
+    int refs_valid[4];
+    jxl_fimage lf_image;
+    int lf_valid;
+} jxl_frame_state;
+
+void jxl_frame_state_free(jxl_ctx *ctx, jxl_frame_state *st);
+
+/* apply_ct == 0 leaves the frame in its pre-color-transform (XYB) form, which
+   is what a frame saved "before CT" -- every LF frame -- must store. */
 int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
-                     const jxl_toc *toc, jxl_fimage *out);
+                     const jxl_toc *toc, jxl_frame_state *st, int apply_ct,
+                     jxl_fimage *out);
 
 /* ===================================================================== */
 /* doc -- top level state                                                 */

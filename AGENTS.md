@@ -104,11 +104,36 @@ section per module. Every source file includes just that one header.
   case there is exactly one section covering everything.
   Our `jxl_toc` stores **absolute byte offsets into the codestream buffer**.
 
+## Frames
+A codestream is a sequence of frames. Only *displayed* frames (normal type,
+and either `is_last` or a non-zero duration) are visible; LF frames
+(progressive DC) and reference-only frames are decoded for their side effects.
+`decode_frame_planes` in `render.c` walks the chain, keeping a
+`jxl_frame_state` with four reference slots and the most recent LF image.
+Frames saved "before CT" (every LF frame) skip the XYB -> color-space step.
+
 ## Methodology
-Reference-oracle verification: decode with `jxl_test` and with `djxl`, compare
-PNM output. Modular (integer) paths must be **bit-exact**; VarDCT paths are
-float and are compared with a tight tolerance. Work incrementally and keep
-`PROGRESS.md` current.
+Reference-oracle verification: decode with `jxl_test -out x.pam` and with
+`djxl file.jxl x.pam`, compare. Modular (integer) paths must be **byte-exact**;
+VarDCT paths are float and compared with a tolerance of one 8-bit step --
+libjxl, jxl-oxide and this decoder use different IDCT factorizations and
+different `powf` approximations, so exact equality is not achievable and
+libjxl's own conformance testing uses a tolerance too. Work incrementally and
+keep `PROGRESS.md` current; it lists the exact pass rate and every known gap.
+
+### Gotchas already paid for (do not re-discover)
+- The ANS end-of-stream signature is `0x130000`.
+- MA tree leaves hold an already-clustered index; reading them must bypass the
+  context->cluster map (`jxl_dec_read_clustered`).
+- Every entropy stream needs `jxl_dec_begin` after `jxl_dec_init` -- missing it
+  on the TOC permutation decoder silently corrupts every permuted TOC, which
+  is what `--progressive` produces.
+- `CustomTransformData` is read even when ImageMetadata says "all default".
+- The natural-order generator keeps libjxl's `x < lbw && y < lbw` quirk (`lbw`
+  twice, not `lbh`).
+- libjxl encodes sRGB with a rational-polynomial approximation, not `powf`.
+- Lossy Modular stores XYB as `(Y, X, B)` integers scaled by `m_*_lf / 128`,
+  with `B += Y` applied first.
 
 **Do not commit automatically.** Make and verify changes, but leave them in the
 working tree; only run `git commit` when the user asks. Never commit

@@ -429,8 +429,19 @@ static void vardct_finish_blocks(jxl_vardct_state *v,
     }
 }
 
+void jxl_frame_state_free(jxl_ctx *ctx, jxl_frame_state *st) {
+    int i;
+    for (i = 0; i < 4; i++) {
+        jxl_fimage_free(ctx, &st->refs[i]);
+        st->refs_valid[i] = 0;
+    }
+    jxl_fimage_free(ctx, &st->lf_image);
+    st->lf_valid = 0;
+}
+
 int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
-                     const jxl_toc *toc, jxl_fimage *out) {
+                     const jxl_toc *toc, jxl_frame_state *st, int apply_ct,
+                     jxl_fimage *out) {
     const jxl_image_metadata *meta = &doc->meta;
     jxl_sections sec;
     jxl_br *br;
@@ -466,8 +477,8 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         JXL_ERR(ctx, "frame: patches/splines/noise are not implemented yet");
         return -1;
     }
-    if (fh->flags & JXL_FF_USE_LF_FRAME) {
-        JXL_ERR(ctx, "frame: LF frames are not implemented yet");
+    if ((fh->flags & JXL_FF_USE_LF_FRAME) && !st->lf_valid) {
+        JXL_ERR(ctx, "frame: LF frame referenced but not decoded");
         return -1;
     }
     if (fh->do_ycbcr) {
@@ -633,7 +644,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
 
             br = section_reader(&sec, JXL_TOC_LF_GROUP, 0, i);
             if (!br) goto done;
-            if (is_vardct) {
+            if (is_vardct && !(fh->flags & JXL_FF_USE_LF_FRAME)) {
                 if (decode_lf_coeff(ctx, br, &vd, &lf_dequant, i, lf_w, lf_h,
                                     base_bx, base_by, bits,
                                     has_global_ma ? &global_ma : NULL) != 0)
@@ -746,12 +757,29 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         m_lf[0] = lf_dequant.m_x_lf;
         m_lf[1] = lf_dequant.m_y_lf;
         m_lf[2] = lf_dequant.m_b_lf;
-        jxl_cfl_lf(vd.lf[0], vd.lf[1], vd.lf[2], vd.bw, vd.bh, vd.bw,
-                   &vd.chan_corr);
-        if (!(fh->flags & JXL_FF_SKIP_ADAPTIVE_LF_SMOOTH)) {
-            if (jxl_adaptive_lf_smoothing(ctx, vd.lf, vd.bw, vd.bh, vd.bw, m_lf,
-                                          &vd.quantizer) != 0)
-                goto done;
+        if (fh->flags & JXL_FF_USE_LF_FRAME) {
+            /* The LF image comes from a previously decoded LF frame, already
+               dequantized and in XYB, so neither CfL nor smoothing apply. */
+            uint32_t x, y;
+            for (c = 0; c < 3; c++) {
+                const jxl_fplane *p = &st->lf_image.plane[c];
+                for (y = 0; y < vd.bh; y++) {
+                    uint32_t sy = y < p->h ? y : (p->h ? p->h - 1 : 0);
+                    for (x = 0; x < vd.bw; x++) {
+                        uint32_t sx = x < p->w ? x : (p->w ? p->w - 1 : 0);
+                        vd.lf[c][(size_t)y * vd.bw + x] =
+                            p->data[(size_t)sy * p->stride + sx];
+                    }
+                }
+            }
+        } else {
+            jxl_cfl_lf(vd.lf[0], vd.lf[1], vd.lf[2], vd.bw, vd.bh, vd.bw,
+                       &vd.chan_corr);
+            if (!(fh->flags & JXL_FF_SKIP_ADAPTIVE_LF_SMOOTH)) {
+                if (jxl_adaptive_lf_smoothing(ctx, vd.lf, vd.bw, vd.bh, vd.bw,
+                                              m_lf, &vd.quantizer) != 0)
+                    goto done;
+            }
         }
         vardct_finish_blocks(&vd, meta, fh);
 
@@ -837,7 +865,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     }
 
     /* ----- XYB -> the image's color space ----- */
-    if (meta->xyb_encoded && out->ncolor >= 3) {
+    if (apply_ct && meta->xyb_encoded && out->ncolor >= 3) {
         size_t n = (size_t)out->plane[0].w * out->plane[0].h;
         jxl_xyb_to_linear(out->plane[0].data, out->plane[1].data,
                           out->plane[2].data, n, meta->opsin_inv,

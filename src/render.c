@@ -178,47 +178,90 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
     return 0;
 }
 
-/* Decodes frame `frame_no` of the document into float planes. */
+/* A frame is displayed when it is a normal frame that either ends the
+   animation or has a duration; LF and reference-only frames are decoded for
+   their side effects and skipped. */
+static int frame_is_keyframe(const jxl_frame_header *fh) {
+    if (fh->frame_type != JXL_FRAME_REGULAR &&
+        fh->frame_type != JXL_FRAME_SKIP_PROGRESSIVE)
+        return 0;
+    return fh->is_last || fh->duration != 0;
+}
+
+/* Decodes frames in order until the `frame_no`-th displayed frame, keeping
+   LF and reference frames in `st` along the way. */
 static int decode_frame_planes(jxl_doc *doc, int frame_no, jxl_fimage *img) {
     jxl_ctx *ctx = doc->ctx;
+    jxl_frame_state st;
     jxl_br br;
     int idx = 0;
     int rc = -1;
 
+    memset(&st, 0, sizeof(st));
     jxl_br_init(&br, doc->container.cs, doc->container.cs_len);
     jxl_br_seek_byte(&br, doc->first_frame_off);
     for (;;) {
         jxl_frame_header fh;
         jxl_toc toc;
         size_t end;
-        int last;
+        int last, keyframe, want, apply_ct;
+        jxl_fimage tmp;
 
         memset(&toc, 0, sizeof(toc));
+        memset(&tmp, 0, sizeof(tmp));
         if (jxl_read_frame_header(ctx, &br, &doc->size, &doc->meta, &fh) != 0) {
             jxl_frame_header_free(ctx, &fh);
-            return -1;
+            goto done;
         }
         if (jxl_read_toc(ctx, &br, &fh, &toc) != 0) {
             jxl_frame_header_free(ctx, &fh);
-            return -1;
+            goto done;
         }
         end = toc.end_off + toc.total_size;
         last = fh.is_last;
+        keyframe = frame_is_keyframe(&fh);
+        want = keyframe && idx == frame_no;
+        apply_ct = want || !fh.save_before_ct;
 
-        if (idx == frame_no) {
-            rc = jxl_frame_decode(ctx, doc, &fh, &toc, img);
+        if (jxl_frame_decode(ctx, doc, &fh, &toc, &st, apply_ct, &tmp) != 0) {
             jxl_toc_free(ctx, &toc);
             jxl_frame_header_free(ctx, &fh);
-            return rc;
+            goto done;
         }
+
+        if (fh.frame_type == JXL_FRAME_LF) {
+            jxl_fimage_free(ctx, &st.lf_image);
+            st.lf_image = tmp;
+            st.lf_valid = 1;
+            memset(&tmp, 0, sizeof(tmp));
+        } else if (!keyframe && fh.save_as_reference < 4) {
+            uint32_t slot = fh.save_as_reference;
+            jxl_fimage_free(ctx, &st.refs[slot]);
+            st.refs[slot] = tmp;
+            st.refs_valid[slot] = 1;
+            memset(&tmp, 0, sizeof(tmp));
+        }
+
+        if (want) {
+            *img = tmp;
+            memset(&tmp, 0, sizeof(tmp));
+            jxl_toc_free(ctx, &toc);
+            jxl_frame_header_free(ctx, &fh);
+            rc = 0;
+            goto done;
+        }
+        jxl_fimage_free(ctx, &tmp);
+        if (keyframe) idx++;
         jxl_toc_free(ctx, &toc);
         jxl_frame_header_free(ctx, &fh);
-        idx++;
         if (last || end >= doc->container.cs_len) break;
         jxl_br_seek_byte(&br, end);
     }
     JXL_ERR(ctx, "render: no such frame %d", frame_no);
-    return -1;
+
+done:
+    jxl_frame_state_free(ctx, &st);
+    return rc;
 }
 
 jxl_image *jxl_frame_render(jxl_doc *doc, int frame_no, jxl_format fmt) {
