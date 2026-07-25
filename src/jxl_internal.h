@@ -42,6 +42,26 @@ void jxl_errorf(jxl_ctx *ctx, jxl_severity sev, const char *fmt, ...);
 /* Overflow-checked multiply for allocation sizes. Returns 0 on overflow. */
 int jxl_size_mul(size_t a, size_t b, size_t *out);
 
+/* 1 when the CPU has AVX2 *and* the OS saves YMM state. Cached after the
+   first call. -DJXL_NO_AVX2 makes it always 0, which is how the AVX2 and
+   SSE2 paths are diffed against each other. */
+int jxl_has_avx2(void);
+
+/* AVX2 kernels sit beside their SSE2 twins in the same translation unit so
+   the dist/ amalgamation stays one file. MSVC needs nothing; clang and gcc
+   need the target attribute per function. */
+#if defined(__clang__) || defined(__GNUC__)
+#define JXL_TARGET_AVX2 __attribute__((target("avx2")))
+#else
+#define JXL_TARGET_AVX2
+#endif
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#define JXL_ALIGN32 __declspec(align(32))
+#else
+#define JXL_ALIGN32 __attribute__((aligned(32)))
+#endif
+
 #define JXL_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define JXL_MAX(a, b) ((a) > (b) ? (a) : (b))
 

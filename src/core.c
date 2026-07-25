@@ -1,8 +1,74 @@
-/* core.c -- context, allocator wrappers, diagnostics. */
+/* core.c -- context, allocator wrappers, diagnostics, CPU feature detection. */
 #include "jxl_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+
+/* ----- runtime CPU dispatch -----
+ *
+ * SSE2 is baseline on x64 and needs no detection. AVX2 does, and it also
+ * needs the OS to have enabled YMM state saving -- a CPU that reports AVX2
+ * on a kernel that does not save the upper halves would corrupt them across
+ * a context switch, so OSXSAVE and XCR0 are checked as well as the feature
+ * bit. Detected once and cached; the result is only ever read afterwards, so
+ * the benign race on first use costs at most a duplicated CPUID.
+ *
+ * The AVX2 kernels live in the same translation units as the SSE2 ones, so
+ * the dist/ amalgamation stays a single file: MSVC accepts AVX2 intrinsics
+ * without /arch:AVX2, and clang takes a per-function target attribute. No
+ * separately-compiled object, and no /arch flag that would let the compiler
+ * emit AVX2 into code that has not been guarded.
+ *
+ * -DJXL_NO_AVX2 forces the SSE2 path, which is what the bit-identity diff
+ * uses: the AVX2 kernels compute the same values in the same order, eight
+ * lanes at a time instead of four, and that is checked rather than assumed. */
+#if defined(_WIN32)
+#include <intrin.h>
+#elif defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+#endif
+
+static int jxl_avx2_cached = -1;
+
+static int jxl_detect_avx2(void) {
+#if defined(JXL_NO_AVX2)
+    return 0;
+#elif defined(_WIN32) && (defined(_M_X64) || defined(_M_AMD64) || defined(_M_IX86))
+    int r[4];
+    __cpuid(r, 0);
+    if (r[0] < 7) return 0;
+    __cpuidex(r, 1, 0);
+    if (!(r[2] & (1 << 27))) return 0;          /* OSXSAVE */
+    if (!(r[2] & (1 << 28))) return 0;          /* AVX */
+    if ((_xgetbv(0) & 0x6u) != 0x6u) return 0;  /* OS saves XMM and YMM */
+    __cpuidex(r, 7, 0);
+    return (r[1] & (1 << 5)) != 0;              /* AVX2 */
+#elif defined(__x86_64__) || defined(__i386__)
+    unsigned a, b, c, d;
+    if (!__get_cpuid_max(0, 0)) return 0;
+    if (!__get_cpuid_count(1, 0, &a, &b, &c, &d)) return 0;
+    if (!(c & (1u << 27)) || !(c & (1u << 28))) return 0;
+    {
+        unsigned lo, hi;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        (void)hi;
+        if ((lo & 0x6u) != 0x6u) return 0;
+    }
+    if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) return 0;
+    return (b & (1u << 5)) != 0;
+#else
+    return 0;
+#endif
+}
+
+int jxl_has_avx2(void) {
+    int v = jxl_avx2_cached;
+    if (v < 0) {
+        v = jxl_detect_avx2();
+        jxl_avx2_cached = v;
+    }
+    return v;
+}
 
 static void *default_alloc(void *user, void *ctx, size_t size) {
     (void)user;

@@ -62,14 +62,14 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **2.19x libjxl** (2.74x before the SSE2 work below;
+1245-file corpus we are **2.18x libjxl** (2.74x before the SSE2 work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
 average up). libjxl is AVX2 throughout; we are scalar C apart from the SSE2
 hot loops (noise, upsampling, EPF, gaborish, both DCT passes, the XYB
-inverse, the sRGB transfer function and the output quantiser), so a
-constant factor is expected. Each of those keeps a scalar twin and is checked
-bit-identical against it -- see the log.
+inverse, the sRGB transfer function and the output quantiser), plus an AVX2
+`epf_pass` chosen at runtime, so a constant factor is expected. Each of those
+keeps a scalar twin and is checked bit-identical against it -- see the log.
 
 `bun cmd/prof.ts <file.jxl>` profiles our decoder alone through the sibling
 `../samply` and prints samply's `-print-agent` report (top self-time
@@ -131,12 +131,11 @@ The profile on `P3-sRGB-color-bars.v_d1` is flat -- `dct_1d` alone used to be
 27%, and nothing is above ~14% now. Everything with a straightforward,
 provably-bit-identical vector form has been done.
 
-What is left is qualitatively different from the six rounds above:
+What is left is qualitatively different from the rounds above:
 
-- **AVX2.** libjxl runs 8 lanes to our 4 throughout. Doubling the width is
-  the only remaining across-the-board win, but it means runtime dispatch and
-  a second copy of each kernel -- a real change in what this codebase is,
-  rather than another loop rewrite.
+- **AVX2 beyond `epf_pass`.** The dispatch machinery exists now, but widening
+  a kernel only paid for the one that is genuinely compute-bound; see the log
+  for the measurements that killed the others.
 - **`epf_pass` SAD symmetry.** The taps are symmetric pairs and the SAD is
   symmetric under swapping the two footprints, so `dist(x, y, k) ==
   dist(x+kx, y+ky, -k)`. Caching six SADs per sample in a rolling three-row
@@ -145,6 +144,47 @@ What is left is qualitatively different from the six rounds above:
 - **Multithreading**, which is not implemented at all and would dwarf both.
 
 ## Log
+
+### AVX2 with runtime dispatch -- and why only one kernel kept it
+`jxl_has_avx2()` in `core.c` does the detection: CPUID for the feature bit,
+plus OSXSAVE and XCR0, because a CPU that reports AVX2 under a kernel that
+does not save the upper halves would corrupt them across a context switch.
+Cached after the first call.
+
+The kernels sit beside their SSE2 twins in the same translation unit, so
+`dist/jxl.c` stays one file. MSVC accepts AVX2 intrinsics without
+`/arch:AVX2`; clang takes `__attribute__((target("avx2")))` per function.
+Neither needs a separate object with different flags, and neither lets the
+compiler emit AVX2 into code that has not been guarded. `-DJXL_NO_AVX2`
+forces SSE2, which is how the two are diffed: 313 files, identical. No
+`_mm256_fmadd_ps` anywhere -- a fused multiply-add rounds once where the
+scalar code rounds twice.
+
+**The interesting part is what got removed.** I widened the easy things
+first -- the XYB inverse, `tf_srgb`, the output quantiser -- because they are
+simple element-wise loops. Measured against an otherwise identical SSE2
+build, ten decodes, best of three:
+
+    file                     sse2    all-avx2        epf-only
+    P3-sRGB-color-bars.v_d1  0.51s   0.49s (-3.9%)   0.48s (-5.9%)
+    splines.v_e3             1.84s   1.64s (-10.9%)  1.58s (-14.1%)
+    flower.v_d1              1.72s   1.67s (-2.9%)   1.66s (-3.5%)
+    flower.v_prog            1.86s   1.76s (-5.4%)   1.74s (-6.5%)
+    flower.m_e3              6.19s   6.27s (+1.3%)   6.23s (+0.6%)
+
+Every file is faster with the element-wise kernels *gone*. They are
+memory-bandwidth-bound, so a wider vector buys nothing, and `quantize8` is
+called once per eight pixels and returns straight into SSE and scalar store
+code -- an AVX-to-SSE transition each time. So only `epf_pass` keeps an AVX2
+path: 12 kernel taps x 5 SAD offsets x 3 channels per sample out of an
+L1-resident window, which is the one place in the decoder that is genuinely
+compute-bound. An octet also suits it better than the quad does, since sigma
+blocks are 8 wide and `border_sad_mul` then applies to lanes 0 and 7 only.
+
+Corpus-wide this is small -- **2.19x -> 2.18x** -- because the corpus is
+Modular-heavy and Modular never runs EPF. The gain is real but concentrated:
+3.5-14% on VarDCT files, nothing elsewhere. 1245/1245 ok, ASan clean, 115
+fuzz reproducers clean.
 
 ### Not zeroing planes that get overwritten, and vectorising the quantiser
 The last two single-digit items on the profile, and the first one was the

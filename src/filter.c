@@ -27,6 +27,7 @@
 #if !defined(JXL_EPF_FORCE_SCALAR) &&     (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) ||      (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
 #define JXL_EPF_SSE2 1
 #include <emmintrin.h>
+#include <immintrin.h>
 #endif
 
 static uint32_t jxl_mirror(int64_t offset, uint32_t len) {
@@ -129,6 +130,69 @@ static const int8_t epf_dist_2[1][2] = {{0,0}};
    of the tap loop; only the multiply-add stays per tap. */
 #define EPF_SIGMA_MUL (6.6f * (0.70710678118654752f - 1.0f))
 
+#ifdef JXL_EPF_SSE2
+/* epf_pass, eight samples at a time. This is the densest arithmetic in the
+   decoder -- step 0 is 12 kernel taps x 5 SAD offsets x 3 channels per
+   sample, all out of an L1-resident window -- so it is the one kernel where
+   doubling the vector width should actually pay, unlike the element-wise
+   colour loops.
+ *
+ * An octet is tidier than the quad the SSE2 path uses: sigma blocks are 8
+ * wide, so an 8-aligned run is exactly one block, and border_sad_mul applies
+ * to lanes 0 and 7 only -- a single fixed pattern rather than two. */
+JXL_TARGET_AVX2
+static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
+                     const ptrdiff_t koff[12], const ptrdiff_t doff[5],
+                     int nkernel, int ndist, const float cscale[3],
+                     float sigma_val, float step_mul, float border_mul,
+                     int is_y_border) {
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    const __m256 one = _mm256_set1_ps(1.0f);
+    __m256 dist8[12], sum8[3], sw, nis, smv;
+    int c, k, d;
+
+    if (is_y_border) {
+        smv = _mm256_set1_ps(border_mul);
+    } else {
+        smv = _mm256_setr_ps(border_mul, step_mul, step_mul, step_mul,
+                             step_mul, step_mul, step_mul, border_mul);
+    }
+    nis = _mm256_mul_ps(_mm256_set1_ps(EPF_SIGMA_MUL / sigma_val), smv);
+
+    for (k = 0; k < nkernel; k++) dist8[k] = _mm256_setzero_ps();
+    for (c = 0; c < 3; c++) {
+        const float *p = in[c] + row + x;
+        __m256 cs = _mm256_set1_ps(cscale[c]);
+        __m256 cen[5];
+        for (d = 0; d < ndist; d++) cen[d] = _mm256_loadu_ps(p + doff[d]);
+        for (k = 0; k < nkernel; k++) {
+            const float *pk = p + koff[k];
+            __m256 acc = _mm256_setzero_ps();
+            for (d = 0; d < ndist; d++) {
+                acc = _mm256_add_ps(acc, _mm256_and_ps(absmask,
+                    _mm256_sub_ps(_mm256_loadu_ps(pk + doff[d]), cen[d])));
+            }
+            dist8[k] = _mm256_add_ps(dist8[k], _mm256_mul_ps(cs, acc));
+        }
+    }
+    for (c = 0; c < 3; c++) sum8[c] = _mm256_loadu_ps(in[c] + row + x);
+    sw = one;
+    for (k = 0; k < nkernel; k++) {
+        __m256 wgt = _mm256_add_ps(one, _mm256_mul_ps(dist8[k], nis));
+        wgt = _mm256_max_ps(wgt, _mm256_setzero_ps());
+        sw = _mm256_add_ps(sw, wgt);
+        for (c = 0; c < 3; c++) {
+            sum8[c] = _mm256_add_ps(sum8[c], _mm256_mul_ps(wgt,
+                _mm256_loadu_ps(in[c] + row + x + koff[k])));
+        }
+    }
+    sw = _mm256_div_ps(one, sw);
+    for (c = 0; c < 3; c++)
+        _mm256_storeu_ps(out[c] + row + x, _mm256_mul_ps(sum8[c], sw));
+    _mm256_zeroupper();
+}
+#endif
+
 /* A sample whose whole footprint is inside the image needs no mirroring, so
    every neighbour it reads is a fixed sample offset from its centre. Those
    offsets depend only on the pass, so they are tabulated once per pass. */
@@ -146,6 +210,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
     int c, k, d;
 #ifdef JXL_EPF_SSE2
     __m128 epf_absmask, sm_border, sm_lo, sm_hi;
+    const int use_avx2 = jxl_has_avx2();
 #endif
 
     if (step == 0) {
@@ -194,6 +259,21 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                the reference. Requires the whole quad to be in the mirror-free
                interior and inside one sigma block: blocks are 8 wide and the
                quad is 4-aligned, so x/8 is constant across it. */
+            if (use_avx2 && y_inside && (x & 7u) == 0 &&
+                x >= (uint32_t)pad && x + 7 + (uint32_t)pad < w) {
+                if (sigma_val < 0.3f) {
+                    for (c = 0; c < 3; c++) {
+                        memcpy(out[c] + row + x, in[c] + row + x,
+                               8 * sizeof(float));
+                    }
+                    x += 8;
+                    continue;
+                }
+                epf_row8(in, out, row, x, koff, doff, nkernel, ndist, cscale,
+                         sigma_val, step_mul, border_mul, is_y_border);
+                x += 8;
+                continue;
+            }
             if (y_inside && (x & 3u) == 0 &&
                 x >= (uint32_t)pad && x + 3 + (uint32_t)pad < w) {
                 __m128 dist4[12], sum4[3], sw, nis;
