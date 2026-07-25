@@ -852,14 +852,22 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                                 vd.hs[c], vd.vs[c], vd.pw, vd.ph);
         }
 
+        /* Filter the image at its real size, not the block-padded pw x ph.
+           libjxl's render pipeline allocates and mirrors at
+           frame_dimensions_.xsize_upsampled (simple_render_pipeline.cc), so
+           for a width that is not a multiple of 8 its last column mirrors,
+           while padding the loop over to pw would instead read the partial
+           block's padding columns as if they were image content. That is a
+           real difference: it moved the last column and row of every
+           500x500 and 510x532 corpus file by up to 10 counts. */
         for (c = 0; c < 3; c++) planes[c] = vd.coeff[c];
         if (fh->gab.enabled) {
-            if (jxl_apply_gabor(ctx, planes, vd.pw, vd.ph, vd.pw,
+            if (jxl_apply_gabor(ctx, planes, color_w, color_h, vd.pw,
                                 fh->gab.weights) != 0)
                 goto done;
         }
         if (fh->epf.enabled) {
-            if (jxl_apply_epf(ctx, planes, vd.pw, vd.ph, vd.pw, vd.epf_sigma,
+            if (jxl_apply_epf(ctx, planes, color_w, color_h, vd.pw, vd.epf_sigma,
                               vd.bw, &fh->epf) != 0)
                 goto done;
         }

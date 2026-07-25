@@ -123,11 +123,16 @@ Frames saved "before CT" (every LF frame) skip the XYB -> color-space step.
 ## Methodology
 Reference-oracle verification: decode with `jxl_test -out x.pam` and with
 `djxl file.jxl x.pam`, compare. Modular (integer) paths must be **byte-exact**;
-VarDCT paths are float and compared with a tolerance of one 8-bit step --
-libjxl, jxl-oxide and this decoder use different IDCT factorizations and
-different `powf` approximations, so exact equality is not achievable and
-libjxl's own conformance testing uses a tolerance too. Work incrementally and
-keep `PROGRESS.md` current; it lists the exact pass rate and every known gap.
+VarDCT paths are float, so they are gated on RMS **and** peak together (`-rms`
+0.6, `-tol` 3, in 8-bit steps), the shape libjxl's own conformance checker
+uses -- libjxl, jxl-oxide and this decoder use different IDCT factorizations
+and different `powf` approximations, so exact equality is not achievable. Do
+not gate on peak alone: one sample then decides a megapixel file, and the
+resulting noise hid a real loop-filter edge bug for a long time. When a
+tolerance failure looks like float divergence, check *where* the outliers are
+before concluding it -- clustering by column, row or block position is what
+distinguishes a bug from rounding. Work incrementally and keep `PROGRESS.md`
+current; it lists the exact pass rate and every known gap.
 
 ### Gotchas already paid for (do not re-discover)
 - The ANS end-of-stream signature is `0x130000`.

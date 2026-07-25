@@ -2,11 +2,12 @@
 // our decoder and libjxl's djxl, and compare the PAM output.
 //
 //   bun cmd/tests.ts <-all | -rand N | file.jxl ...> [-clang] [-cpu N]
-//                    [-preset a,b] [-asan] [-v]
+//                    [-preset a,b] [-asan] [-v] [-tol N] [-rms X]
 //
 // Modular (integer) paths must be byte-identical. VarDCT paths are float, so
-// a small per-sample difference is expected and reported as max/mean abs
-// diff; -tol N sets the pass threshold (default 1 for 8-bit output).
+// a small per-sample difference is expected; a file passes when it is under
+// both thresholds, RMS (-rms, default 0.6) and peak (-tol, default 3), in
+// 8-bit steps. See the note above PEAK_TOL for why both are needed.
 //
 // Files are tested in parallel, one worker per CPU, each with private temp
 // files. Per-file lines print in completion order.
@@ -22,8 +23,31 @@ const argv = process.argv.slice(2);
 const useClang = argv.includes("-clang") || defaultUseClang;
 const useAsan = argv.includes("-asan");
 const verbose = argv.includes("-v");
+// Two thresholds, both required, in the shape libjxl's own conformance
+// checker uses (tools/conformance/conformance.py CompareNPY: an RMSE limit
+// and a peak limit, never peak alone).
+//
+// Peak alone does not work as the primary gate: a single sample decides a
+// whole megapixel file, so the old peak<=1 default failed 63 files whose
+// mean-error distribution was indistinguishable from the 377 that passed,
+// and left 289 of those passes sitting exactly on the threshold. RMS is what
+// separates "different IDCT factorisation" from "wrong". The peak is kept as
+// a second gate because a handful of very wrong samples can hide under a
+// good RMS -- which is exactly what the loop-filter edge bug did.
+//
+// 3 rather than 1: with that bug fixed no corpus file exceeds a peak of 1,
+// so 3 catches any gross single-pixel breakage while leaving the headroom
+// that made peak<=1 flip on harmless rounding.
 const tolIdx = argv.indexOf("-tol");
-const TOL = tolIdx >= 0 ? parseInt(argv[tolIdx + 1]) : 1;
+const PEAK_TOL = tolIdx >= 0 ? parseFloat(argv[tolIdx + 1]) : 3;
+// 0.6 is picked off the measured distribution, not by taste. Across the 440
+// non-byte-exact corpus files RMS runs dense up to 0.505 and then stops: when
+// every differing sample is off by exactly one count, rms = sqrt(fraction
+// differing), so pure rounding noise saturates near 0.5 and cannot go higher.
+// 0.6 clears that ceiling while staying well under 1.0, which is what a
+// systematic one-count shift across the whole image would score.
+const rmsIdx = argv.indexOf("-rms");
+const RMS_TOL = rmsIdx >= 0 ? parseFloat(argv[rmsIdx + 1]) : 0.6;
 const cpuIdx = argv.indexOf("-cpu");
 const NCPU = cpuIdx >= 0 ? parseInt(argv[cpuIdx + 1]) : Math.max(1, cpus().length - 1);
 
@@ -40,12 +64,17 @@ options:
   -clang          build/test with clang instead of MSVC
   -asan           build and run the clang+AddressSanitizer harness
   -cpu N          worker count (default: cores - 1)
-  -tol N          max allowed abs difference in 8-bit steps (default 1);
-                  16-bit output is normalised, so the threshold means the
-                  same thing at either depth
+  -tol N          max allowed peak abs difference, 8-bit steps (default 3)
+  -rms X          max allowed RMS difference, 8-bit steps (default 0.6);
+                  a file must pass both. 16-bit output is normalised, so
+                  either threshold means the same thing at either depth
   -v              print per-file detail even when they match
 
 ${corpusSummary()}`,
+  // Every flag that takes a value, so its value is not mistaken for a
+  // filename. -tol was missing from this list, which made `-tol 3 file.jxl`
+  // fail with "no such file: 3".
+  ["-rand", "-cpu", "-preset", "-tol", "-rms"],
 );
 
 const EXE = useAsan ? await buildAsan() : await build(useClang);
@@ -77,27 +106,29 @@ type Cmp = {
   same: boolean;
   maxDiff: number;      // in the file's own sample units
   meanDiff: number;
+  rmsDiff: number;
   scale: number;        // sample units per 8-bit step (1 or 257)
   note?: string;
 };
 
 function compare(ours: Uint8Array, ref: Uint8Array): Cmp {
   if (ours.length === ref.length && Buffer.compare(Buffer.from(ours), Buffer.from(ref)) === 0) {
-    return { same: true, maxDiff: 0, meanDiff: 0, scale: 1 };
+    return { same: true, maxDiff: 0, meanDiff: 0, rmsDiff: 0, scale: 1 };
   }
   const a = parsePam(ours);
   const b = parsePam(ref);
   if (!a || !b) {
-    return { same: false, maxDiff: 255, meanDiff: 255, scale: 1, note: "unparsable PAM" };
+    return { same: false, maxDiff: 255, meanDiff: 255, rmsDiff: 255, scale: 1,
+             note: "unparsable PAM" };
   }
   if (a.width !== b.width || a.height !== b.height || a.depth !== b.depth) {
     return {
-      same: false, maxDiff: 255, meanDiff: 255, scale: 1,
+      same: false, maxDiff: 255, meanDiff: 255, rmsDiff: 255, scale: 1,
       note: `geometry ${a.width}x${a.height}x${a.depth} vs ${b.width}x${b.height}x${b.depth}`,
     };
   }
   const n = Math.min(a.data.length, b.data.length);
-  let maxDiff = 0, sum = 0, count = 0;
+  let maxDiff = 0, sum = 0, sumSq = 0, count = 0;
   if (a.maxval > 255) {
     for (let i = 0; i + 1 < n; i += 2) {
       const va = (a.data[i] << 8) | a.data[i + 1];
@@ -105,6 +136,7 @@ function compare(ours: Uint8Array, ref: Uint8Array): Cmp {
       const d = Math.abs(va - vb);
       if (d > maxDiff) maxDiff = d;
       sum += d;
+      sumSq += d * d;
       count++;
     }
   } else {
@@ -112,12 +144,19 @@ function compare(ours: Uint8Array, ref: Uint8Array): Cmp {
       const d = Math.abs(a.data[i] - b.data[i]);
       if (d > maxDiff) maxDiff = d;
       sum += d;
+      sumSq += d * d;
       count++;
     }
   }
   // 16-bit output has 257 sample steps per 8-bit step; compare like for like.
   const scale = a.maxval > 255 ? 257 : 1;
-  return { same: false, maxDiff, meanDiff: count ? sum / count : 0, scale };
+  return {
+    same: false,
+    maxDiff,
+    meanDiff: count ? sum / count : 0,
+    rmsDiff: count ? Math.sqrt(sumSq / count) : 0,
+    scale,
+  };
 }
 
 type Result = { file: string; ok: boolean; msg: string; ms: number };
@@ -159,12 +198,17 @@ async function testOne(file: string, slot: number): Promise<Result> {
   // Tolerances are expressed in 8-bit steps regardless of the output depth.
   const max8 = cmp.maxDiff / cmp.scale;
   const mean8 = cmp.meanDiff / cmp.scale;
+  const rms8 = cmp.rmsDiff / cmp.scale;
+  const stats = `rms ${rms8.toFixed(3)}, mean ${mean8.toFixed(3)}`;
   const detail =
     cmp.scale === 1
-      ? `max ${cmp.maxDiff}, mean ${cmp.meanDiff.toFixed(3)}`
-      : `max ${max8.toFixed(2)}/8bit (${cmp.maxDiff}/16bit), mean ${mean8.toFixed(3)}`;
-  if (max8 <= TOL) return { file, ok: true, msg: `close (${detail})`, ms };
-  return { file, ok: false, msg: `DIFF (${detail})`, ms };
+      ? `max ${cmp.maxDiff}, ${stats}`
+      : `max ${max8.toFixed(2)}/8bit (${cmp.maxDiff}/16bit), ${stats}`;
+  if (rms8 <= RMS_TOL && max8 <= PEAK_TOL) {
+    return { file, ok: true, msg: `close (${detail})`, ms };
+  }
+  const why = rms8 > RMS_TOL ? `rms>${RMS_TOL}` : `peak>${PEAK_TOL}`;
+  return { file, ok: false, msg: `DIFF ${why} (${detail})`, ms };
 }
 
 let nextIndex = 0;

@@ -8,13 +8,12 @@ Milestone log for the C JPEG XL decoder. Newest first.
 presets, its JPEGs transcoded, plus the `.jxl` files that ship with libjxl):
 
 ```
-758/821 ok, 63 failed
+821/821 ok, 0 failed
 ```
 
-"ok" means byte-identical to `djxl file.jxl out.pam`, or within one 8-bit step
-for the float (VarDCT) paths. **No file fails to decode**: every one of the 63
-is a lossy VarDCT path differing by 2-10 counts out of 255 on isolated pixels,
-which is float divergence, not a bug (see below).
+"ok" means byte-identical to `djxl file.jxl out.pam`, or inside the float
+tolerance for the VarDCT paths. 381 files are byte-exact; across the other 440
+no sample differs from libjxl by more than one 8-bit step.
 
 | area | state |
 |---|---|
@@ -37,14 +36,20 @@ Modular is integer arithmetic, so it is byte-identical to libjxl and any
 mismatch is a bug. VarDCT is float: libjxl, jxl-oxide and this decoder all use
 different IDCT factorizations and different `powf` approximations, so exact
 equality is not achievable and libjxl's own conformance testing uses a
-tolerance. Our target there is max abs difference ≤ 1 on 8-bit output, which
-is met for sRGB content.
+tolerance. Following it, a VarDCT file passes on RMS **and** peak together
+(`-rms` 0.6, `-tol` 3 in 8-bit steps), not peak alone: a single sample should
+not decide a megapixel file. Max abs difference ≤ 1 currently holds on every
+corpus file anyway.
 
 ## Remaining differences
 
-1. **Residual VarDCT float divergence** — 63 files, max 2-10 counts on
-   scattered pixels, mean under 0.3. Inherent to the differing IDCT
-   factorizations; not worth chasing further.
+1. **VarDCT float divergence** — about a quarter of the samples in a lossy
+   file land one count either side of libjxl's, RMS ~0.5. Inherent to the
+   differing IDCT factorizations; not worth chasing further.
+
+   This used to read "63 files, max 2-10 counts, not worth chasing". That was
+   wrong: the long tail was a loop-filter edge bug, not float divergence. See
+   the entry below.
 2. **Noise** reproduces approximately (max 5, mean 0.47 on a photon-noise
    file). The XorShift128+ RNG and the 5x5 high-pass match jxl-oxide's
    structure but a small difference remains, uninvestigated.
@@ -123,6 +128,34 @@ rather than overhead-bound. Two further options, neither taken:
   intrinsics, which would end the scalar-C property.
 
 ## Log
+
+### The loop filters ran over the block padding, not the image
+Every VarDCT file whose width or height is not a multiple of 8 had a wrong
+last column and last row. `decode.c` called `jxl_apply_gabor` and
+`jxl_apply_epf` with `vd.pw x vd.ph` -- the size rounded up to whole 8x8
+blocks -- so on a 500-wide image the filters treated x=500..503, the partial
+block's padding, as image content. At x=499 gaborish read a padding sample as
+its east neighbour where libjxl mirrors: its render pipeline allocates and
+mirrors at `frame_dimensions_.xsize_upsampled`, the real size
+(`render_pipeline/simple_render_pipeline.cc`). Passing `color_w, color_h` with
+the stride still `vd.pw` is the whole fix.
+
+Found by asking where the outliers actually were rather than how big they
+were. On `u76c0g_bliznaca_srgb8.v_icc` (500x500), 76 of the 80 samples off by
+more than one sat in column 499; on `cvo9xd_keong_macan_srgb8.v_icc`, 61 of
+112 sat in row 499. The control was `vgqcws_vin_srgb8` at 64x64 -- a multiple
+of 8 -- with zero outliers, and `flower_small.rgb` at 510x532 put 115 in
+column 509 and 46 in row 531.
+
+The corpus had pointed at the `v_icc` preset, which was a red herring: `v_icc`
+differs from `v_d1` only by an embedded ProPhoto profile, and on the want_icc
+path `doc.c` falls back to linear output, where the same float discrepancy
+maps to a bigger integer step. It was the most sensitive detector of the bug,
+not the cause -- `v_d1` on the same image had 109 of 110 outliers in the same
+column, quietly under the old tolerance.
+
+Peak error over the whole corpus drops from 10 to 1: `821/821 ok, 0 failed`,
+from 758/821. ASan clean.
 
 ### Splitting the MA node so a big tree fits in cache
 `ma_get_leaf` is **72% of a lossy-Modular decode** -- by far the hottest
