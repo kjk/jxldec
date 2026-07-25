@@ -74,6 +74,79 @@ static uint32_t noise_mirror(int64_t v, uint32_t len) {
     }
 }
 
+/* SSE2 is baseline on x64, so no runtime dispatch and no scalar/vector output
+   divergence to worry about: the same lanes are summed in the same order
+   either way, only four at a time. */
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
+    (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#define JXL_NOISE_SSE2 1
+#include <emmintrin.h>
+#endif
+
+/* One row of the 5-wide horizontal box, mirrored at both ends. Splitting the
+   row into "needs mirroring" and "does not" is what buys the most here: the
+   old code called noise_mirror -- a loop -- for all five taps of every sample,
+   including the interior, where the answer is always x+dx. */
+static void noise_hbox5(const float *src, float *dst, uint32_t w) {
+    uint32_t x, lo, hi;
+    lo = w < 2 ? w : 2;
+    hi = w < 2 ? w : w - 2;
+    if (hi < lo) hi = lo;
+    for (x = 0; x < lo; x++) {
+        dst[x] = src[noise_mirror((int64_t)x - 2, w)] +
+                 src[noise_mirror((int64_t)x - 1, w)] +
+                 src[noise_mirror((int64_t)x, w)] +
+                 src[noise_mirror((int64_t)x + 1, w)] +
+                 src[noise_mirror((int64_t)x + 2, w)];
+    }
+    x = lo;
+#ifdef JXL_NOISE_SSE2
+    for (; x + 4 <= hi; x += 4) {
+        __m128 s = _mm_loadu_ps(src + x - 2);
+        s = _mm_add_ps(s, _mm_loadu_ps(src + x - 1));
+        s = _mm_add_ps(s, _mm_loadu_ps(src + x));
+        s = _mm_add_ps(s, _mm_loadu_ps(src + x + 1));
+        s = _mm_add_ps(s, _mm_loadu_ps(src + x + 2));
+        _mm_storeu_ps(dst + x, s);
+    }
+#endif
+    for (; x < hi; x++) {
+        dst[x] = src[x - 2] + src[x - 1] + src[x] + src[x + 1] + src[x + 2];
+    }
+    for (x = hi; x < w; x++) {
+        dst[x] = src[noise_mirror((int64_t)x - 2, w)] +
+                 src[noise_mirror((int64_t)x - 1, w)] +
+                 src[noise_mirror((int64_t)x, w)] +
+                 src[noise_mirror((int64_t)x + 1, w)] +
+                 src[noise_mirror((int64_t)x + 2, w)];
+    }
+}
+
+/* The vertical half: five already-horizontally-summed rows, scaled by 0.16,
+   minus four times the centre sample. 0.16 * 25 == 4, so the kernel sums to
+   zero and the [1, 2) offset of the raw values cancels. */
+static void noise_vbox5(const float *const rows[5], const float *centre,
+                        float *dst, uint32_t w) {
+    uint32_t x = 0;
+#ifdef JXL_NOISE_SSE2
+    const __m128 k = _mm_set1_ps(0.16f), m4 = _mm_set1_ps(4.0f);
+    for (; x + 4 <= w; x += 4) {
+        __m128 s = _mm_loadu_ps(rows[0] + x);
+        s = _mm_add_ps(s, _mm_loadu_ps(rows[1] + x));
+        s = _mm_add_ps(s, _mm_loadu_ps(rows[2] + x));
+        s = _mm_add_ps(s, _mm_loadu_ps(rows[3] + x));
+        s = _mm_add_ps(s, _mm_loadu_ps(rows[4] + x));
+        s = _mm_sub_ps(_mm_mul_ps(s, k),
+                       _mm_mul_ps(_mm_loadu_ps(centre + x), m4));
+        _mm_storeu_ps(dst + x, s);
+    }
+#endif
+    for (; x < w; x++) {
+        float s = rows[0][x] + rows[1][x] + rows[2][x] + rows[3][x] + rows[4][x];
+        dst[x] = s * 0.16f - centre[x] * 4.0f;
+    }
+}
+
 int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
                      const jxl_frame_header *fh, uint32_t visible_frames,
                      uint32_t invisible_frames, float corr_x, float corr_b) {
@@ -82,6 +155,7 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
     uint32_t groups_per_row, group_rows, gx, gy;
     float *raw[3] = {NULL, NULL, NULL};
     float *conv[3] = {NULL, NULL, NULL};
+    float *hsum = NULL;          /* one row-summed scratch, reused per channel */
     uint64_t seed0 = ((uint64_t)visible_frames << 32) + invisible_frames;
     float lut[9];
     uint32_t x, y;
@@ -91,10 +165,19 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
     for (c = 0; c < 8; c++) lut[c] = np->lut[c];
     lut[8] = np->lut[7];
 
-    for (c = 0; c < 3; c++) {
-        raw[c] = (float *)jxl_calloc(ctx, (size_t)width * height, sizeof(float));
-        conv[c] = (float *)jxl_calloc(ctx, (size_t)width * height, sizeof(float));
-        if (!raw[c] || !conv[c]) goto done;
+    /* Groups tile the frame and each writes its whole extent, and every
+       sample of conv is assigned, so none of these need zeroing first --
+       calloc was clearing 24 bytes per pixel that the next loop overwrote. */
+    {
+        size_t n;
+        if (!jxl_size_mul((size_t)width * height, sizeof(float), &n)) goto done;
+        for (c = 0; c < 3; c++) {
+            raw[c] = (float *)jxl_malloc(ctx, n);
+            conv[c] = (float *)jxl_malloc(ctx, n);
+            if (!raw[c] || !conv[c]) goto done;
+        }
+        hsum = (float *)jxl_malloc(ctx, n);
+        if (!hsum) goto done;
     }
 
     groups_per_row = (width + group_dim - 1) / group_dim;
@@ -129,23 +212,24 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
         }
     }
 
-    /* 5x5 high-pass: 0.16 * sum minus 4 * center. */
+    /* 5x5 high-pass: 0.16 * sum minus 4 * centre. The box is separable, so
+       this is a horizontal 5-tap into hsum followed by a vertical one --
+       ten adds a sample instead of twenty-five multiply-adds, and the
+       mirroring is resolved once per row rather than once per tap. */
     for (c = 0; c < 3; c++) {
         for (y = 0; y < height; y++) {
-            for (x = 0; x < width; x++) {
-                float sum = 0.0f;
-                int dy, dx;
-                for (dy = -2; dy <= 2; dy++) {
-                    uint32_t sy = noise_mirror((int64_t)y + dy, height);
-                    const float *row = raw[c] + (size_t)sy * width;
-                    for (dx = -2; dx <= 2; dx++) {
-                        uint32_t sx = noise_mirror((int64_t)x + dx, width);
-                        sum += row[sx] * 0.16f;
-                    }
-                }
-                conv[c][(size_t)y * width + x] =
-                    sum - raw[c][(size_t)y * width + x] * 4.0f;
+            noise_hbox5(raw[c] + (size_t)y * width, hsum + (size_t)y * width,
+                        width);
+        }
+        for (y = 0; y < height; y++) {
+            const float *rows[5];
+            int dy;
+            for (dy = -2; dy <= 2; dy++) {
+                rows[dy + 2] = hsum +
+                    (size_t)noise_mirror((int64_t)y + dy, height) * width;
             }
+            noise_vbox5(rows, raw[c] + (size_t)y * width,
+                        conv[c] + (size_t)y * width, width);
         }
     }
 
@@ -183,6 +267,7 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
     rc = 0;
 
 done:
+    jxl_free(ctx, hsum);
     for (c = 0; c < 3; c++) {
         jxl_free(ctx, raw[c]);
         jxl_free(ctx, conv[c]);

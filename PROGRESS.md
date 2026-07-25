@@ -62,9 +62,11 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-corpus we are **2.33x libjxl** (was 3.22x, then 2.64x), measured over the 821
-files that predate the `v_noise` preset. libjxl is AVX2; we are scalar C, so a
-constant factor is expected.
+1245-file corpus we are **2.61x libjxl** (2.74x before the noise and
+upsampling work below; 2.33x over the smaller 821-file corpus that predates
+the `v_noise`, `v_rs*`, `v_orient`, `v_p3` and `v_2020` presets, which are
+lossy paths and pull the average up). libjxl is AVX2 throughout; we are scalar
+C apart from two SSE2 hot loops, so a constant factor is expected.
 
 `bun cmd/prof.ts <file.jxl>` profiles our decoder alone through the sibling
 `../samply` and prints samply's `-print-agent` report (top self-time
@@ -72,7 +74,7 @@ functions, hot source lines, heaviest call path). That is how the numbers
 below were found.
 
 The worst ratios among files that take libjxl more than 5ms are now
-`P3-sRGB-color-bars.v_*` at 6.4-6.6x and `flower.v_prog` at 4.5x. Files
+`P3-sRGB-color-bars.v_*` at 6.5-6.8x and `P3-sRGB-green.v_rs2` at 6.6x. Files
 below ~1ms sit at up to 9x purely on fixed setup cost.
 
 ### The EPF and spline rewrites
@@ -133,6 +135,49 @@ rather than overhead-bound. Two further options, neither taken:
   intrinsics, which would end the scalar-C property.
 
 ## Log
+
+### The noise convolution was doing 25 taps where 10 would do
+Re-benchmarking after the corpus grew put `v_noise` at the top on both axes:
+worst ratio (5.99x) and the largest share of our total decode time (8.4%).
+Subtracting the same image without noise isolates the stage -- `flower` cost us
+257ms of noise against libjxl's 14ms, `splines` 313ms against 15.5ms. Roughly
+**18-21x slower than libjxl on that stage alone**, against ~5x everywhere else.
+
+Three compounding problems, all in the 5x5 high-pass:
+
+- **The box is separable and nothing exploited it.** A 5x5 box sum is a
+  horizontal 5-tap followed by a vertical one: ten adds a sample instead of
+  twenty-five multiply-adds.
+- **`noise_mirror` -- a loop -- ran for every tap of every sample**, five for
+  the rows and twenty-five for the columns, including deep in the interior
+  where the answer is always `x+dx`. Exactly the mistake `epf_pass` had.
+  Rows now mirror once per row, and each row splits into an interior span that
+  needs no mirroring and two short edges that do.
+- **Six frame-sized planes were `calloc`ed** and immediately overwritten --
+  24 bytes per pixel of zeroing thrown away. Groups tile the frame and each
+  writes its whole extent, so `jxl_malloc` is enough.
+
+The two hot loops are SSE2, which is baseline on x64 -- no runtime dispatch,
+and the lanes are summed in the same order as the scalar path, four at a time.
+
+    flower.v_noise    509.7ms  7.97x -> 262.4ms  4.46x
+    splines.v_noise   600.9ms  9.54x -> 337.9ms  5.51x
+    P3-color-bars     106.7ms  9.82x ->  57.5ms  4.92x
+    v_noise preset    5.99x, 4086ms -> 3.61x, 2335ms
+
+The stage itself is now ~25ms against libjxl's 13.5ms on `flower`: from 18x
+down to 1.85x, and `flower.v_noise` is now *faster relative to libjxl* than
+the same image without noise.
+
+The same treatment on `upsample.c`, which had the identical per-tap mirroring
+and is the innermost loop of the whole filter, took `v_rs2` from 5.96x to
+4.90x and `v_rs4` from 5.17x to 4.07x; its 25-tap dot product is SSE2 now too.
+Less dramatic because that filter is genuinely 25 taps per *output* sample and
+is not separable -- each of the N*N positions has its own kernel -- so what is
+left is arithmetic libjxl also does, just 8 lanes wide to our 4.
+
+Corpus total: **2.74x -> 2.61x**, our wall clock 48.4s -> 43.2s. 1245/1245 ok,
+ASan clean, all 115 fuzz reproducers clean.
 
 ### Importing other decoders' crashes
 Two JPEG XL projects ship their crash reproducers, and both were already on

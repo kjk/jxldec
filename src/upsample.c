@@ -58,6 +58,36 @@ static void build_kernel(float *kernel, uint32_t shift, const float *w) {
     }
 }
 
+/* SSE2 is baseline on x64. This is the innermost operation in the whole
+   filter -- N*N of them per input sample, 25 multiply-adds each -- so it is
+   the one place worth writing by hand. */
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
+    (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#define JXL_UPSAMPLE_SSE2 1
+#include <emmintrin.h>
+#endif
+
+static float up_dot25(const float *a, const float *b) {
+#ifdef JXL_UPSAMPLE_SSE2
+    __m128 acc = _mm_mul_ps(_mm_loadu_ps(a), _mm_loadu_ps(b));
+    __m128 t;
+    int i;
+    for (i = 4; i + 4 <= 24; i += 4) {
+        acc = _mm_add_ps(acc, _mm_mul_ps(_mm_loadu_ps(a + i),
+                                         _mm_loadu_ps(b + i)));
+    }
+    /* 25 is odd; lanes 0..23 are vectorised and the last tap stays scalar. */
+    t = _mm_add_ps(acc, _mm_movehl_ps(acc, acc));
+    t = _mm_add_ss(t, _mm_shuffle_ps(t, t, 1));
+    return _mm_cvtss_f32(t) + a[24] * b[24];
+#else
+    float sum = 0.0f;
+    int n;
+    for (n = 0; n < 25; n++) sum += a[n] * b[n];
+    return sum;
+#endif
+}
+
 /* Picks the weight set for a shift of 1, 2 or 3. */
 static const float *weights_for(const jxl_image_metadata *meta, uint32_t shift) {
     if (shift == 1) return meta->up2;
@@ -87,17 +117,33 @@ int jxl_upsample_plane(jxl_ctx *ctx, jxl_fplane *p, uint32_t shift,
     if (jxl_fplane_alloc(ctx, &dst, out_w, out_h) != 0) goto done;
 
     for (y = 0; y < h; y++) {
+        /* The five source rows depend only on y, so mirror them once per row
+           rather than once per sample -- and inside the row, only the first
+           and last two columns need mirroring at all. */
+        const float *srow[5];
+        int iy;
+        for (iy = -2; iy <= 2; iy++) {
+            srow[iy + 2] = p->data +
+                (size_t)up_mirror((int64_t)y + iy, h) * p->stride;
+        }
         for (x = 0; x < w; x++) {
             float nb[25];
             float lo, hi;
             uint32_t oy, ox;
-            int iy, ix;
+            int ix;
             int n = 0;
-            for (iy = -2; iy <= 2; iy++) {
-                const float *row = p->data +
-                    (size_t)up_mirror((int64_t)y + iy, h) * p->stride;
-                for (ix = -2; ix <= 2; ix++) {
-                    nb[n++] = row[up_mirror((int64_t)x + ix, w)];
+            if (x >= 2 && x + 2 < w) {
+                for (iy = 0; iy < 5; iy++) {
+                    const float *r = srow[iy] + x - 2;
+                    nb[n] = r[0]; nb[n + 1] = r[1]; nb[n + 2] = r[2];
+                    nb[n + 3] = r[3]; nb[n + 4] = r[4];
+                    n += 5;
+                }
+            } else {
+                for (iy = 0; iy < 5; iy++) {
+                    for (ix = -2; ix <= 2; ix++) {
+                        nb[n++] = srow[iy][up_mirror((int64_t)x + ix, w)];
+                    }
                 }
             }
             lo = hi = nb[0];
@@ -113,9 +159,9 @@ int jxl_upsample_plane(jxl_ctx *ctx, jxl_fplane *p, uint32_t shift,
                 for (ox = 0; ox < N; ox++) {
                     uint32_t dx = x * N + ox;
                     const float *k = kernel + ((size_t)oy * N + ox) * 25;
-                    float sum = 0.0f;
+                    float sum;
                     if (dx >= out_w) break;
-                    for (n = 0; n < 25; n++) sum += nb[n] * k[n];
+                    sum = up_dot25(nb, k);
                     if (sum < lo) sum = lo;
                     if (sum > hi) sum = hi;
                     drow[dx] = sum;

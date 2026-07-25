@@ -86,9 +86,10 @@ verified against `djxl` yet.
 ## Performance
 `bun cmd/bench.ts -all` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both single-threaded, best of N. Over the
-corpus this decoder takes **2.33x** libjxl's decode time, down from 3.22x
-(measured over the 821 files that predate the `v_noise` preset). libjxl is AVX2 and this is scalar C, so a constant factor is
-expected; PROGRESS.md records what closed the gap and, just as usefully, which
+1245-file corpus this decoder takes **2.61x** libjxl's decode time. libjxl is
+AVX2 throughout; this is scalar C apart from two SSE2 hot loops (the noise
+convolution and the upsampling kernel), so a constant factor is expected.
+PROGRESS.md records what closed the gap and, just as usefully, which
 optimizations were measured and thrown away.
 
 ## How it was made
