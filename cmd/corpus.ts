@@ -54,12 +54,15 @@ function orientationFor(src: string): number {
   return (h % 8) + 1;
 }
 
-// ProPhoto is wide enough that cjxl keeps the profile verbatim instead of
-// matching it to an enum.
-const ICC_PROFILE = join(
+const iccProfile = (name: string) => join(
   LIBJXL_DIR, "testdata", "external", "Compact-ICC-Profiles", "profiles",
-  "ProPhoto-v4.icc",
+  `${name}.icc`,
 );
+// ProPhoto is wide enough that cjxl keeps the profile verbatim instead of
+// matching it to an enum. That is what makes it useful for the want_icc path
+// -- and also what makes it useless for the colour-conversion code, since on
+// that path the decoder falls back to linear sRGB by design.
+const ICC_PROFILE = iccProfile("ProPhoto-v4");
 
 /** cjxl settings, one per generated variant. */
 export const PRESETS:
@@ -89,6 +92,18 @@ export const PRESETS:
   // in build_kernel.
   { name: "v_rs2", args: ["-d", "1", "-e", "7", "--resampling=2"] },
   { name: "v_rs4", args: ["-d", "1", "-e", "7", "--resampling=4"] },
+  // Non-sRGB primaries, which nothing covered until now: everything else here
+  // comes from PAM, which carries no colour information, so cjxl tags it sRGB
+  // -- names like P3-sRGB-color-bars describe their *content*, not their
+  // declared encoding. Unlike ProPhoto these two are narrow enough for cjxl to
+  // match against the enumerated primaries rather than embedding the profile,
+  // which is exactly what puts the decoder through jxl_opsin_matrix_for's
+  // non-sRGB branch (get_primaries, primaries_to_xyz, adapt_to_xyz_d50).
+  // Rec2020-v4 additionally declares transfer function 709, covering tf_bt709.
+  { name: "v_p3", args: ["-d", "1", "-e", "7", "-x",
+                         `icc_pathname=${iccProfile("DisplayP3-v4")}`] },
+  { name: "v_2020", args: ["-d", "1", "-e", "7", "-x",
+                           `icc_pathname=${iccProfile("Rec2020-v4")}`] },
   // EXIF orientation, which the writer undoes. The eight values are spread
   // across the sources by orientationFor, so this one preset reaches every
   // arm of unapply_orientation's switch, including the four that transpose.

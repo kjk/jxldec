@@ -4,15 +4,15 @@ Milestone log for the C JPEG XL decoder. Newest first.
 
 ## Status summary
 
-`bun cmd/tests.ts -all` — 1113 corpus files (libjxl's testdata images × 15 cjxl
+`bun cmd/tests.ts -all` — 1245 corpus files (libjxl's testdata images × 17 cjxl
 presets, its JPEGs transcoded, plus the `.jxl` files that ship with libjxl):
 
 ```
-1113/1113 ok, 0 failed
+1245/1245 ok, 0 failed
 ```
 
 "ok" means byte-identical to `djxl file.jxl out.pam`, or inside the float
-tolerance for the VarDCT paths. 387 files are byte-exact; across the other 726
+tolerance for the VarDCT paths. 387 files are byte-exact; across the other 858
 no sample differs from libjxl by more than one 8-bit step.
 
 | area | state |
@@ -24,7 +24,9 @@ no sample differs from libjxl by more than one 8-bit step.
 | VarDCT, 8-bit sRGB | within 1 |
 | VarDCT, progressive (LF frames) | within 1 |
 | gaborish, EPF | done |
-| non-sRGB primaries (BT.2020, P3) | **unverified** — implemented, but no corpus file declares them (see log) |
+| non-sRGB primaries (P3, Rec.2100) | within 1 (Bradford-adapted matrix) |
+| transfer functions: sRGB, 709 | within 1 |
+| transfer functions: PQ, HLG | **unverified** — cjxl here cannot emit a lossy frame declaring them |
 | images with an embedded ICC profile | done |
 | patches / reference frames | **byte-exact** |
 | splines, noise | within 1 |
@@ -131,6 +133,38 @@ rather than overhead-bound. Two further options, neither taken:
   intrinsics, which would end the scalar-C property.
 
 ## Log
+
+### Non-sRGB primaries, finally exercised -- and correct
+Acting on what the coverage run below reported. The obstacle was never the
+decoder: it was that every corpus source is a PAM, which carries no colour
+information, so cjxl tags everything sRGB. `v_icc` did not help because
+ProPhoto is *too* wide -- cjxl embeds it verbatim rather than matching an enum,
+and on that want_icc path `doc.c` deliberately resets primaries to sRGB to
+match libjxl's CMS-less fallback.
+
+The fix is to pick profiles narrow enough for cjxl to enumerate. DisplayP3-v4
+lands as `Primaries: P3`, Rec2020-v4 as `Primaries: Rec.2100` with
+`Transfer function: 709`, which between them put the decoder through
+`jxl_opsin_matrix_for`'s non-sRGB branch and `tf_bt709`. Two presets, `v_p3`
+and `v_2020`, 66 sources each -- the seven grayscale ones reject an RGB
+profile, exactly as they do for `v_icc`, and the skip report now says so.
+
+`color.c` goes from 30.3% to 66.9% of regions and 35.9% to 80.9% of lines;
+uncovered functions across the decoder drop from 21 to 15. All 132 files match
+`djxl` at max 1, so the Bradford-adapted matrix was right all along -- it had
+simply never run.
+
+`tf_pq` and `tf_hlg` are still dark and stay that way for now. They need a
+*lossy* frame declaring PQ or HLG: `jxl_linear_to_tf` is only reached on the
+XYB path, so testdata's `pq_gradient.jxl` does not do it (grayscale lossless,
+samples already in the target space). Compact-ICC-Profiles has no PQ or HLG
+profile, and this cjxl cannot read PNG at all -- libpng is deliberately not
+built -- so the tagged HDR sources in testdata are out of reach too.
+
+Worth recording for whoever picks this up: `Rec2020-g24-v4.icc` reaches the
+`tf_have_gamma` branch and passes, but runs hotter than the rest of the corpus
+(max 0-3 over 14 sources against max 1 for sRGB), so a preset for it may sit
+on the peak threshold rather than under it.
 
 ### Measuring the untested paths instead of guessing at them
 Every decoder bug in this run -- the noise seed, the loop-filter edge, missing
