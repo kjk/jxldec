@@ -9,7 +9,7 @@
 // JXL_SPECS=<dir> overrides the corpus with any directory of .jxl files
 // (scanned recursively), the way DJVU_SPECS does in djvudec.
 import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "fs";
-import { basename, isAbsolute, join, relative } from "path";
+import { basename, dirname, isAbsolute, join, relative } from "path";
 import { DEPS_DIR, LIBJXL_DIR, refTool } from "./get-deps";
 import { pngToPam } from "./png";
 
@@ -59,14 +59,34 @@ export function sourceImages(): string[] {
   const pngs = walk(join(LIBJXL_DIR, "testdata"), (n) =>
     n.toLowerCase().endsWith(".png"),
   );
+  // testdata carries the same basename in more than one directory:
+  // external/wesaturate/500px and .../64px hold *different* images under
+  // three shared names. Keying the converted .pam by basename alone made
+  // both collapse onto one file, so the 64px image was never tested and the
+  // 500px one was tested (and counted) twice. Qualify a colliding name with
+  // its parent directory; unique names keep the short form, so the cached
+  // corpus does not have to be regenerated wholesale.
+  const seen = new Map<string, number>();
+  for (const png of pngs) {
+    const b = basename(png).toLowerCase();
+    seen.set(b, (seen.get(b) ?? 0) + 1);
+  }
+  const taken = new Set<string>();
   const out: string[] = [];
   for (const png of pngs) {
-    const pam = join(SRC_DIR, basename(png).replace(/\.png$/i, ".pam"));
+    let stem = basename(png).replace(/\.png$/i, "");
+    if ((seen.get(basename(png).toLowerCase()) ?? 0) > 1) {
+      stem = `${basename(dirname(png))}_${stem}`;
+    }
+    let name = `${stem}.pam`;
+    for (let i = 2; taken.has(name.toLowerCase()); i++) name = `${stem}_${i}.pam`;
+    taken.add(name.toLowerCase());
+    const pam = join(SRC_DIR, name);
     if (!existsSync(pam)) {
       try {
         pngToPam(png, pam);
       } catch (e) {
-        console.warn(`corpus: skipping ${basename(png)}: ${e}`);
+        console.warn(`corpus: skipping ${relative(LIBJXL_DIR, png)}: ${e}`);
         continue;
       }
     }

@@ -129,6 +129,26 @@ rather than overhead-bound. Two further options, neither taken:
 
 ## Log
 
+### Three testdata images were never being tested
+`sourceImages()` named each converted `.pam` after the source PNG's basename
+alone, but testdata ships three names in two directories:
+`external/wesaturate/500px/` and `.../64px/` hold *different* images called
+`cvo9xd_keong_macan_srgb8.png`, `tmshre_riaphotographs_srgb8.png` and
+`u76c0g_bliznaca_srgb8.png`. Both copies collapsed onto one `.pam`, so the
+64px image was never converted and the 500px one was enumerated twice per
+preset -- 821 paths, 788 distinct. That is why the failure list used to print
+each of those files twice.
+
+A colliding basename is now qualified with its parent directory
+(`64px_u76c0g_bliznaca_srgb8.pam`); unique names keep the short form, so an
+existing corpus is not regenerated wholesale. The corpus is still 821 files
+but all 821 are distinct, and the 33 that were shadowed are real coverage:
+15 byte-exact, 18 within one count. All pass.
+
+Worth noting the 64px images are 64x64 -- a multiple of 8, so they would have
+been the control that made the loop-filter edge bug obvious. Being silently
+dropped, they weren't.
+
 ### The loop filters ran over the block padding, not the image
 Every VarDCT file whose width or height is not a multiple of 8 had a wrong
 last column and last row. `decode.c` called `jxl_apply_gabor` and
