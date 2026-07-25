@@ -5,6 +5,7 @@
 //   bun cmd/build.ts -clean   delete out/ first (full rebuild)
 //   bun cmd/build.ts asan     clang + AddressSanitizer harness
 //   bun cmd/build.ts cov      clang + coverage instrumentation (see coverage.ts)
+//   bun cmd/build.ts fuzz     clang + libFuzzer + ASan (see fuzz.ts)
 //
 // Objects and exes land in out/msvc/, out/clang/ or out/clang_asan/. The build
 // is incremental: a source is recompiled only when newer than its object, and
@@ -171,6 +172,72 @@ export async function buildAsan(): Promise<string> {
   return exe;
 }
 
+// clang + libFuzzer + ASan -> out/fuzz/. Unlike the other variants this one
+// links test/fuzz_target.c instead of test/jxl_test.c, since libFuzzer brings
+// its own main(). No external libraries are involved, so there is nothing here
+// like heicdec's /MD import shim.
+const FUZZ_DIR = `${OUT_ROOT}/fuzz`;
+export const FUZZ_EXE = `${FUZZ_DIR}/${binName("jxl_fuzz")}`;
+
+// Apple's clang ships without libFuzzer; Homebrew's has it.
+function findFuzzClang(): string {
+  const env = process.env.CLANG || process.env.CC || process.env.FUZZ_CC;
+  if (env && existsSync(env)) return env;
+  if (isMac) {
+    for (const c of ["/opt/homebrew/opt/llvm/bin/clang",
+                     "/usr/local/opt/llvm/bin/clang"]) {
+      if (existsSync(c)) return c;
+    }
+  }
+  return "clang";
+}
+
+export async function buildFuzz(clean = false): Promise<string> {
+  mkdirSync(FUZZ_DIR, { recursive: true });
+  const target = `${ROOT}/test/fuzz_target.c`;
+  const units = [
+    ...SRCS.map((s) => ({ src: `${ROOT}/${s}`, obj: `${FUZZ_DIR}/${objBase(s)}.o` })),
+    { src: target, obj: `${FUZZ_DIR}/fuzz_target.o` },
+  ];
+  if (clean) {
+    for (const u of units) rmSync(u.obj, { force: true });
+    rmSync(FUZZ_EXE, { force: true });
+  }
+
+  const cc = findFuzzClang();
+  // -O1 keeps ASan traces readable; the fuzzer is not a benchmark.
+  const flags = `-fsanitize=address,fuzzer ${clangCFlags("-g -O1")}`;
+  const stale = units.filter((u) => needsRebuild(u.obj, u.src, INTERNAL_H, PUBLIC_H));
+  const objs = units.map((u) => u.obj);
+  if (stale.length === 0 && !needsRebuild(FUZZ_EXE, ...objs) && existsSync(FUZZ_EXE)) {
+    if (isWindows) await copyAsanRuntimeDll(FUZZ_DIR);
+    console.log("jxl_fuzz up to date");
+    return FUZZ_EXE;
+  }
+  try {
+    for (const u of stale) {
+      await runCmd(`${cc} ${flags} -I${ROOT}/src -c -o ${u.obj} ${u.src}`);
+    }
+    if (needsRebuild(FUZZ_EXE, ...objs)) {
+      // ASan inflates stack frames and the Modular/VarDCT paths nest deeply;
+      // Windows' default 1MB is tight once the fuzzer starts shrinking inputs.
+      const stack = isWindows ? " -Wl,/STACK:8388608" : "";
+      const libs = isWindows ? "" : " -lpthread -lm";
+      await runCmd(`${cc} -fsanitize=address,fuzzer ${objs.join(" ")}` +
+                   `${stack}${libs} -o ${FUZZ_EXE}`);
+    }
+  } catch (e) {
+    if (isMac && cc === "clang") {
+      console.error("\nfuzz build failed: Apple's clang has no libFuzzer.");
+      console.error("  brew install llvm   (then re-run; it is auto-detected)\n");
+    }
+    throw e;
+  }
+  if (isWindows) await copyAsanRuntimeDll(FUZZ_DIR);
+  console.log("built jxl_fuzz");
+  return FUZZ_EXE;
+}
+
 // clang + source-based coverage instrumentation -> out/clang_cov/.
 // -O0 so that no inlining folds one function's lines into another's and a
 // never-executed branch cannot be optimised away before it is counted.
@@ -327,5 +394,6 @@ if (import.meta.main) {
   const useClang = args.includes("-clang") || defaultUseClang;
   if (args.includes("asan")) await buildAsan();
   else if (args.includes("cov")) await buildCoverage();
+  else if (args.includes("fuzz")) await buildFuzz();
   else await build(useClang);
 }

@@ -134,6 +134,45 @@ rather than overhead-bound. Two further options, neither taken:
 
 ## Log
 
+### Fuzzing, and the first crash it found
+`cmd/tests.ts` only ever feeds the decoder *valid* files, and a valid file
+takes no error path: `jxl_errorf`, which every `JXL_ERR` in the decoder
+funnels into, does not execute once across all 1245 corpus files. Everything
+the decoder does when the bytes lie to it was unverified.
+
+`bun cmd/fuzz.ts` is libFuzzer + ASan over `test/fuzz_target.c`, modelled on
+`../heicdec`'s. The target opens the input, reads info and the ICC profile,
+then renders up to four frames in two formats. It installs a budgeted
+allocator (512 MB live per input): a crafted size header can declare an
+enormous canvas, and the decoder has no pixel limit of its own, so bounding
+allocation makes those inputs fail through the library's own
+allocation-failure paths -- more error handling under test -- instead of
+tripping libFuzzer's RSS limit and stopping the run. The corpus seeds from the
+1245 real files, so mutation starts from valid codestreams.
+
+It found a crash within minutes, and the same one eight times:
+
+    jxl_image_metadata_free   headers.c:387
+    jxl_doc_close             doc.c:52
+    jxl_doc_open              doc.c:44        <- the *failure* path
+
+`image_metadata_read` assigned `meta->num_extra` straight from the bitstream
+and only allocated `ec_info` afterwards. Both early returns in between -- the
+"too many extra channels" rejection and the calloc failure -- left num_extra
+non-zero with ec_info still NULL, and `jxl_doc_open`'s cleanup calls
+`jxl_doc_close`, which walks num_extra entries of that null array. A read of
+address 0x18, the offset of `name` in the first entry.
+
+The count is now published only once the array behind it exists, and the free
+refuses to trust num_extra on its own, since its caller sees metadata
+abandoned at whatever point parsing gave up. All eight artifacts replay clean;
+they are kept in `fuzz/crashes/` (tracked) as regression seeds. 1245/1245 still
+ok, ASan clean.
+
+Worth noting what this says about the corpus: a null-deref reachable from
+`jxl_doc_open` on a 62-byte input survived 1245 conformance files and every
+ASan run over them, because none of them is malformed.
+
 ### Non-sRGB primaries, finally exercised -- and correct
 Acting on what the coverage run below reported. The obstacle was never the
 decoder: it was that every corpus source is a PAM, which carries no colour

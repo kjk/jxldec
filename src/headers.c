@@ -318,16 +318,23 @@ static int image_metadata_read(jxl_ctx *ctx, jxl_br *br,
         }
         read_bit_depth(br, &meta->bit_depth);
         meta->modular_16bit_buffers = jxl_br_bool(br);
-        meta->num_extra = jxl_br_u32(br, 0, 0, 1, 0, 2, 4, 1, 12);
-        if (meta->num_extra > 256) {
+        /* Count the channels into a local and only publish it once the array
+           behind it exists. Assigning meta->num_extra straight from the
+           bitstream left it non-zero with ec_info still NULL on both of the
+           early returns below, and jxl_image_metadata_free walks num_extra
+           entries -- a null dereference on a path only a malformed file takes.
+           Every one of the fuzzer's first eight crashes was this. */
+        uint32_t n_extra = jxl_br_u32(br, 0, 0, 1, 0, 2, 4, 1, 12);
+        if (n_extra > 256) {
             JXL_ERR(ctx, "header: too many extra channels (%u)",
-                    (unsigned)meta->num_extra);
+                    (unsigned)n_extra);
             return -1;
         }
-        if (meta->num_extra) {
-            meta->ec_info = (jxl_ec_info *)jxl_calloc(ctx, meta->num_extra,
+        if (n_extra) {
+            meta->ec_info = (jxl_ec_info *)jxl_calloc(ctx, n_extra,
                                                       sizeof(jxl_ec_info));
             if (!meta->ec_info) return -1;
+            meta->num_extra = n_extra;
             for (i = 0; i < meta->num_extra; i++) {
                 ec_info_read(ctx, br, &meta->ec_info[i]);
                 if (br->err) return -1;
@@ -384,6 +391,10 @@ int jxl_read_image_header(jxl_ctx *ctx, jxl_br *br, jxl_size_header *size,
 void jxl_image_metadata_free(jxl_ctx *ctx, jxl_image_metadata *meta) {
     uint32_t i;
     if (!meta) return;
+    /* Belt as well as braces: the caller is jxl_doc_close, which also runs on
+       the failure path of jxl_doc_open, so it sees metadata abandoned at
+       whatever point parsing gave up. Never trust num_extra alone. */
+    if (!meta->ec_info) meta->num_extra = 0;
     for (i = 0; i < meta->num_extra; i++) jxl_free(ctx, meta->ec_info[i].name);
     jxl_free(ctx, meta->ec_info);
     meta->ec_info = NULL;
