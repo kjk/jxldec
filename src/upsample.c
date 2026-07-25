@@ -114,7 +114,7 @@ int jxl_upsample_plane(jxl_ctx *ctx, jxl_fplane *p, uint32_t shift,
 
     /* The upsampled frame is w*N wide but the image may be a few samples
        narrower, so allocate the crop and simply skip the samples past it. */
-    if (jxl_fplane_alloc(ctx, &dst, out_w, out_h) != 0) goto done;
+    if (jxl_fplane_alloc_uninit(ctx, &dst, out_w, out_h) != 0) goto done;
 
     for (y = 0; y < h; y++) {
         /* The five source rows depend only on y, so mirror them once per row

@@ -68,6 +68,37 @@ static uint32_t quantize(float v, uint32_t maxval) {
     return (uint32_t)s;
 }
 
+/* SSE2 is baseline on x64. Only the arithmetic is vectorised here, not the
+   output packing: write_pixels covers eight formats crossed with orientation
+   and BGR order, and quantize -- a multiply, an add, two compares and a
+   truncating convert, per component per pixel -- is where its time goes.
+   Quantising four samples and letting the existing scalar code interleave
+   them from a small array keeps all of that format handling in one place.
+   -DJXL_RENDER_FORCE_SCALAR builds without it, to diff against. */
+#if !defined(JXL_RENDER_FORCE_SCALAR) && \
+    (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
+     (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#define JXL_RENDER_SSE2 1
+#include <emmintrin.h>
+
+/* Four samples through the exact logic of quantize() above. */
+static void quantize4(const float *src, uint32_t maxval, uint32_t out[4]) {
+    const __m128 vm = _mm_set1_ps((float)maxval);
+    const __m128 zero = _mm_setzero_ps();
+    __m128 v = _mm_loadu_ps(src);
+    __m128 s = _mm_add_ps(_mm_mul_ps(v, vm), _mm_set1_ps(0.5f));
+    __m128i t = _mm_cvttps_epi32(s);                  /* truncates, as (uint32_t) */
+    __m128 pos = _mm_cmpgt_ps(v, zero);               /* false for <= 0 and NaN */
+    __m128 sat = _mm_cmpge_ps(s, vm);
+    __m128i mx = _mm_set1_epi32((int)maxval);
+    /* s >= maxval wins over the converted value, then !(v > 0) zeroes it. */
+    t = _mm_or_si128(_mm_and_si128(_mm_castps_si128(sat), mx),
+                     _mm_andnot_si128(_mm_castps_si128(sat), t));
+    t = _mm_and_si128(_mm_castps_si128(pos), t);
+    _mm_storeu_si128((__m128i *)out, t);
+}
+#endif
+
 /* Reads a plane sample, replicating edge pixels for subsampled channels. */
 static float plane_sample(const jxl_fplane *p, uint32_t x, uint32_t y,
                           uint32_t w, uint32_t h) {
@@ -173,7 +204,58 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
             }
             if (op.a) pa = op.a->data + (size_t)oy * op.a->stride;
         }
-        for (ox = 0; ox < ow; ox++) {
+        ox = 0;
+#ifdef JXL_RENDER_SSE2
+        /* Quantise four pixels' worth of each plane up front; the store loop
+           below is the same scalar code, reading the results instead of
+           calling quantize(). Only the straight-through case qualifies --
+           anything with orientation or a subsampled plane keeps the general
+           path. */
+        if (direct) {
+            uint32_t qr[4], qg[4], qb[4], qa[4];
+            for (; ox + 4 <= ow; ox += 4) {
+                uint32_t j;
+                quantize4(pr + ox, maxval, qr);
+                if (!gray) {
+                    quantize4(pg + ox, maxval, qg);
+                    quantize4(pb + ox, maxval, qb);
+                }
+                if (pa) quantize4(pa + ox, maxval, qa);
+                for (j = 0; j < 4; j++) {
+                    uint32_t comps[4];
+                    uint32_t px = ox + j;
+                    uint32_t r = qr[j];
+                    uint32_t g = gray ? r : qg[j];
+                    uint32_t b = gray ? r : qb[j];
+                    uint32_t a = pa ? qa[j] : maxval;
+                    if (gray) {
+                        comps[0] = r;
+                        if (has_alpha) comps[1] = a;
+                    } else if (bgr) {
+                        comps[0] = b; comps[1] = g; comps[2] = r;
+                        if (has_alpha) comps[3] = a;
+                    } else {
+                        comps[0] = r; comps[1] = g; comps[2] = b;
+                        if (has_alpha) comps[3] = a;
+                    }
+                    if (wide) {
+                        uint16_t *o = row16 + (size_t)px * ncomp;
+                        o[0] = (uint16_t)comps[0];
+                        if (ncomp > 1) o[1] = (uint16_t)comps[1];
+                        if (ncomp > 2) o[2] = (uint16_t)comps[2];
+                        if (ncomp > 3) o[3] = (uint16_t)comps[3];
+                    } else {
+                        uint8_t *o = row8 + (size_t)px * ncomp;
+                        o[0] = (uint8_t)comps[0];
+                        if (ncomp > 1) o[1] = (uint8_t)comps[1];
+                        if (ncomp > 2) o[2] = (uint8_t)comps[2];
+                        if (ncomp > 3) o[3] = (uint8_t)comps[3];
+                    }
+                }
+            }
+        }
+#endif
+        for (; ox < ow; ox++) {
             uint32_t sx, sy;
             float rv, gv, bv, av = 1.0f;
             uint32_t comps[4];

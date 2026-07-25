@@ -62,12 +62,12 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **2.23x libjxl** (2.74x before the SSE2 work below;
+1245-file corpus we are **2.19x libjxl** (2.74x before the SSE2 work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
 average up). libjxl is AVX2 throughout; we are scalar C apart from the SSE2
 hot loops (noise, upsampling, EPF, gaborish, both DCT passes, the XYB
-inverse and the sRGB transfer function), so a
+inverse, the sRGB transfer function and the output quantiser), so a
 constant factor is expected. Each of those keeps a scalar twin and is checked
 bit-identical against it -- see the log.
 
@@ -128,28 +128,57 @@ from `djxl`, with the same max and mean deviation on each.
 
 ### What is left
 The profile on `P3-sRGB-color-bars.v_d1` is flat -- `dct_1d` alone used to be
-27%, and nothing is above ~14% now. The two remaining candidates both come
-with a caveat rather than being straightforward:
+27%, and nothing is above ~14% now. Everything with a straightforward,
+provably-bit-identical vector form has been done.
 
-- **`memset_repstos`**, from `jxl_fplane_alloc`'s `calloc`. The cheapest win
-  left, and the same waste already removed from the noise and gaborish
-  scratch buffers -- but it needs checking caller by caller. A plane only
-  partly written would start returning heap contents instead of zeros, which
-  is a disclosure bug, not a rendering one.
-- **`write_pixels`**, the float-to-integer output pass. Vectorisable, but it
-  is a gather across planes with per-format packing, so rather more code than
-  the loops done so far for a single-digit share.
+What is left is qualitatively different from the six rounds above:
 
-Everything with an easy, provably-bit-identical vector form has now been
-done.
-
-Still not taken on EPF: the kernel taps are symmetric pairs and the SAD is
-symmetric under swapping the two footprints, so `dist(x, y, k) ==
-dist(x+kx, y+ky, -k)`. Caching six SADs per sample in a rolling three-row
-window would halve the SAD work. The `sigma < 0.3` early-out complicates it:
-a skipped sample's neighbours still want its cached values.
+- **AVX2.** libjxl runs 8 lanes to our 4 throughout. Doubling the width is
+  the only remaining across-the-board win, but it means runtime dispatch and
+  a second copy of each kernel -- a real change in what this codebase is,
+  rather than another loop rewrite.
+- **`epf_pass` SAD symmetry.** The taps are symmetric pairs and the SAD is
+  symmetric under swapping the two footprints, so `dist(x, y, k) ==
+  dist(x+kx, y+ky, -k)`. Caching six SADs per sample in a rolling three-row
+  window would halve the SAD work. The `sigma < 0.3` early-out complicates
+  it: a skipped sample's neighbours still want its cached values.
+- **Multithreading**, which is not implemented at all and would dwarf both.
 
 ## Log
+
+### Not zeroing planes that get overwritten, and vectorising the quantiser
+The last two single-digit items on the profile, and the first one was the
+interesting one because the obvious version of it is wrong.
+
+`memset_repstos` at 8.4% was `jxl_fplane_alloc`'s `calloc` clearing a frame's
+worth of planes that the very next loop overwrites. The tempting fix -- swap
+the allocator to `jxl_malloc` -- would have been a **security bug**, not just
+a risky optimisation: `jxl_fimage_blank_like` allocates a canvas and writes
+*nothing*, relying on the zeros, so blank frames would have started showing
+whatever the heap last held. Checking the six callers individually, four fill
+their plane completely (the VarDCT assembly, the two Modular ones, and
+`jxl_fimage_copy`, plus the upsampler's destination) and one does not. So the
+uninitialised version is a separate entry point, `jxl_fplane_alloc_uninit`,
+and the zeroing one stays the default.
+
+`-DJXL_FPLANE_ALWAYS_ZERO` turns it back into `calloc`, which converts "every
+sample really is written" from an argument into a diff: any plane read before
+being written would show up as garbage against zeros. 210 files, identical.
+
+`write_pixels` at 8.2% is eight formats crossed with orientation and BGR
+order, so vectorising the *packing* would have been a lot of code for a
+single-digit share. Its time goes on `quantize` -- a multiply, an add, two
+compares and a truncating convert, per component per pixel -- so only that is
+vectorised, four samples at a time into a small array that the existing scalar
+store loop reads. All the format handling stays in one place.
+
+    P3-sRGB-color-bars.v_d1   28.0ms  3.40x -> 27.2ms  3.30x
+    flower.v_d1              145.2ms  3.10x -> 139.6ms 3.04x
+    flower.m_e3 (Modular)                      557.0ms 1.99x
+
+Corpus **2.23x -> 2.19x**, 37.1s -> 36.2s. Across all six rounds: 2.74x ->
+2.19x, 48.4s -> 36.2s, a quarter of the wall clock, every step verified
+against a scalar twin. 1245/1245 ok, ASan clean, 115 fuzz reproducers clean.
 
 ### The colour conversion, four lanes at a time
 `jxl_linear_to_tf` at 11% and `jxl_xyb_to_linear` at 6.1% both looked like

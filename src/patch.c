@@ -422,7 +422,7 @@ int jxl_fimage_copy(jxl_ctx *ctx, jxl_fimage *dst, const jxl_fimage *src) {
     dst->h = src->h;
     for (i = 0; i < src->nplane; i++) {
         const jxl_fplane *s = &src->plane[i];
-        if (jxl_fplane_alloc(ctx, &dst->plane[i], s->w, s->h) != 0) return -1;
+        if (jxl_fplane_alloc_uninit(ctx, &dst->plane[i], s->w, s->h) != 0) return -1;
         for (y = 0; y < s->h; y++) {
             memcpy(dst->plane[i].data + (size_t)y * dst->plane[i].stride,
                    s->data + (size_t)y * s->stride, (size_t)s->w * sizeof(float));

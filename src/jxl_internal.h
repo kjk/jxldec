@@ -925,6 +925,8 @@ typedef struct {
 
 int jxl_fimage_alloc(jxl_ctx *ctx, jxl_fimage *img, uint32_t nplane);
 int jxl_fplane_alloc(jxl_ctx *ctx, jxl_fplane *p, uint32_t w, uint32_t h);
+/* Uninitialised variant -- only for callers that write every sample. */
+int jxl_fplane_alloc_uninit(jxl_ctx *ctx, jxl_fplane *p, uint32_t w, uint32_t h);
 void jxl_fimage_free(jxl_ctx *ctx, jxl_fimage *img);
 
 /* State carried across the frames of one document: the reference slots a
