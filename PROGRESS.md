@@ -4,15 +4,17 @@ Milestone log for the C JPEG XL decoder. Newest first.
 
 ## Status summary
 
-`bun cmd/tests.ts -all` — 736 corpus files (73 libjxl testdata images × 10 cjxl
-presets, plus the `.jxl` files that ship with libjxl):
+`bun cmd/tests.ts -all` — 821 corpus files (libjxl's testdata images × 11 cjxl
+presets, its JPEGs transcoded, plus the `.jxl` files that ship with libjxl):
 
 ```
-607/736 ok, 129 failed
+758/821 ok, 63 failed
 ```
 
 "ok" means byte-identical to `djxl file.jxl out.pam`, or within one 8-bit step
-for the float (VarDCT) paths.
+for the float (VarDCT) paths. **No file fails to decode**: every one of the 63
+is a lossy VarDCT path differing by 2-10 counts out of 255 on isolated pixels,
+which is float divergence, not a bug (see below).
 
 | area | state |
 |---|---|
@@ -24,11 +26,11 @@ for the float (VarDCT) paths.
 | VarDCT, progressive (LF frames) | within 1 |
 | gaborish, EPF | done |
 | non-sRGB primaries (BT.2020, P3) | done (Bradford-adapted matrix) |
-| images with an embedded ICC profile | **missing** — the enum fields are unused, so the conversion is wrong |
-| patches / reference frames | **missing** — decodes the wrong image |
-| splines, noise | **missing** — errors out |
-| animation (frames after the first) | **missing** — only frame 0 |
-| YCbCr / JPEG transcode frames | **missing** — errors out |
+| images with an embedded ICC profile | done |
+| patches / reference frames | **byte-exact** |
+| splines, noise | done (noise is approximate, see below) |
+| animation (frames after the first) | done |
+| YCbCr / JPEG transcode frames | done, all subsampling modes |
 
 ### What "pixel perfect" means here
 Modular is integer arithmetic, so it is byte-identical to libjxl and any
@@ -38,24 +40,42 @@ equality is not achievable and libjxl's own conformance testing uses a
 tolerance. Our target there is max abs difference ≤ 1 on 8-bit output, which
 is met for sRGB content.
 
-## Known-cause failures
+## Remaining differences
 
-1. **ICC-profile images** (`*_v4_krita`, `*_acescg_*`): when `want_icc` is set
-   the enumerated primaries/transfer fields are absent and the real color space
-   lives in the embedded profile. We decode the profile bytes but do not
-   interpret them, so the color transform uses sRGB defaults.
-   Enumerated non-sRGB primaries (BT.2020, P3, DCI) *are* handled:
-   `jxl_opsin_matrix_for` folds the sRGB→target conversion (Bradford-adapted
-   through XYZ D50) into the opsin inverse matrix, matching libjxl's
-   `OutputEncodingInfo::SetFromMetadata`. Linear-transfer 16-bit images can
-   still differ by a few counts at gamut edges, where out-of-range values clip.
-2. **Patches** (`ellipses`, `grayscale_patches` at effort ≥ 7): the encoder
-   emits a `ReferenceOnly` frame plus a main frame with the patches flag. We
-   decode and store the reference frame but do not blit patches, and we bail
-   out on the patches flag.
-3. **Splines / noise**: `frame: patches/splines/noise are not implemented yet`.
+1. **Residual VarDCT float divergence** — 63 files, max 2-10 counts on
+   scattered pixels, mean under 0.3. Inherent to the differing IDCT
+   factorizations; not worth chasing further.
+2. **Noise** reproduces approximately (max 5, mean 0.47 on a photon-noise
+   file). The XorShift128+ RNG and the 5x5 high-pass match jxl-oxide's
+   structure but a small difference remains, uninvestigated.
+
+## Performance
+
+`bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
+libraries into one process and times both, single-threaded. On a random
+sample we are ~3.7x libjxl overall: Modular 2-3x, VarDCT 1-5x with occasional
+outliers. libjxl is AVX2; we are scalar C, so a small constant factor is
+expected. Splines are the slowest path by a wide margin.
 
 ## Log
+
+### YCbCr, ICC, and lazy dequant matrices
+- JPEG-transcoded files (YCbCr frames) decode, including every chroma
+  subsampling mode. The subtleties: the block grid rounds up to a whole
+  number of subsampled blocks, so LF group rects are measured in blocks, not
+  pixels; a subsampled channel lives in the top-left corner of each plane, so
+  the per-group coefficient and LF-quant *views* start at the shifted block
+  origin (getting this wrong decodes plausibly but wrongly, mean 4/255);
+  chroma-from-luma is skipped entirely when anything is subsampled.
+- `want_icc` images output **linear sRGB**. Recovering the real primaries and
+  transfer curve from the profile is colorimetrically right but is not what
+  libjxl does — without a CMS it falls back to linear sRGB and hands the
+  profile to the caller. Matching libjxl took eight test profiles from
+  max diff 74-169 to max 1.
+- Grayscale XYB leaves three identical planes; dropping two is required or
+  the extra-channel plane indices are off by two and alpha reads luma.
+- Dequant matrices are built on demand. Materializing all 17 slots (including
+  256x256) cost 8ms on files libjxl decodes in 0.2ms.
 
 ### VarDCT + multi-frame
 - Frame iteration now decodes non-displayed frames (LF, reference-only) for

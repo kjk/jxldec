@@ -46,7 +46,9 @@ PNGs to PNM in TypeScript. Don't re-investigate this.
 - `bun cmd/tests.ts <-all | -rand N | file.jxl ...>` — the test driver:
   builds, then decodes each corpus file with both our decoder and `djxl`
   and compares the PNM output.
-- `bun cmd/bench.ts <selection>` — times our decode against libjxl's.
+- `bun cmd/bench.ts <selection> [-runs N]` — times our decode against libjxl's,
+  both in one process, single-threaded, best of N. Windows/MSVC only: it links
+  libjxl's static libraries, which need `-MD` and `-DJXL_STATIC_DEFINE`.
 - `bun cmd/build-dist.ts` — regenerate the `dist/jxl.c` + `dist/jxl.h`
   amalgamation and verify it compiles with every available toolchain.
 
@@ -134,6 +136,24 @@ keep `PROGRESS.md` current; it lists the exact pass rate and every known gap.
 - libjxl encodes sRGB with a rational-polynomial approximation, not `powf`.
 - Lossy Modular stores XYB as `(Y, X, B)` integers scaled by `m_*_lf / 128`,
   with `B += Y` applied first.
+- `want_icc` images decode to **linear sRGB**, not to the profile's real color
+  space. That is what libjxl does without a CMS; reconstructing the primaries
+  from the profile makes the output *less* like `djxl`, not more.
+- Grayscale XYB produces three identical planes. Two must be dropped, or the
+  extra-channel plane indices are off by two and alpha reads the luma plane.
+- With chroma subsampling the block grid rounds up to a whole number of
+  subsampled blocks (`jxl_frame_blocks_w/h`), and LF group rects are measured
+  in **blocks**, not pixels.
+- A subsampled channel occupies the top-left corner of its full-size plane, so
+  every per-group view into the coefficient and LF-quant planes must start at
+  the *shifted* block origin. Getting this wrong still decodes -- it just
+  produces a plausible, wrong image (mean 4/255).
+- Chroma-from-luma is skipped entirely when anything is subsampled, and the
+  default Y-to-B correlation is 1.0 only for XYB frames (0 otherwise).
+- Our public `JXL_SIG_*` enum names collide with libjxl's `jxl/decode.h`; the
+  two headers cannot be included in one translation unit.
+- Dequant matrices are built lazily. Do not make them eager again: all 17
+  slots cost ~8ms, which is the entire decode of a small image.
 
 **Do not commit automatically.** Make and verify changes, but leave them in the
 working tree; only run `git commit` when the user asks. Never commit
