@@ -62,8 +62,11 @@ by more than one 8-bit step.**
   lossy Modular (XYB), for sRGB content.
 * Also working: gaborish and EPF, splines, synthetic photon noise, 2x/4x/8x
   upsampling, all eight EXIF orientations, animation, embedded ICC profiles,
-  non-sRGB primaries (BT.2020, P3), and YCbCr/JPEG-transcoded frames in every
-  chroma subsampling mode.
+  and YCbCr/JPEG-transcoded frames in every chroma subsampling mode.
+* Implemented but **unverified**: non-sRGB primaries (BT.2020, P3) and the PQ
+  and HLG transfer functions. `bun cmd/coverage.ts` shows that code never
+  runs — every corpus file declares sRGB primaries, so nothing checks it
+  against `djxl`.
 
 The 726 non-byte-exact files are lossy VarDCT paths where roughly a quarter of
 the samples land one count either side of libjxl's. libjxl, jxl-oxide and this

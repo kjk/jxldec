@@ -24,7 +24,7 @@ no sample differs from libjxl by more than one 8-bit step.
 | VarDCT, 8-bit sRGB | within 1 |
 | VarDCT, progressive (LF frames) | within 1 |
 | gaborish, EPF | done |
-| non-sRGB primaries (BT.2020, P3) | done (Bradford-adapted matrix) |
+| non-sRGB primaries (BT.2020, P3) | **unverified** — implemented, but no corpus file declares them (see log) |
 | images with an embedded ICC profile | done |
 | patches / reference frames | **byte-exact** |
 | splines, noise | within 1 |
@@ -131,6 +131,39 @@ rather than overhead-bound. Two further options, neither taken:
   intrinsics, which would end the scalar-C property.
 
 ## Log
+
+### Measuring the untested paths instead of guessing at them
+Every decoder bug in this run -- the noise seed, the loop-filter edge, missing
+upsampling, spot colour -- lived in a path nothing in the corpus exercised, and
+each was found by guessing where such paths were. `bun cmd/coverage.ts` builds
+a clang source-coverage variant (`build.ts cov`, `-O0` so inlining cannot fold
+one function's lines into another's), decodes the corpus under it, and reports
+per-file line coverage plus every function that never ran.
+
+Over all 1113 files: **83.8% of lines, 91.0% of functions, 21 functions never
+executed.** The full list is in the tool's output; the one that matters:
+
+**`color.c` is 30.3% covered, and the entire non-sRGB colour path is dark** --
+`get_primaries`, `get_white_point`, `primaries_to_xyz`, `adapt_to_xyz_d50`,
+`mat3_inv`, `tf_pq`, `tf_hlg`, `tf_bt709`. The status table above claimed
+non-sRGB primaries were done and Bradford-adapted. The code is there; nothing
+runs it. Every corpus file declares `Primaries: sRGB` -- including
+`P3-sRGB-color-bars`, `R2020-sRGB-red` and `phu1or_alfann24_2020_g1`, whose
+names describe their *content*, not their declared encoding. They are built
+from PAM, which carries no colour information, so cjxl tags them sRGB. The
+`v_icc` preset does not help either: on the want_icc path `doc.c` deliberately
+forces primaries back to sRGB, matching libjxl's CMS-less fallback. So the
+claim has been resting on nothing, and the table now says so.
+
+Other unexercised paths worth naming: `read_dct_params` and `read_fixed` in
+`vardct.c` (custom dequant matrices), `preview_header_read` and `read_customxy`
+in `headers.c`, `pred_nee` and `props_get_extra` in `modular.c`.
+
+Two things the tool got wrong at first and no longer does: it filed the test
+harness under decoder code, because it took "everything after the first
+`/src/`" as the project-relative path and this checkout lives under a path that
+itself contains `/src/`; and it listed a header's static inlines once per
+translation unit, so one unused inline read as sixteen findings.
 
 ### EXIF orientation: untested, and correct
 The first path this run that turned out fine. `unapply_orientation` had never

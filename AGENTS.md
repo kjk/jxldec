@@ -46,6 +46,13 @@ PNGs to PNM in TypeScript. Don't re-investigate this.
 - `bun cmd/tests.ts <-all | -rand N | file.jxl ...>` — the test driver:
   builds, then decodes each corpus file with both our decoder and `djxl`
   and compares the PNM output.
+- `bun cmd/coverage.ts [-rand N] [-cpu N] [-all-fns] [-reuse]` — decodes the
+  corpus under clang source-based coverage and prints per-file line coverage
+  plus, more usefully, every function that never ran. Use it before assuming a
+  feature works: each decoder bug found so far lived in a path nothing
+  exercised, and a function on that list is one nothing verifies against
+  libjxl. `-reuse` re-reports from the profile already on disk (the decode is
+  the slow part, ~3 min).
 - `bun cmd/bench.ts <selection> [-runs N]` — times our decode against libjxl's,
   both in one process, single-threaded, best of N. Windows/MSVC only: it links
   libjxl's static libraries, which need `-MD` and `-DJXL_STATIC_DEFINE`.

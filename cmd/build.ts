@@ -4,6 +4,7 @@
 //   bun cmd/build.ts -clang   build with clang instead of MSVC
 //   bun cmd/build.ts -clean   delete out/ first (full rebuild)
 //   bun cmd/build.ts asan     clang + AddressSanitizer harness
+//   bun cmd/build.ts cov      clang + coverage instrumentation (see coverage.ts)
 //
 // Objects and exes land in out/msvc/, out/clang/ or out/clang_asan/. The build
 // is incremental: a source is recompiled only when newer than its object, and
@@ -170,6 +171,16 @@ export async function buildAsan(): Promise<string> {
   return exe;
 }
 
+// clang + source-based coverage instrumentation -> out/clang_cov/.
+// -O0 so that no inlining folds one function's lines into another's and a
+// never-executed branch cannot be optimised away before it is counted.
+const COV_DIR = `${OUT_ROOT}/clang_cov`;
+
+export async function buildCoverage(): Promise<string> {
+  return buildClang("-g -O0", COV_DIR, "jxl_test_cov",
+                    "-fprofile-instr-generate -fcoverage-mapping");
+}
+
 // The exe links the DYNAMIC asan runtime, which lives in clang's resource dir
 // (not on PATH); without a copy next to the exe the loader fails before main.
 export async function copyAsanRuntimeDll(dir: string): Promise<void> {
@@ -315,5 +326,6 @@ if (import.meta.main) {
   await getDeps();
   const useClang = args.includes("-clang") || defaultUseClang;
   if (args.includes("asan")) await buildAsan();
+  else if (args.includes("cov")) await buildCoverage();
   else await build(useClang);
 }
