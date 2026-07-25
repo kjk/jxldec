@@ -1,6 +1,6 @@
 /* jxl_bench.c -- decode timing, ours against libjxl, in one process.
  *
- *   jxl_bench [-runs N] file.jxl ...
+ *   jxl_bench [-runs N] [-list paths.txt] file.jxl ...
  *
  * Both decoders produce 8-bit interleaved samples of the first frame, which
  * is what an application like SumatraPDF asks for. libjxl runs
@@ -139,9 +139,72 @@ fail:
     return dt;
 }
 
+/* One file: decode `runs` times with each decoder, print the best of each. */
+static void bench_one(const char *path, int runs, double *tot_ref,
+                      double *tot_ours, size_t *tot_bytes, int *nfiles) {
+    uint8_t *data;
+    size_t len;
+    double best_ours = -1, best_ref = -1;
+    const char *base, *p;
+    int r;
+
+    data = read_file(path, &len);
+    if (!data) {
+        fprintf(stderr, "cannot read %s\n", path);
+        return;
+    }
+    for (r = 0; r < runs; r++) {
+        double a = bench_ours(data, len);
+        double b = bench_libjxl(data, len);
+        if (a >= 0 && (best_ours < 0 || a < best_ours)) best_ours = a;
+        if (b >= 0 && (best_ref < 0 || b < best_ref)) best_ref = b;
+    }
+    free(data);
+
+    base = path;
+    for (p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') base = p + 1;
+    }
+
+    if (best_ours < 0 || best_ref < 0) {
+        printf("%-46s %10s %10s %8s\n", base, best_ref < 0 ? "fail" : "-",
+               best_ours < 0 ? "fail" : "-", "-");
+        fflush(stdout);
+        return;
+    }
+    printf("%-46s %9.2fms %9.2fms %7.2fx\n", base, best_ref, best_ours,
+           best_ref > 0 ? best_ours / best_ref : 0.0);
+    fflush(stdout);
+    *tot_ours += best_ours;
+    *tot_ref += best_ref;
+    *tot_bytes += len;
+    (*nfiles)++;
+}
+
+/* Runs every path in a newline-separated list file. The whole corpus does not
+   fit in a Windows command line, so the driver always passes -list. */
+static int bench_list(const char *list_path, int runs, double *tot_ref,
+                      double *tot_ours, size_t *tot_bytes, int *nfiles) {
+    FILE *f = fopen(list_path, "rb");
+    char line[4096];
+    if (!f) {
+        fprintf(stderr, "cannot read list %s\n", list_path);
+        return -1;
+    }
+    while (fgets(line, (int)sizeof(line), f)) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+        if (n == 0) continue;
+        bench_one(line, runs, tot_ref, tot_ours, tot_bytes, nfiles);
+    }
+    fclose(f);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    const char *list_path = NULL;
     int runs = 3;
-    int i, r, nfiles = 0;
+    int i, nfiles = 0;
     double tot_ours = 0, tot_ref = 0;
     size_t tot_bytes = 0;
 
@@ -149,49 +212,22 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-runs") == 0 && i + 1 < argc) {
             runs = atoi(argv[++i]);
             if (runs < 1) runs = 1;
+        } else if (strcmp(argv[i], "-list") == 0 && i + 1 < argc) {
+            list_path = argv[++i];
         }
     }
     printf("%-46s %10s %10s %8s\n", "file", "libjxl", "jxldec", "ratio");
 
+    if (list_path &&
+        bench_list(list_path, runs, &tot_ref, &tot_ours, &tot_bytes, &nfiles) != 0) {
+        return 1;
+    }
     for (i = 1; i < argc; i++) {
-        const char *path = argv[i];
-        uint8_t *data;
-        size_t len;
-        double best_ours = -1, best_ref = -1;
-        const char *base;
-
         if (argv[i][0] == '-') {
-            if (strcmp(argv[i], "-runs") == 0) i++;
+            if (strcmp(argv[i], "-runs") == 0 || strcmp(argv[i], "-list") == 0) i++;
             continue;
         }
-        data = read_file(path, &len);
-        if (!data) {
-            fprintf(stderr, "cannot read %s\n", path);
-            continue;
-        }
-        for (r = 0; r < runs; r++) {
-            double a = bench_ours(data, len);
-            double b = bench_libjxl(data, len);
-            if (a >= 0 && (best_ours < 0 || a < best_ours)) best_ours = a;
-            if (b >= 0 && (best_ref < 0 || b < best_ref)) best_ref = b;
-        }
-        free(data);
-
-        base = strrchr(path, '/');
-        if (!base) base = strrchr(path, '\\');
-        base = base ? base + 1 : path;
-
-        if (best_ours < 0 || best_ref < 0) {
-            printf("%-46s %10s %10s %8s\n", base,
-                   best_ref < 0 ? "fail" : "-", best_ours < 0 ? "fail" : "-", "-");
-            continue;
-        }
-        printf("%-46s %9.2fms %9.2fms %7.2fx\n", base, best_ref, best_ours,
-               best_ref > 0 ? best_ours / best_ref : 0.0);
-        tot_ours += best_ours;
-        tot_ref += best_ref;
-        tot_bytes += len;
-        nfiles++;
+        bench_one(argv[i], runs, &tot_ref, &tot_ours, &tot_bytes, &nfiles);
     }
 
     if (nfiles) {

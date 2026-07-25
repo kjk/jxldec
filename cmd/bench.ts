@@ -3,13 +3,17 @@
 //   bun cmd/bench.ts <file.jxl ... | -rand N | -all> [-runs N] [-preset a,b]
 //
 // Builds jxl_bench, which links the dist/ amalgamation and libjxl's static
-// libraries into one process, then decodes each file with both. Both produce
+// libraries into one process, then decodes each file with both. The selection
+// goes over in a list file: the whole corpus does not fit in a Windows
+// command line. Both produce
 // 8-bit interleaved samples of the first frame; libjxl runs single-threaded,
 // the only configuration we implement. The best of -runs decodes is reported
 // per decoder, since the fastest run is the least perturbed one.
 //
 // Windows/MSVC only: libjxl is C++ and links against the MSVC runtime.
-import { dirname } from "path";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { dirname, join } from "path";
 import { buildBenchHarness, isWindows } from "./build";
 import { corpusSummary, selectFiles } from "./corpus";
 import { getDeps } from "./get-deps";
@@ -41,10 +45,17 @@ ${corpusSummary()}`,
 );
 
 const EXE = await buildBenchHarness();
-const proc = Bun.spawnSync({
-  cmd: [EXE, "-runs", RUNS, ...files],
-  stdout: "inherit",
-  stderr: "inherit",
-  cwd: ROOT,
-});
-process.exit(proc.exitCode ?? 1);
+const tmp = mkdtempSync(join(tmpdir(), "jxldec-bench-"));
+const listFile = join(tmp, "files.txt");
+writeFileSync(listFile, files.join("\n") + "\n");
+try {
+  const proc = Bun.spawnSync({
+    cmd: [EXE, "-runs", RUNS, "-list", listFile],
+    stdout: "inherit",
+    stderr: "inherit",
+    cwd: ROOT,
+  });
+  process.exitCode = proc.exitCode ?? 1;
+} finally {
+  rmSync(tmp, { recursive: true, force: true });
+}
