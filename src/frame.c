@@ -196,17 +196,6 @@ static void read_extensions_frame(jxl_br *br) {
     for (i = 0; i < n; i++) jxl_br_skip(br, (size_t)lens[i]);
 }
 
-static char *read_name(jxl_ctx *ctx, jxl_br *br) {
-    uint32_t len = jxl_br_u32(br, 0, 0, 0, 4, 16, 5, 48, 10);
-    char *s;
-    uint32_t i;
-    if (len == 0 || br->err) return NULL;
-    s = (char *)jxl_malloc(ctx, len + 1);
-    if (!s) return NULL;
-    for (i = 0; i < len; i++) s[i] = (char)jxl_br_read(br, 8);
-    s[len] = 0;
-    return s;
-}
 
 int jxl_read_frame_header(jxl_ctx *ctx, jxl_br *br, const jxl_size_header *size,
                           const jxl_image_metadata *meta, jxl_frame_header *fh) {
@@ -352,7 +341,7 @@ int jxl_read_frame_header(jxl_ctx *ctx, jxl_br *br, const jxl_size_header *size,
                     (fh->duration == 0 || fh->save_as_reference != 0) &&
                     fh->frame_type != JXL_FRAME_LF);
         if (cond) fh->save_before_ct = jxl_br_bool(br);
-        fh->name = read_name(ctx, br);
+        fh->name = jxl_read_name(ctx, br);
         if (!jxl_br_bool(br)) {   /* RestorationFilter all_default */
             read_gabor(br, &fh->gab);
             read_epf(br, &fh->epf, fh->encoding);

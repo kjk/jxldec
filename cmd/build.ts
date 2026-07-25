@@ -229,6 +229,60 @@ export async function buildBench(useClang = defaultUseClang): Promise<string> {
   return exePath;
 }
 
+// libjxl's static libraries, in link order, for the benchmark harness.
+function libjxlLibs(): string[] {
+  const b = `${ROOT}/deps/libjxl-build`;
+  return [
+    `${b}/lib/jxl.lib`,
+    `${b}/lib/jxl_cms.lib`,
+    `${b}/third_party/brotli/brotlidec.lib`,
+    `${b}/third_party/brotli/brotlienc.lib`,
+    `${b}/third_party/brotli/brotlicommon.lib`,
+    `${b}/third_party/highway/hwy.lib`,
+  ];
+}
+
+/** Build jxl_bench: our amalgamation and libjxl in one process, MSVC only
+ *  (libjxl is built as C++ with the MSVC runtime). */
+export async function buildBenchHarness(): Promise<string> {
+  if (!isWindows) throw new Error("the benchmark harness needs the MSVC toolchain");
+  await ensureDist();
+  const dir = outDir(false);
+  const exePath = `${dir}/${binName("jxl_bench")}`;
+  const inc = `${ROOT}/deps/libjxl/lib/include`;
+  const incBuild = `${ROOT}/deps/libjxl-build/lib/include`;
+  mkdirSync(dir, { recursive: true });
+
+  // libjxl links the dynamic CRT, so the harness objects must too (-MD).
+  const clMd = JXLDEC_MSVC_CL_C.replace("-MT", "-MD");
+  const libObj = `${dir}/jxl_dist.obj`;
+  const benchObj = `${dir}/jxl_bench.obj`;
+  const refObj = `${dir}/bench_libjxl.obj`;
+  if (needsRebuild(libObj, DIST_C, DIST_H)) {
+    await runCmd(`cl ${clMd} -Idist -Fo${libObj} -c dist/jxl.c`, ROOT);
+  }
+  if (needsRebuild(benchObj, `${ROOT}/test/jxl_bench.c`, DIST_H)) {
+    await runCmd(
+      `cl ${clMd} -Idist -Fo${benchObj} -c test/jxl_bench.c`,
+      ROOT,
+    );
+  }
+  if (needsRebuild(refObj, `${ROOT}/test/bench_libjxl.c`)) {
+    await runCmd(
+      `cl ${clMd} -DJXL_STATIC_DEFINE -I${inc} -I${incBuild} -Fo${refObj} -c test/bench_libjxl.c`,
+      ROOT,
+    );
+  }
+  const libs = libjxlLibs();
+  if (needsRebuild(exePath, libObj, benchObj, refObj, ...libs)) {
+    await runCmd(
+      `cl -nologo ${libObj} ${benchObj} ${refObj} -Fe:${exePath} -link -LTCG ${libs.join(" ")}`,
+      ROOT,
+    );
+  }
+  return exePath;
+}
+
 if (import.meta.main) {
   const args = process.argv.slice(2);
   if (args.includes("-clean")) cleanBuildOutput();

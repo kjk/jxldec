@@ -13,7 +13,7 @@
 
 /* Name: a length-prefixed UTF-8 string. Returns malloc'd NUL-terminated bytes,
    or NULL for the (common) empty name. */
-static char *read_name(jxl_ctx *ctx, jxl_br *br) {
+char *jxl_read_name(jxl_ctx *ctx, jxl_br *br) {
     uint32_t len = jxl_br_u32(br, 0, 0, 0, 4, 16, 5, 48, 10);
     char *s;
     uint32_t i;
@@ -204,7 +204,7 @@ static void ec_info_read(jxl_ctx *ctx, jxl_br *br, jxl_ec_info *ec) {
     ty = jxl_br_enum(br);
     read_bit_depth(br, &ec->bit_depth);
     ec->dim_shift = jxl_br_u32(br, 0, 0, 3, 0, 4, 0, 1, 3);
-    ec->name = read_name(ctx, br);
+    ec->name = jxl_read_name(ctx, br);
     ec->type = (jxl_ec_type)ty;
 
     switch (ty) {

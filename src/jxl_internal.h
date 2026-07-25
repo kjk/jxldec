@@ -83,9 +83,6 @@ void jxl_br_seek_byte(jxl_br *br, size_t byte_off);
 static inline int32_t jxl_unpack_signed(uint32_t u) {
     return (int32_t)((u >> 1) ^ (~(u & 1) + 1));
 }
-static inline int64_t jxl_unpack_signed64(uint64_t u) {
-    return (int64_t)((u >> 1) ^ (~(u & 1) + 1));
-}
 
 /* ===================================================================== */
 /* container -- ISOBMFF box parsing                                       */
@@ -219,6 +216,8 @@ typedef struct {
 } jxl_image_metadata;
 
 /* Parses the 0xFF 0x0A signature, SizeHeader and ImageMetadata. */
+/* A length-prefixed UTF-8 name; NULL when empty. Caller frees. */
+char *jxl_read_name(jxl_ctx *ctx, jxl_br *br);
 int jxl_read_image_header(jxl_ctx *ctx, jxl_br *br, jxl_size_header *size,
                           jxl_image_metadata *meta);
 void jxl_image_metadata_free(jxl_ctx *ctx, jxl_image_metadata *meta);
