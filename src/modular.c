@@ -91,7 +91,9 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
                        size_t node_limit) {
     jxl_dec tree_dec;
     jxl_ma_node *raw = NULL;
+    jxl_ma_leaf *leaves = NULL;
     uint32_t cap = 0, count = 0;
+    uint32_t lcap = 0;
     size_t nodes_left = 1;
     uint32_t ctx_count = 0;
     uint32_t *dq = NULL;
@@ -136,13 +138,26 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
         } else {
             uint32_t pred = jxl_dec_read(&tree_dec, br, 2);
             uint32_t mul_log, mul_bits;
+            jxl_ma_leaf *leaf;
             if (pred > JXL_PRED_AVG_ALL) {
                 JXL_ERR(ctx, "modular: bad predictor %u", (unsigned)pred);
                 goto done;
             }
-            node.property = -1;
-            node.predictor = (uint8_t)pred;
-            node.offset = jxl_unpack_signed(jxl_dec_read(&tree_dec, br, 3));
+            if (ctx_count == lcap) {
+                uint32_t ncap = lcap ? lcap * 2 : 16;
+                jxl_ma_leaf *nl = (jxl_ma_leaf *)jxl_realloc_array(
+                    ctx, leaves, lcap, ncap, sizeof(jxl_ma_leaf));
+                if (!nl) goto done;
+                leaves = nl;
+                lcap = ncap;
+            }
+            /* Leaves are numbered in read order, which is also the order the
+               sample decoder's contexts are numbered, so a leaf's index into
+               leaves[] is its context id. */
+            leaf = &leaves[ctx_count];
+            leaf->predictor = (uint8_t)pred;
+            leaf->cluster = 0;      /* filled in once the decoder exists */
+            leaf->offset = jxl_unpack_signed(jxl_dec_read(&tree_dec, br, 3));
             mul_log = jxl_dec_read(&tree_dec, br, 4);
             if (mul_log > 30) {
                 JXL_ERR(ctx, "modular: bad MA multiplier");
@@ -153,9 +168,9 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
                 JXL_ERR(ctx, "modular: bad MA multiplier bits");
                 goto done;
             }
-            node.multiplier = (mul_bits + 1) << mul_log;
-            node.cluster = (uint8_t)ctx_count;   /* provisional: context id */
-            node.value = (int32_t)ctx_count;     /* keep the wide context id */
+            leaf->multiplier = (mul_bits + 1) << mul_log;
+            node.property = -1;
+            node.left = ctx_count;
             ctx_count++;
         }
         raw[count++] = node;
@@ -166,10 +181,16 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
                 (unsigned)count, (unsigned)ctx_count, tree_dec.use_prefix,
                 (unsigned)tree_dec.num_clusters);
         for (k = 0; k < count && k < 12; k++) {
-            fprintf(stderr, "  [%u] prop=%d value=%d pred=%u off=%d mul=%u\n",
-                    (unsigned)k, (int)raw[k].property, (int)raw[k].value,
-                    (unsigned)raw[k].predictor, (int)raw[k].offset,
-                    (unsigned)raw[k].multiplier);
+            if (raw[k].property >= 0) {
+                fprintf(stderr, "  [%u] prop=%d value=%d\n",
+                        (unsigned)k, (int)raw[k].property, (int)raw[k].value);
+            } else {
+                const jxl_ma_leaf *lf = &leaves[raw[k].left];
+                fprintf(stderr, "  [%u] leaf ctx=%u pred=%u off=%d mul=%u\n",
+                        (unsigned)k, (unsigned)raw[k].left,
+                        (unsigned)lf->predictor, (int)lf->offset,
+                        (unsigned)lf->multiplier);
+            }
         }
     }
     if (jxl_dec_finalize(&tree_dec) != 0) {
@@ -182,17 +203,13 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
 
     if (jxl_dec_init(ctx, &ma->dec, br, ctx_count) != 0) goto done;
 
-    /* Map leaf context ids through the sample decoder's cluster map. */
-    for (i = 0; i < count; i++) {
-        if (raw[i].property < 0) {
-            uint32_t c = (uint32_t)raw[i].value;
-            if (c >= ma->dec.num_dist) {
-                JXL_ERR(ctx, "modular: MA leaf context out of range");
-                goto done;
-            }
-            raw[i].cluster = ma->dec.clusters[c];
-        }
+    /* Map leaf context ids through the sample decoder's cluster map. A leaf's
+       index into leaves[] is its context id, so this is a straight walk. */
+    if (ctx_count > ma->dec.num_dist) {
+        JXL_ERR(ctx, "modular: MA leaf context out of range");
+        goto done;
     }
+    for (i = 0; i < ctx_count; i++) leaves[i].cluster = ma->dec.clusters[i];
 
     /* Rebuild the tree: walk the node list backwards, pushing finished
        subtrees onto a queue; a decision node takes the two at the front
@@ -234,14 +251,18 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
     }
     ma->root = dq[dq_head];
     ma->nodes = raw;
+    ma->leaves = leaves;
     ma->count = count;
+    ma->nleaves = ctx_count;
     ma->valid = 1;
     raw = NULL;
+    leaves = NULL;
     rc = 0;
 
 done:
     jxl_free(ctx, dq);
     jxl_free(ctx, raw);
+    jxl_free(ctx, leaves);
     jxl_dec_free(&tree_dec);
     if (rc != 0) jxl_ma_config_free(ctx, ma);
     return rc;
@@ -252,6 +273,9 @@ void jxl_ma_config_free(jxl_ctx *ctx, jxl_ma_config *ma) {
     jxl_free(ctx, ma->nodes);
     ma->nodes = NULL;
     ma->count = 0;
+    jxl_free(ctx, ma->leaves);
+    ma->leaves = NULL;
+    ma->nleaves = 0;
     jxl_dec_free(&ma->dec);
     ma->valid = 0;
 }
@@ -1454,7 +1478,7 @@ int jxl_modular_transform_channels(jxl_ctx *ctx, jxl_modular *m,
    terminates -- jxl_ma_config_read rejects any tree whose child indices are
    not strictly greater than the parent's -- so this returns a real leaf,
    never a decision node abandoned part-way down. */
-static const jxl_ma_node *ma_get_leaf(const jxl_ma_config *ma,
+static const jxl_ma_leaf *ma_get_leaf(const jxl_ma_config *ma,
                                       const jxl_pred_state *ps,
                                       const jxl_props *pr) {
     const jxl_ma_node *nodes = ma->nodes;
@@ -1465,7 +1489,7 @@ static const jxl_ma_node *ma_get_leaf(const jxl_ma_config *ma,
                            : props_get_extra(ps, (uint32_t)p - 16);
         node = &nodes[v > node->value ? node->left : node->right];
     }
-    return node;
+    return &ma->leaves[node->left];
 }
 
 /* True when the tree can ask for the self-correcting predictor or property
@@ -1474,9 +1498,9 @@ static int ma_needs_self_correcting(const jxl_ma_config *ma) {
     uint32_t i;
     for (i = 0; i < ma->count; i++) {
         if (ma->nodes[i].property == 15) return 1;
-        if (ma->nodes[i].property < 0 &&
-            ma->nodes[i].predictor == JXL_PRED_SELF_CORRECTING)
-            return 1;
+    }
+    for (i = 0; i < ma->nleaves; i++) {
+        if (ma->leaves[i].predictor == JXL_PRED_SELF_CORRECTING) return 1;
     }
     return 0;
 }
@@ -1554,7 +1578,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
             int32_t *row = ch->data + (size_t)y * ch->stride;
             for (x = 0; x < ch->w; x++) {
                 jxl_props pr;
-                const jxl_ma_node *leaf;
+                const jxl_ma_leaf *leaf;
                 uint32_t token;
                 int32_t diff, value;
 

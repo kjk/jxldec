@@ -124,6 +124,39 @@ rather than overhead-bound. Two further options, neither taken:
 
 ## Log
 
+### Splitting the MA node so a big tree fits in cache
+`ma_get_leaf` is **72% of a lossy-Modular decode** -- by far the hottest
+function left. The cost is not arithmetic: `flower_alpha.lm_d1` has a
+1901-node tree, and at 28 bytes per node that is 53KB walked as a chain of
+dependent loads, so it misses L1 at nearly every level. Only `property`,
+`value`, `left` and `right` are read during a walk; `cluster`, `predictor`,
+`offset` and `multiplier` are read once, at the leaf. Splitting those four out
+into a separate `jxl_ma_leaf` array leaves a 16-byte node -- four to a cache
+line -- and since the node array is breadth-first, the decision nodes a walk
+actually passes through sit in its first half.
+
+Measured interleaved A/B, 5 runs each, two passes, ours (libjxl column flat
+throughout, so this is not machine drift):
+
+| file | tree | before | after |
+|---|---|---|---|
+| `flower_alpha.lm_d1` | 1901 nodes, 53KB | 1166ms, 4.11x | 1096ms, 3.93x |
+| `flower.lm_d1` | large | 593ms, 3.71x | 569ms, 3.60x |
+| `flower_alpha.m_e9` | <=1175 nodes | 1207ms, 1.83x | 1169ms, 1.78x |
+| `flower_alpha.m_e3` | 67 nodes, 1.9KB | 819ms, 2.23x | 816ms, 2.22x |
+| corpus total | | 2.73x | 2.71x |
+
+The last row of the table is the point: a 67-node tree is 1.9KB and was
+already L1-resident, so halving the node does nothing for it. That is what the
+cache explanation predicts and what a "fewer instructions" explanation does
+not, and it is the reason to trust the other rows. Corpus-wide the effect is
+small (~0.8%) because large-tree files are a minority; `ma_get_leaf` fell from
+72.4% to 69.1% self on `flower_alpha.lm_d1`, 11025 to 9582 samples.
+
+`ma_get_leaf` is still 69%, so the remaining lever is the length of the
+dependent-load chain rather than its width -- libjxl flattens two tree levels
+into one 32-byte node to halve it.
+
 ### MA tree walk: a leaf is now always a leaf (not a speedup)
 `ma_get_leaf` carried a step counter that `break`s out of the walk once it
 exceeds the node count, which returns a **decision** node to the caller --
