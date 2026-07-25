@@ -409,6 +409,7 @@ int jxl_read_toc(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
             jxl_free(ctx, perm);
             return -1;
         }
+        jxl_dec_begin(&dec, br);
         if (jxl_read_permutation(ctx, &dec, br, entry_count, 0, perm) != 0 ||
             jxl_dec_finalize(&dec) != 0) {
             JXL_ERR(ctx, "toc: bad permutation");

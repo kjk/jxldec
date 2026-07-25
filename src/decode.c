@@ -13,6 +13,8 @@
  */
 #include "jxl_internal.h"
 
+#include <math.h>
+
 static uint32_t div_ceil32(uint32_t a, uint32_t b) {
     return (a + b - 1) / b;
 }
@@ -83,15 +85,6 @@ static jxl_br *section_reader(jxl_sections *s, jxl_toc_kind kind,
     jxl_br_init(&s->br, s->cs, s->cs_len);
     jxl_br_seek_byte(&s->br, s->toc->entries[idx].offset);
     return &s->br;
-}
-
-static uint32_t section_size(jxl_sections *s, jxl_toc_kind kind,
-                             uint32_t pass_idx, uint32_t group_idx) {
-    uint32_t idx;
-    if (s->single) return s->toc->entries[0].size;
-    idx = jxl_toc_index(s->toc, kind, pass_idx, group_idx);
-    if (idx >= s->toc->count) return 0;
-    return s->toc->entries[idx].size;
 }
 
 /* ===================================================================== */
@@ -228,6 +221,214 @@ done:
     return rc;
 }
 
+
+/* ===================================================================== */
+/* VarDCT frame state                                                     */
+/* ===================================================================== */
+
+typedef struct {
+    jxl_quantizer quantizer;
+    jxl_hf_block_ctx block_ctx;
+    jxl_lf_chan_corr chan_corr;
+
+    uint32_t bw, bh;              /* frame size in 8x8 blocks (rounded up) */
+    uint32_t pw, ph;              /* pixel size == bw*8, bh*8              */
+    float *lf[3];                 /* bw x bh, the dequantized LF image      */
+    int32_t *lfq[3];              /* bw x bh, the raw quantized LF values    */
+    float *coeff[3];              /* pw x ph, coefficients then samples    */
+    jxl_block_info *block_info;   /* bw x bh                               */
+    float *epf_sigma;             /* bw x bh                               */
+    int32_t *x_from_y, *b_from_y; /* cfl_w x cfl_h                         */
+    uint32_t cfl_w, cfl_h;
+
+    jxl_dequant_matrices dm;
+    int have_dm;
+    jxl_hf_pass *passes;
+    uint32_t num_passes;
+    uint32_t num_hf_presets;
+    jxl_natural_orders no;
+} jxl_vardct_state;
+
+static void vardct_state_free(jxl_ctx *ctx, jxl_vardct_state *v) {
+    uint32_t i;
+    int c;
+    for (c = 0; c < 3; c++) {
+        jxl_free(ctx, v->lf[c]);
+        jxl_free(ctx, v->lfq[c]);
+        jxl_free(ctx, v->coeff[c]);
+    }
+    jxl_free(ctx, v->block_info);
+    jxl_free(ctx, v->epf_sigma);
+    jxl_free(ctx, v->x_from_y);
+    jxl_free(ctx, v->b_from_y);
+    if (v->have_dm) jxl_dequant_matrices_free(ctx, &v->dm);
+    if (v->passes) {
+        for (i = 0; i < v->num_passes; i++) jxl_hf_pass_free(ctx, &v->passes[i]);
+        jxl_free(ctx, v->passes);
+    }
+    jxl_hf_block_ctx_free(ctx, &v->block_ctx);
+    jxl_natural_orders_free(ctx, &v->no);
+    memset(v, 0, sizeof(*v));
+}
+
+static int vardct_state_alloc(jxl_ctx *ctx, jxl_vardct_state *v, uint32_t bw,
+                              uint32_t bh) {
+    int c;
+    v->bw = bw;
+    v->bh = bh;
+    v->pw = bw * 8;
+    v->ph = bh * 8;
+    v->cfl_w = (v->pw + 63) / 64;
+    v->cfl_h = (v->ph + 63) / 64;
+    for (c = 0; c < 3; c++) {
+        v->lf[c] = (float *)jxl_calloc(ctx, (size_t)bw * bh, sizeof(float));
+        v->lfq[c] = (int32_t *)jxl_calloc(ctx, (size_t)bw * bh, sizeof(int32_t));
+        v->coeff[c] = (float *)jxl_calloc(ctx, (size_t)v->pw * v->ph, sizeof(float));
+        if (!v->lf[c] || !v->lfq[c] || !v->coeff[c]) return -1;
+    }
+    v->block_info =
+        (jxl_block_info *)jxl_calloc(ctx, (size_t)bw * bh, sizeof(jxl_block_info));
+    v->epf_sigma = (float *)jxl_calloc(ctx, (size_t)bw * bh, sizeof(float));
+    v->x_from_y =
+        (int32_t *)jxl_calloc(ctx, (size_t)v->cfl_w * v->cfl_h, sizeof(int32_t));
+    v->b_from_y =
+        (int32_t *)jxl_calloc(ctx, (size_t)v->cfl_w * v->cfl_h, sizeof(int32_t));
+    if (!v->block_info || !v->epf_sigma || !v->x_from_y || !v->b_from_y) return -1;
+    {
+        size_t i;
+        for (i = 0; i < (size_t)bw * bh; i++) {
+            v->block_info[i].dct_select = JXL_BLK_UNINIT;
+        }
+    }
+    return 0;
+}
+
+/* Reads the quantized LF image of one LF group and dequantizes it into the
+   frame-wide LF planes. */
+static int decode_lf_coeff(jxl_ctx *ctx, jxl_br *br, jxl_vardct_state *v,
+                           const jxl_lf_dequant *lfd, uint32_t lf_group_idx,
+                           uint32_t lf_width, uint32_t lf_height,
+                           uint32_t base_bx, uint32_t base_by,
+                           uint32_t bit_depth, jxl_ma_config *global_ma) {
+    uint32_t extra_precision = jxl_br_read(br, 2);
+    uint32_t w = (lf_width + 7) / 8;
+    uint32_t h = (lf_height + 7) / 8;
+    jxl_mchan_spec specs[3];
+    jxl_modular mod;
+    jxl_chanlist cl;
+    /* Channel order in the bitstream is X, Y, B but the planes are Y, X, B. */
+    static const int plane_of[3] = {1, 0, 2};
+    float m_lf[3];
+    int i, rc = -1;
+
+    memset(&mod, 0, sizeof(mod));
+    memset(&cl, 0, sizeof(cl));
+    m_lf[0] = lfd->m_x_lf;
+    m_lf[1] = lfd->m_y_lf;
+    m_lf[2] = lfd->m_b_lf;
+
+    for (i = 0; i < 3; i++) {
+        specs[i].w = w;
+        specs[i].h = h;
+        specs[i].hshift = 0;
+        specs[i].vshift = 0;
+    }
+    if (jxl_modular_init(ctx, &mod, br, specs, 3, global_ma, 0, bit_depth) != 0)
+        goto done;
+    if (jxl_modular_transform_channels(ctx, &mod, &cl) != 0) goto done;
+    if (jxl_modular_decode(ctx, &mod, &cl, br, 1 + lf_group_idx) != 0) goto done;
+    if (jxl_modular_inverse(ctx, &mod, &cl) != 0) goto done;
+
+    /* Plane c (X, Y, B) comes from Modular channel [1, 0, 2][c]. */
+    for (i = 0; i < 3; i++) {
+        const jxl_mchan *src = &mod.base[plane_of[i]];
+        float *dst = v->lf[i] + (size_t)base_by * v->bw + base_bx;
+        uint32_t xx, yy;
+        jxl_copy_lf_dequant(dst, v->bw, src, &v->quantizer, m_lf[i],
+                            (int)extra_precision);
+        for (yy = 0; yy < src->h && base_by + yy < v->bh; yy++) {
+            for (xx = 0; xx < src->w && base_bx + xx < v->bw; xx++) {
+                v->lfq[i][(size_t)(base_by + yy) * v->bw + base_bx + xx] =
+                    src->data[(size_t)yy * src->stride + xx];
+            }
+        }
+    }
+    rc = 0;
+
+done:
+    jxl_chanlist_free(ctx, &cl);
+    jxl_modular_free(ctx, &mod);
+    return rc;
+}
+
+/* Copies one LF group's varblock metadata into the frame-wide arrays. */
+static void merge_hf_meta(jxl_vardct_state *v, const jxl_hf_meta *m,
+                          uint32_t base_bx, uint32_t base_by) {
+    uint32_t x, y;
+    for (y = 0; y < m->bh && base_by + y < v->bh; y++) {
+        for (x = 0; x < m->bw && base_bx + x < v->bw; x++) {
+            v->block_info[(size_t)(base_by + y) * v->bw + base_bx + x] =
+                m->block_info[(size_t)y * m->bw + x];
+            v->epf_sigma[(size_t)(base_by + y) * v->bw + base_bx + x] =
+                m->epf_sigma[(size_t)y * m->bw + x];
+        }
+    }
+    for (y = 0; y < m->cfl_h; y++) {
+        uint32_t gy = base_by / 8 + y;
+        if (gy >= v->cfl_h) break;
+        for (x = 0; x < m->cfl_w; x++) {
+            uint32_t gx = base_bx / 8 + x;
+            if (gx >= v->cfl_w) break;
+            v->x_from_y[(size_t)gy * v->cfl_w + gx] = m->x_from_y[(size_t)y * m->cfl_w + x];
+            v->b_from_y[(size_t)gy * v->cfl_w + gx] = m->b_from_y[(size_t)y * m->cfl_w + x];
+        }
+    }
+}
+
+/* Dequantizes, undoes chroma-from-luma and inverse-transforms every varblock
+   of the frame, leaving XYB samples in v->coeff. */
+static void vardct_finish_blocks(jxl_vardct_state *v,
+                                 const jxl_image_metadata *meta,
+                                 const jxl_frame_header *fh) {
+    float qm_scale[3];
+    uint32_t bx, by;
+    int c;
+
+    qm_scale[0] = powf(0.8f, (float)fh->x_qm_scale - 2.0f);
+    qm_scale[1] = 1.0f;
+    qm_scale[2] = powf(0.8f, (float)fh->b_qm_scale - 2.0f);
+
+    for (c = 0; c < 3; c++) {
+        for (by = 0; by < v->bh; by++) {
+            for (bx = 0; bx < v->bw; bx++) {
+                const jxl_block_info *bi = &v->block_info[(size_t)by * v->bw + bx];
+                if (bi->dct_select >= JXL_TR_COUNT) continue;
+                jxl_dequant_varblock(
+                    v->coeff[c] + (size_t)(by * 8) * v->pw + bx * 8, v->pw,
+                    bi->dct_select, bi->hf_mul, c, &v->dm, &v->quantizer,
+                    qm_scale[c], meta->quant_bias[c], meta->quant_bias_numerator);
+            }
+        }
+    }
+
+    jxl_cfl_hf(v->coeff[0], v->coeff[1], v->coeff[2], v->pw, v->pw, v->ph,
+               v->x_from_y, v->b_from_y, v->cfl_w, &v->chan_corr);
+
+    for (c = 0; c < 3; c++) {
+        for (by = 0; by < v->bh; by++) {
+            for (bx = 0; bx < v->bw; bx++) {
+                const jxl_block_info *bi = &v->block_info[(size_t)by * v->bw + bx];
+                float *blk;
+                if (bi->dct_select >= JXL_TR_COUNT) continue;
+                blk = v->coeff[c] + (size_t)(by * 8) * v->pw + bx * 8;
+                jxl_fill_varblock_lf(blk, v->pw, bi->dct_select, v->lf[c], v->bw,
+                                     bx, by);
+                jxl_transform_varblock(blk, v->pw, bi->dct_select);
+            }
+        }
+    }
+}
+
 int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                      const jxl_toc *toc, jxl_fimage *out) {
     const jxl_image_metadata *meta = &doc->meta;
@@ -242,11 +443,14 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     jxl_mchan_spec *specs = NULL;
     jxl_group_lists gl;
     jxl_pass_shifts pshifts;
+    jxl_vardct_state vd;
+    int is_vardct;
     uint32_t nspecs = 0, i, split;
     uint32_t color_w, color_h, group_dim, group_dim_shift;
     uint32_t num_lf_groups, num_groups, num_passes;
     uint32_t color_upsampling_shift;
     uint32_t bits;
+    uint32_t ncolor;
     int rc = -1;
 
     memset(&global_ma, 0, sizeof(global_ma));
@@ -254,14 +458,20 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     memset(&gcl, 0, sizeof(gcl));
     memset(&prefix, 0, sizeof(prefix));
     memset(&gl, 0, sizeof(gl));
+    memset(&vd, 0, sizeof(vd));
     memset(out, 0, sizeof(*out));
 
-    if (fh->encoding != JXL_ENC_MODULAR) {
-        JXL_ERR(ctx, "frame: VarDCT is not implemented yet");
-        return -1;
-    }
+    is_vardct = (fh->encoding == JXL_ENC_VARDCT);
     if (fh->flags & (JXL_FF_PATCHES | JXL_FF_SPLINES | JXL_FF_NOISE)) {
         JXL_ERR(ctx, "frame: patches/splines/noise are not implemented yet");
+        return -1;
+    }
+    if (fh->flags & JXL_FF_USE_LF_FRAME) {
+        JXL_ERR(ctx, "frame: LF frames are not implemented yet");
+        return -1;
+    }
+    if (fh->do_ycbcr) {
+        JXL_ERR(ctx, "frame: YCbCr frames are not implemented yet");
         return -1;
     }
 
@@ -273,6 +483,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     num_groups = jxl_frame_num_groups(fh);
     num_passes = fh->passes.num_passes;
     bits = meta->bit_depth.bits_per_sample;
+    ncolor = (uint32_t)fh->encoded_color_channels;
 
     sections_init(&sec, doc->container.cs, doc->container.cs_len, toc);
     br = section_reader(&sec, JXL_TOC_LF_GLOBAL, 0, 0);
@@ -280,24 +491,41 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
 
     lf_dequant_read(br, &lf_dequant);
 
+    if (is_vardct) {
+        if (vardct_state_alloc(ctx, &vd, div_ceil32(color_w, 8),
+                               div_ceil32(color_h, 8)) != 0)
+            goto done;
+        jxl_quantizer_read(br, &vd.quantizer);
+        if (jxl_hf_block_ctx_read(ctx, br, &vd.block_ctx) != 0) goto done;
+        jxl_lf_chan_corr_read(br, &vd.chan_corr);
+        if (vd.quantizer.global_scale == 0 || vd.quantizer.quant_lf == 0) {
+            JXL_ERR(ctx, "frame: zero quantizer scale");
+            goto done;
+        }
+    }
+
     /* ----- global modular ----- */
     if (jxl_br_bool(br)) {
-        uint64_t num_channels = (uint64_t)fh->encoded_color_channels + meta->num_extra;
+        uint64_t num_channels = ncolor + meta->num_extra;
         uint64_t limit = 1024 + (uint64_t)fh->width * fh->height * num_channels / 16;
         if (limit > (1u << 22)) limit = 1u << 22;
         if (jxl_ma_config_read(ctx, br, &global_ma, (size_t)limit) != 0) goto done;
         has_global_ma = 1;
     }
 
-    nspecs = (uint32_t)fh->encoded_color_channels + meta->num_extra;
+    /* VarDCT frames keep only the extra channels in the global Modular
+       image; the color channels are the transform coefficients. */
+    nspecs = (is_vardct ? 0 : ncolor) + meta->num_extra;
     specs = (jxl_mchan_spec *)jxl_calloc(ctx, nspecs ? nspecs : 1,
                                          sizeof(jxl_mchan_spec));
     if (!specs) goto done;
-    for (i = 0; i < (uint32_t)fh->encoded_color_channels; i++) {
-        specs[i].w = color_w;
-        specs[i].h = color_h;
-        specs[i].hshift = 0;
-        specs[i].vshift = 0;
+    if (!is_vardct) {
+        for (i = 0; i < ncolor; i++) {
+            specs[i].w = color_w;
+            specs[i].h = color_h;
+            specs[i].hshift = 0;
+            specs[i].vshift = 0;
+        }
     }
     color_upsampling_shift = 0;
     {
@@ -305,6 +533,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         while (u > 1) { color_upsampling_shift++; u >>= 1; }
     }
     for (i = 0; i < meta->num_extra; i++) {
+        uint32_t base = is_vardct ? 0 : ncolor;
         uint32_t ec_shift = 0;
         uint32_t u = fh->ec_upsampling[i];
         int32_t actual;
@@ -312,32 +541,34 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         actual = (int32_t)(ec_shift + meta->ec_info[i].dim_shift) -
                  (int32_t)color_upsampling_shift;
         if (actual < 0) actual = 0;
-        specs[fh->encoded_color_channels + i].w = color_w;
-        specs[fh->encoded_color_channels + i].h = color_h;
-        specs[fh->encoded_color_channels + i].hshift = actual;
-        specs[fh->encoded_color_channels + i].vshift = actual;
+        specs[base + i].w = color_w;
+        specs[base + i].h = color_h;
+        specs[base + i].hshift = actual;
+        specs[base + i].vshift = actual;
     }
 
     if (jxl_modular_init(ctx, &gmod, br, specs, nspecs,
                          has_global_ma ? &global_ma : NULL, group_dim,
                          bits) != 0)
         goto done;
-    if (jxl_modular_transform_channels(ctx, &gmod, &gcl) != 0) goto done;
-
-    /* Channels small enough to live in the global stream come first. */
-    split = 0;
-    while (split < gcl.n) {
-        const jxl_mchan *ch = &gcl.chans[split];
-        if (split < gcl.nb_meta || (ch->w <= group_dim && ch->h <= group_dim)) {
-            split++;
-        } else {
-            break;
+    if (nspecs) {
+        if (jxl_modular_transform_channels(ctx, &gmod, &gcl) != 0) goto done;
+        split = 0;
+        while (split < gcl.n) {
+            const jxl_mchan *ch = &gcl.chans[split];
+            if (split < gcl.nb_meta || (ch->w <= group_dim && ch->h <= group_dim)) {
+                split++;
+            } else {
+                break;
+            }
         }
+        prefix.chans = gcl.chans;
+        prefix.n = split;
+        prefix.cap = 0;    /* borrowed: never freed */
+        if (jxl_modular_decode(ctx, &gmod, &prefix, br, 0) != 0) goto done;
+    } else {
+        split = 0;
     }
-    prefix.chans = gcl.chans;
-    prefix.n = split;
-    prefix.cap = 0;    /* borrowed: never freed */
-    if (jxl_modular_decode(ctx, &gmod, &prefix, br, 0) != 0) goto done;
 
     /* ----- group channel lists ----- */
     compute_pass_shifts(fh, &pshifts);
@@ -365,11 +596,10 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
             uint32_t gh = group_dim >> vshift;
             uint32_t nx = (ch->ow + group_dim - 1) >> group_dim_shift;
             uint32_t ny = (ch->oh + group_dim - 1) >> group_dim_shift;
-            if (gw == 0 || gh == 0) {
-                JXL_ERR(ctx, "frame: channel shift too large for the group size");
+            if (gw == 0 || gh == 0 || pass_idx >= num_passes) {
+                JXL_ERR(ctx, "frame: bad channel shift for the group size");
                 goto done;
             }
-            if (pass_idx >= num_passes) goto done;
             if (split_channel_into_groups(ctx, ch, gw, gh, nx, ny,
                                           gl.pass + (size_t)pass_idx * num_groups,
                                           num_groups) != 0)
@@ -380,7 +610,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
             uint32_t nx = (ch->ow + (group_dim << 3) - 1) >> (group_dim_shift + 3);
             uint32_t ny = (ch->oh + (group_dim << 3) - 1) >> (group_dim_shift + 3);
             if (gw == 0 || gh == 0) {
-                JXL_ERR(ctx, "frame: channel shift too large for the LF group size");
+                JXL_ERR(ctx, "frame: bad channel shift for the LF group size");
                 goto done;
             }
             if (split_channel_into_groups(ctx, ch, gw, gh, nx, ny, gl.lf,
@@ -390,27 +620,111 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     }
 
     /* ----- LF groups ----- */
-    for (i = 0; i < num_lf_groups; i++) {
-        uint32_t sz = section_size(&sec, JXL_TOC_LF_GROUP, 0, i);
-        if (sz == 0 && !sec.single) continue;
-        br = section_reader(&sec, JXL_TOC_LF_GROUP, 0, i);
+    {
+        uint32_t lf_per_row = jxl_frame_lf_groups_per_row(fh);
+        for (i = 0; i < num_lf_groups; i++) {
+            uint32_t lg_x = lf_per_row ? i % lf_per_row : 0;
+            uint32_t lg_y = lf_per_row ? i / lf_per_row : 0;
+            uint32_t lf_dim = group_dim * 8;
+            uint32_t lf_w = JXL_MIN(lf_dim, color_w - lg_x * lf_dim);
+            uint32_t lf_h = JXL_MIN(lf_dim, color_h - lg_y * lf_dim);
+            uint32_t base_bx = lg_x * group_dim;
+            uint32_t base_by = lg_y * group_dim;
+
+            br = section_reader(&sec, JXL_TOC_LF_GROUP, 0, i);
+            if (!br) goto done;
+            if (is_vardct) {
+                if (decode_lf_coeff(ctx, br, &vd, &lf_dequant, i, lf_w, lf_h,
+                                    base_bx, base_by, bits,
+                                    has_global_ma ? &global_ma : NULL) != 0)
+                    goto done;
+            }
+            if (decode_group_modular(ctx, br, &gl.lf[i],
+                                     has_global_ma ? &global_ma : NULL, group_dim,
+                                     bits, 1 + num_lf_groups + i) != 0)
+                goto done;
+            if (is_vardct) {
+                jxl_hf_meta hm;
+                if (jxl_hf_meta_read(ctx, br, &hm, num_lf_groups, i, lf_w, lf_h,
+                                     fh->jpeg_upsampling, bits,
+                                     has_global_ma ? &global_ma : NULL, &fh->epf,
+                                     vd.quantizer.global_scale) != 0)
+                    goto done;
+                merge_hf_meta(&vd, &hm, base_bx, base_by);
+                jxl_hf_meta_free(ctx, &hm);
+            }
+        }
+    }
+
+    /* ----- HF global ----- */
+    if (is_vardct) {
+        uint32_t p;
+        br = section_reader(&sec, JXL_TOC_HF_GLOBAL, 0, 0);
         if (!br) goto done;
-        if (decode_group_modular(ctx, br, &gl.lf[i],
-                                 has_global_ma ? &global_ma : NULL, group_dim,
-                                 bits, 1 + num_lf_groups + i) != 0)
+        if (jxl_dequant_matrices_read(ctx, br, &vd.dm, bits, num_lf_groups,
+                                      has_global_ma ? &global_ma : NULL) != 0)
             goto done;
+        vd.have_dm = 1;
+        vd.num_hf_presets =
+            jxl_br_read(br, (int)jxl_bitlen(num_groups > 1 ? num_groups - 1 : 0)) + 1;
+        vd.passes = (jxl_hf_pass *)jxl_calloc(ctx, num_passes, sizeof(jxl_hf_pass));
+        if (!vd.passes) goto done;
+        vd.num_passes = num_passes;
+        for (p = 0; p < num_passes; p++) {
+            if (jxl_hf_pass_read(ctx, br, &vd.passes[p], &vd.block_ctx,
+                                 vd.num_hf_presets, &vd.no) != 0)
+                goto done;
+        }
     }
 
     /* ----- pass groups ----- */
     {
         uint32_t p, g;
+        uint32_t groups_per_row = jxl_frame_groups_per_row(fh);
+        uint32_t lf_per_row = jxl_frame_lf_groups_per_row(fh);
         for (p = 0; p < num_passes; p++) {
             for (g = 0; g < num_groups; g++) {
                 jxl_chanlist *cl = &gl.pass[(size_t)p * num_groups + g];
-                uint32_t sz = section_size(&sec, JXL_TOC_GROUP_PASS, p, g);
-                if (sz == 0 && !sec.single) continue;
                 br = section_reader(&sec, JXL_TOC_GROUP_PASS, p, g);
                 if (!br) goto done;
+                if (is_vardct) {
+                    uint32_t gx = groups_per_row ? g % groups_per_row : 0;
+                    uint32_t gy = groups_per_row ? g / groups_per_row : 0;
+                    uint32_t bx0 = gx * (group_dim / 8);
+                    uint32_t by0 = gy * (group_dim / 8);
+                    uint32_t bwid = JXL_MIN(group_dim / 8, vd.bw - bx0);
+                    uint32_t bhig = JXL_MIN(group_dim / 8, vd.bh - by0);
+                    jxl_hf_coeff_params hp;
+                    jxl_mchan lfq_view[3];
+                    float *outp[3];
+                    size_t strides[3];
+                    int c;
+                    (void)lf_per_row;
+
+                    memset(&hp, 0, sizeof(hp));
+                    hp.num_hf_presets = vd.num_hf_presets;
+                    hp.bc = &vd.block_ctx;
+                    hp.block_info = vd.block_info + (size_t)by0 * vd.bw + bx0;
+                    hp.bi_w = bwid;
+                    hp.bi_h = bhig;
+                    hp.bi_stride = vd.bw;
+                    for (c = 0; c < 3; c++) {
+                        hp.jpeg_upsampling[c] = fh->jpeg_upsampling[c];
+                        memset(&lfq_view[c], 0, sizeof(lfq_view[c]));
+                        lfq_view[c].data = vd.lfq[c] + (size_t)by0 * vd.bw + bx0;
+                        lfq_view[c].stride = vd.bw;
+                        lfq_view[c].w = bwid;
+                        lfq_view[c].h = bhig;
+                        hp.lf_quant[c] = &lfq_view[c];
+                        outp[c] = vd.coeff[c] + (size_t)(by0 * 8) * vd.pw + bx0 * 8;
+                        strides[c] = vd.pw;
+                    }
+                    hp.pass = &vd.passes[p];
+                    hp.coeff_shift = p < 16 ? fh->passes.shift[p] : 0;
+                    hp.no = &vd.no;
+                    if (jxl_write_hf_coeff(ctx, br, &hp, outp, strides) != 0)
+                        goto done;
+                }
                 if (decode_group_modular(ctx, br, cl,
                                          has_global_ma ? &global_ma : NULL,
                                          group_dim, bits,
@@ -421,31 +735,118 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         }
     }
 
-    /* ----- undo the global transforms ----- */
-    if (jxl_modular_inverse(ctx, &gmod, &gcl) != 0) goto done;
+    if (nspecs && jxl_modular_inverse(ctx, &gmod, &gcl) != 0) goto done;
 
-    /* ----- convert to float planes ----- */
+    /* ----- VarDCT rendering ----- */
+    if (is_vardct) {
+        float m_lf[3];
+        float *planes[3];
+        int c;
+
+        m_lf[0] = lf_dequant.m_x_lf;
+        m_lf[1] = lf_dequant.m_y_lf;
+        m_lf[2] = lf_dequant.m_b_lf;
+        jxl_cfl_lf(vd.lf[0], vd.lf[1], vd.lf[2], vd.bw, vd.bh, vd.bw,
+                   &vd.chan_corr);
+        if (!(fh->flags & JXL_FF_SKIP_ADAPTIVE_LF_SMOOTH)) {
+            if (jxl_adaptive_lf_smoothing(ctx, vd.lf, vd.bw, vd.bh, vd.bw, m_lf,
+                                          &vd.quantizer) != 0)
+                goto done;
+        }
+        vardct_finish_blocks(&vd, meta, fh);
+
+        for (c = 0; c < 3; c++) planes[c] = vd.coeff[c];
+        if (fh->gab.enabled) {
+            if (jxl_apply_gabor(ctx, planes, vd.pw, vd.ph, vd.pw,
+                                fh->gab.weights) != 0)
+                goto done;
+        }
+        if (fh->epf.enabled) {
+            if (jxl_apply_epf(ctx, planes, vd.pw, vd.ph, vd.pw, vd.epf_sigma,
+                              vd.bw, &fh->epf) != 0)
+                goto done;
+        }
+    }
+
+    /* ----- assemble the float planes ----- */
     {
-        uint32_t ncolor = (uint32_t)fh->encoded_color_channels;
-        uint32_t nplane = gmod.nbase;
+        uint32_t nplane = (is_vardct ? 3 : gmod.nbase) +
+                          (is_vardct ? meta->num_extra : 0);
+        uint32_t base = 0;
         float scale = 1.0f;
         if (jxl_fimage_alloc(ctx, out, nplane) != 0) goto done;
-        out->ncolor = ncolor;
+        out->ncolor = is_vardct ? 3 : ncolor;
         out->w = color_w;
         out->h = color_h;
         if (!meta->bit_depth.float_sample) {
             scale = 1.0f / (float)((1u << bits) - 1);
         }
-        for (i = 0; i < nplane; i++) {
+        if (is_vardct) {
+            uint32_t x, y;
+            for (i = 0; i < 3; i++) {
+                if (jxl_fplane_alloc(ctx, &out->plane[i], color_w, color_h) != 0)
+                    goto done;
+                for (y = 0; y < color_h; y++) {
+                    memcpy(out->plane[i].data + (size_t)y * out->plane[i].stride,
+                           vd.coeff[i] + (size_t)y * vd.pw,
+                           (size_t)color_w * sizeof(float));
+                }
+                (void)x;
+            }
+            base = 3;
+        }
+        /* Lossy Modular stores XYB as (Y, X, B) integers scaled by the LF
+           dequant weights, not as [0, 1] samples. */
+        if (!is_vardct && meta->xyb_encoded && gmod.nbase >= 3) {
+            float mul[3];
+            uint32_t x, y;
+            static const int src_of[3] = {1, 0, 2};
+            mul[0] = lf_dequant.m_x_lf / 128.0f;
+            mul[1] = lf_dequant.m_y_lf / 128.0f;
+            mul[2] = lf_dequant.m_b_lf / 128.0f;
+            for (y = 0; y < gmod.base[2].h; y++) {
+                int32_t *rb = gmod.base[2].data + (size_t)y * gmod.base[2].stride;
+                const int32_t *ry = gmod.base[0].data + (size_t)y * gmod.base[0].stride;
+                for (x = 0; x < gmod.base[2].w; x++) {
+                    rb[x] = (int32_t)((uint32_t)rb[x] + (uint32_t)ry[x]);
+                }
+            }
+            for (i = 0; i < 3; i++) {
+                const jxl_mchan *ch = &gmod.base[src_of[i]];
+                if (jxl_fplane_alloc(ctx, &out->plane[i], ch->w, ch->h) != 0) goto done;
+                for (y = 0; y < ch->h; y++) {
+                    const int32_t *src = ch->data + (size_t)y * ch->stride;
+                    float *dst = out->plane[i].data + (size_t)y * out->plane[i].stride;
+                    for (x = 0; x < ch->w; x++) dst[x] = (float)src[x] * mul[i];
+                }
+            }
+        }
+        for (i = 0; i < gmod.nbase; i++) {
             const jxl_mchan *ch = &gmod.base[i];
             uint32_t x, y;
-            if (jxl_fplane_alloc(ctx, &out->plane[i], ch->w, ch->h) != 0) goto done;
+            uint32_t pi = base + i;
+            if (pi >= nplane) break;
+            if (!is_vardct && meta->xyb_encoded && i < 3) continue;
+            if (jxl_fplane_alloc(ctx, &out->plane[pi], ch->w, ch->h) != 0) goto done;
             for (y = 0; y < ch->h; y++) {
                 const int32_t *src = ch->data + (size_t)y * ch->stride;
-                float *dst = out->plane[i].data + (size_t)y * out->plane[i].stride;
+                float *dst = out->plane[pi].data + (size_t)y * out->plane[pi].stride;
                 for (x = 0; x < ch->w; x++) dst[x] = (float)src[x] * scale;
             }
         }
+    }
+
+    /* ----- XYB -> the image's color space ----- */
+    if (meta->xyb_encoded && out->ncolor >= 3) {
+        size_t n = (size_t)out->plane[0].w * out->plane[0].h;
+        jxl_xyb_to_linear(out->plane[0].data, out->plane[1].data,
+                          out->plane[2].data, n, meta->opsin_inv,
+                          meta->opsin_bias, meta->tone_mapping.intensity_target);
+        for (i = 0; i < 3; i++) {
+            jxl_linear_to_tf(out->plane[i].data, n, &meta->colour,
+                             meta->tone_mapping.intensity_target);
+        }
+        if (meta->colour.colour_space == JXL_CS_GRAY) out->ncolor = 1;
     }
     rc = 0;
 
@@ -454,8 +855,8 @@ done:
     group_lists_free(ctx, &gl);
     jxl_chanlist_free(ctx, &gcl);
     jxl_modular_free(ctx, &gmod);
+    vardct_state_free(ctx, &vd);
     if (has_global_ma) jxl_ma_config_free(ctx, &global_ma);
     if (rc != 0) jxl_fimage_free(ctx, out);
-    (void)div_ceil32;
     return rc;
 }

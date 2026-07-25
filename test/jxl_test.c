@@ -195,6 +195,7 @@ int main(int argc, char **argv) {
     const char *in_path = NULL;
     const char *out_path = NULL;
     int do_info = 0, do_frames = 0, frame_no = 0;
+    jxl_format fmt = JXL_FORMAT_NATIVE;
     int i, rc = 0;
     uint8_t *data;
     size_t len;
@@ -205,6 +206,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-frames") == 0) do_frames = 1;
         else if (strcmp(argv[i], "-out") == 0 && i + 1 < argc) out_path = argv[++i];
         else if (strcmp(argv[i], "-frame") == 0 && i + 1 < argc) frame_no = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-fmt") == 0 && i + 1 < argc) fmt = (jxl_format)atoi(argv[++i]);
         else if (argv[i][0] != '-') in_path = argv[i];
         else {
             fprintf(stderr, "unknown option %s\n", argv[i]);
@@ -231,7 +233,7 @@ int main(int argc, char **argv) {
     if (!rc && out_path) {
         jxl_doc *doc = jxl_doc_open(ctx, data, len);
         jxl_image *img = NULL;
-        if (doc) img = jxl_frame_render(doc, frame_no, JXL_FORMAT_NATIVE);
+        if (doc) img = jxl_frame_render(doc, frame_no, fmt);
         if (!img) rc = 1;
         else rc = write_pam(out_path, img);
         jxl_image_destroy(ctx, img);

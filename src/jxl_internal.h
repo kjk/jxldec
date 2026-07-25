@@ -597,6 +597,178 @@ uint32_t jxl_frame_groups_per_row(const jxl_frame_header *fh);
 uint32_t jxl_frame_lf_groups_per_row(const jxl_frame_header *fh);
 
 /* ===================================================================== */
+/* dct                                                                    */
+/* ===================================================================== */
+
+/* In-place separable 2D DCT over a w x h block (stride in floats).
+   inverse == 0 is the analysis transform, 1 the synthesis transform. */
+void jxl_dct_2d(float *data, size_t stride, int w, int h, int inverse);
+float jxl_scale_f(int c, int logb);
+
+/* ===================================================================== */
+/* vardct                                                                 */
+/* ===================================================================== */
+
+/* Varblock transform types, in bitstream order. */
+typedef enum {
+    JXL_TR_DCT8 = 0, JXL_TR_HORNUSS, JXL_TR_DCT2, JXL_TR_DCT4, JXL_TR_DCT16,
+    JXL_TR_DCT32, JXL_TR_DCT16X8, JXL_TR_DCT8X16, JXL_TR_DCT32X8,
+    JXL_TR_DCT8X32, JXL_TR_DCT32X16, JXL_TR_DCT16X32, JXL_TR_DCT4X8,
+    JXL_TR_DCT8X4, JXL_TR_AFV0, JXL_TR_AFV1, JXL_TR_AFV2, JXL_TR_AFV3,
+    JXL_TR_DCT64, JXL_TR_DCT64X32, JXL_TR_DCT32X64, JXL_TR_DCT128,
+    JXL_TR_DCT128X64, JXL_TR_DCT64X128, JXL_TR_DCT256, JXL_TR_DCT256X128,
+    JXL_TR_DCT128X256, JXL_TR_COUNT
+} jxl_transform_type;
+
+void jxl_tr_select_size(int tr, uint32_t *bw, uint32_t *bh);
+void jxl_tr_matrix_size(int tr, uint32_t *w, uint32_t *h);
+int jxl_tr_matrix_index(int tr);
+int jxl_tr_order_id(int tr);
+int jxl_tr_need_transpose(int tr);
+
+typedef struct {
+    uint32_t global_scale;
+    uint32_t quant_lf;
+} jxl_quantizer;
+
+typedef struct {
+    uint32_t colour_factor;
+    float base_correlation_x, base_correlation_b;
+    uint32_t x_factor_lf, b_factor_lf;
+} jxl_lf_chan_corr;
+
+typedef struct {
+    uint32_t nqf;
+    uint32_t qf_thresholds[16];
+    uint32_t nlf[3];
+    int32_t lf_thresholds[3][16];
+    uint8_t *block_ctx_map;
+    uint32_t block_ctx_map_len;
+    uint32_t num_block_clusters;
+} jxl_hf_block_ctx;
+
+typedef struct {
+    float *matrix[17][3];
+    float *matrix_tr[17][3];
+} jxl_dequant_matrices;
+
+typedef struct {
+    uint16_t *order[13][3];    /* NULL means "use the natural order" */
+    jxl_dec dist;
+    int have_dist;
+} jxl_hf_pass;
+
+/* Per-8x8-block varblock state. dct_select is JXL_BLK_* or a transform id. */
+#define JXL_BLK_UNINIT   0xff
+#define JXL_BLK_OCCUPIED 0xfe
+
+typedef struct {
+    uint8_t dct_select;
+    int32_t hf_mul;
+} jxl_block_info;
+
+typedef struct {
+    int32_t *x_from_y, *b_from_y;
+    uint32_t cfl_w, cfl_h;
+    jxl_block_info *block_info;
+    uint32_t bw, bh;
+    float *epf_sigma;
+    int have;
+} jxl_hf_meta;
+
+/* Natural (zig-zag-ish) coefficient orders, materialized on demand. */
+typedef struct {
+    uint16_t *order[13];
+} jxl_natural_orders;
+
+const uint16_t *jxl_natural_order(jxl_ctx *ctx, jxl_natural_orders *no,
+                                  int order_id);
+void jxl_natural_orders_free(jxl_ctx *ctx, jxl_natural_orders *no);
+
+void jxl_quantizer_read(jxl_br *br, jxl_quantizer *q);
+void jxl_lf_chan_corr_read(jxl_br *br, jxl_lf_chan_corr *c);
+int jxl_hf_block_ctx_read(jxl_ctx *ctx, jxl_br *br, jxl_hf_block_ctx *bc);
+void jxl_hf_block_ctx_free(jxl_ctx *ctx, jxl_hf_block_ctx *bc);
+
+int jxl_dequant_matrices_read(jxl_ctx *ctx, jxl_br *br,
+                              jxl_dequant_matrices *dm, uint32_t bit_depth,
+                              uint32_t num_lf_groups,
+                              jxl_ma_config *global_ma);
+void jxl_dequant_matrices_free(jxl_ctx *ctx, jxl_dequant_matrices *dm);
+
+int jxl_hf_pass_read(jxl_ctx *ctx, jxl_br *br, jxl_hf_pass *hp,
+                     const jxl_hf_block_ctx *bc, uint32_t num_hf_presets,
+                     jxl_natural_orders *no);
+void jxl_hf_pass_free(jxl_ctx *ctx, jxl_hf_pass *hp);
+
+/* Decodes one pass group's HF coefficients into three float planes (the
+   quantized values are stored as int32 bit patterns). */
+typedef struct {
+    uint32_t num_hf_presets;
+    const jxl_hf_block_ctx *bc;
+    const jxl_block_info *block_info;
+    uint32_t bi_w, bi_h;
+    size_t bi_stride;
+    uint32_t jpeg_upsampling[3];
+    const jxl_mchan *lf_quant[3];   /* NULL when there is no LF image */
+    jxl_hf_pass *pass;
+    uint32_t coeff_shift;
+    jxl_natural_orders *no;
+} jxl_hf_coeff_params;
+
+int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
+                       const jxl_hf_coeff_params *params, float *out[3],
+                       size_t stride[3]);
+
+void jxl_hf_meta_free(jxl_ctx *ctx, jxl_hf_meta *m);
+int jxl_hf_meta_read(jxl_ctx *ctx, jxl_br *br, jxl_hf_meta *m,
+                     uint32_t num_lf_groups, uint32_t lf_group_idx,
+                     uint32_t lf_width, uint32_t lf_height,
+                     const uint32_t jpeg_upsampling[3], uint32_t bit_depth,
+                     jxl_ma_config *global_ma, const jxl_epf *epf,
+                     uint32_t quantizer_global_scale);
+
+void jxl_copy_lf_dequant(float *dst, size_t dstride, const jxl_mchan *src,
+                         const jxl_quantizer *q, float m_lf,
+                         int extra_precision);
+int jxl_adaptive_lf_smoothing(jxl_ctx *ctx, float *plane[3], uint32_t width,
+                              uint32_t height, size_t stride,
+                              const float m_lf[3], const jxl_quantizer *q);
+void jxl_cfl_lf(float *x, float *y, float *b, uint32_t w, uint32_t h,
+                size_t stride, const jxl_lf_chan_corr *corr);
+void jxl_cfl_hf(float *cx, float *cy, float *cb, size_t stride, uint32_t gw,
+                uint32_t gh, const int32_t *x_from_y, const int32_t *b_from_y,
+                uint32_t cfl_stride, const jxl_lf_chan_corr *corr);
+void jxl_dequant_varblock(float *coeff, size_t stride, int tr, int32_t hf_mul,
+                          int channel, const jxl_dequant_matrices *dm,
+                          const jxl_quantizer *q, float qm_scale,
+                          float quant_bias, float quant_bias_numerator);
+void jxl_transform_varblock(float *coeff, size_t stride, int tr);
+void jxl_fill_varblock_lf(float *coeff, size_t stride, int tr,
+                          const float *lf, size_t lf_stride, uint32_t lf_x,
+                          uint32_t lf_y);
+
+/* ===================================================================== */
+/* filter -- gaborish and the edge-preserving filter                      */
+/* ===================================================================== */
+
+int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
+                    size_t stride, const float weights[3][2]);
+int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
+                  size_t stride, const float *sigma, uint32_t sigma_stride,
+                  const jxl_epf *epf);
+
+/* ===================================================================== */
+/* color -- XYB and transfer functions                                    */
+/* ===================================================================== */
+
+void jxl_xyb_to_linear(float *x, float *y, float *b, size_t n,
+                       const float opsin_inv[9], const float opsin_bias[3],
+                       float intensity_target);
+void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
+                      float intensity_target);
+
+/* ===================================================================== */
 /* decode -- frame decoding into float planes                             */
 /* ===================================================================== */
 

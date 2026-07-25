@@ -1,0 +1,184 @@
+// corpus.ts -- the test/bench corpus.
+//
+// libjxl's testdata/ carries only a handful of .jxl files, so the corpus is
+// *generated*: every source image in testdata is encoded with cjxl across a
+// matrix of settings that covers the format's feature space (modular vs
+// VarDCT, lossless vs lossy, effort levels, squeeze, progressive, alpha).
+// Results are cached in deps/corpus/ and regenerated only when missing.
+//
+// JXL_SPECS=<dir> overrides the corpus with any directory of .jxl files
+// (scanned recursively), the way DJVU_SPECS does in djvudec.
+import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "fs";
+import { basename, isAbsolute, join, relative } from "path";
+import { DEPS_DIR, LIBJXL_DIR, refTool } from "./get-deps";
+import { pngToPam } from "./png";
+
+const CORPUS_DIR = join(DEPS_DIR, "corpus");
+const SRC_DIR = join(CORPUS_DIR, "src");
+const GEN_DIR = join(CORPUS_DIR, "gen");
+
+/** cjxl settings, one per generated variant. */
+export const PRESETS: { name: string; args: string[] }[] = [
+  { name: "m_e1", args: ["-d", "0", "-e", "1"] },
+  { name: "m_e3", args: ["-d", "0", "-e", "3"] },
+  { name: "m_e7", args: ["-d", "0", "-e", "7"] },
+  { name: "m_e9", args: ["-d", "0", "-e", "9"] },
+  { name: "m_resp", args: ["-d", "0", "-e", "7", "--responsive=1"] },
+  { name: "v_e3", args: ["-d", "1", "-e", "3"] },
+  { name: "v_d1", args: ["-d", "1", "-e", "7"] },
+  { name: "v_d05", args: ["-d", "0.5", "-e", "7"] },
+  { name: "v_prog", args: ["-d", "1", "-e", "7", "--progressive"] },
+  { name: "lm_d1", args: ["-d", "1", "-e", "7", "-m", "1"] },
+];
+
+function walk(dir: string, pred: (name: string) => boolean): string[] {
+  if (!existsSync(dir)) return [];
+  const out: string[] = [];
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name);
+    if (statSync(p).isDirectory()) out.push(...walk(p, pred));
+    else if (pred(name)) out.push(p);
+  }
+  return out;
+}
+
+/** Source images shipped in libjxl's testdata, converted to PAM once. */
+export function sourceImages(): string[] {
+  mkdirSync(SRC_DIR, { recursive: true });
+  const pngs = walk(join(LIBJXL_DIR, "testdata"), (n) =>
+    n.toLowerCase().endsWith(".png"),
+  );
+  const out: string[] = [];
+  for (const png of pngs) {
+    const pam = join(SRC_DIR, basename(png).replace(/\.png$/i, ".pam"));
+    if (!existsSync(pam)) {
+      try {
+        pngToPam(png, pam);
+      } catch (e) {
+        console.warn(`corpus: skipping ${basename(png)}: ${e}`);
+        continue;
+      }
+    }
+    out.push(pam);
+  }
+  return out.sort();
+}
+
+function runCjxl(src: string, dst: string, args: string[]): boolean {
+  const r = Bun.spawnSync({
+    cmd: [refTool("cjxl"), src, dst, ...args],
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  if (r.exitCode !== 0 || !existsSync(dst)) {
+    return false;
+  }
+  return true;
+}
+
+/** Generates (once) and returns every corpus .jxl file. */
+export function corpusFiles(presets = PRESETS.map((p) => p.name)): string[] {
+  if (process.env.JXL_SPECS) {
+    return walk(process.env.JXL_SPECS, (n) => n.toLowerCase().endsWith(".jxl")).sort();
+  }
+  mkdirSync(GEN_DIR, { recursive: true });
+  const srcs = sourceImages();
+  const out: string[] = [];
+  let generated = 0;
+  for (const src of srcs) {
+    const base = basename(src).replace(/\.pam$/, "");
+    for (const preset of PRESETS) {
+      if (!presets.includes(preset.name)) continue;
+      const dst = join(GEN_DIR, `${base}.${preset.name}.jxl`);
+      if (!existsSync(dst)) {
+        if (!runCjxl(src, dst, preset.args)) continue;
+        generated++;
+        if (generated % 25 === 0) console.log(`corpus: generated ${generated} files...`);
+      }
+      out.push(dst);
+    }
+  }
+  // The .jxl files that ship with libjxl exercise things cjxl won't emit
+  // (splines, animation, odd containers).
+  out.push(...walk(join(LIBJXL_DIR, "testdata", "jxl"), (n) =>
+    n.toLowerCase().endsWith(".jxl"),
+  ));
+  if (generated) console.log(`corpus: generated ${generated} file(s)`);
+  return out.sort();
+}
+
+export function pickRandom(files: string[], n: number): string[] {
+  const shuffled = [...files];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled.slice(0, Math.max(0, Math.min(n, shuffled.length)));
+}
+
+// Shared file selection: explicit paths, -rand N, or -all. With none of
+// those, print usageText and exit 2 (the djvudec convention).
+export function selectFiles(usageText: string, valueFlags = ["-rand", "-cpu", "-preset"]): string[] {
+  const argv = process.argv.slice(2);
+  const explicit = argv.filter(
+    (a, i) => !a.startsWith("-") && !valueFlags.includes(argv[i - 1] ?? ""),
+  );
+  const pi = argv.indexOf("-preset");
+  const presets = pi >= 0 ? argv[pi + 1].split(",") : undefined;
+
+  if (argv.includes("-all")) return corpusFiles(presets);
+  const ri = argv.indexOf("-rand");
+  if (ri >= 0) {
+    const n = parseInt(argv[ri + 1] ?? "");
+    if (!(n > 0)) {
+      console.log(usageText);
+      process.exit(2);
+    }
+    const all = corpusFiles(presets);
+    const picked = pickRandom(all, n);
+    console.log(`(${picked.length} random of ${all.length} corpus files)`);
+    return picked;
+  }
+  if (explicit.length > 0) {
+    for (const f of explicit) {
+      if (!existsSync(f)) {
+        console.error(`no such file: ${f}`);
+        process.exit(1);
+      }
+    }
+    return explicit;
+  }
+  console.log(usageText);
+  process.exit(2);
+}
+
+export function fmtBytesHuman(n: number): string {
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(2)} GB`;
+  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${n} B`;
+}
+
+export function fileLabel(f: string, root: string): string {
+  let rel = relative(root, f);
+  if (rel.startsWith("..") || isAbsolute(rel)) rel = f;
+  rel = rel.replaceAll("\\", "/");
+  return `${rel} (${fmtBytesHuman(statSync(f).size)})`;
+}
+
+export function corpusSummary(): string {
+  const src = process.env.JXL_SPECS
+    ? `JXL_SPECS=${process.env.JXL_SPECS}`
+    : `deps/corpus (generated from libjxl testdata; ${PRESETS.length} presets)`;
+  const dir = process.env.JXL_SPECS ?? GEN_DIR;
+  const n = existsSync(dir)
+    ? walk(dir, (x) => x.toLowerCase().endsWith(".jxl")).length
+    : 0;
+  return `${n} .jxl file(s) available from ${src}`;
+}
+
+if (import.meta.main) {
+  const files = corpusFiles();
+  console.log(`${files.length} corpus files in ${GEN_DIR}`);
+  writeFileSync(join(CORPUS_DIR, "files.txt"), files.join("\n") + "\n");
+}
