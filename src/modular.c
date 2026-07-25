@@ -84,6 +84,107 @@ static void chanlist_remove_range(jxl_chanlist *cl, uint32_t from, uint32_t to) 
 /* MA tree                                                                */
 /* ===================================================================== */
 
+/* Both arrays grow together: bnode[] is scratch that remembers which binary
+   node each flat slot still has to be filled from. */
+static int ma_flat_grow(jxl_ctx *ctx, jxl_ma_flat **flat, uint32_t **bnode,
+                        uint32_t *cap, uint32_t need) {
+    uint32_t ncap = *cap ? *cap : 16;
+    jxl_ma_flat *nf;
+    uint32_t *nb;
+
+    if (need <= *cap) return 0;
+    while (ncap < need) ncap *= 2;
+    nf = (jxl_ma_flat *)jxl_realloc_array(ctx, *flat, *cap, ncap,
+                                          sizeof(jxl_ma_flat));
+    if (!nf) return -1;
+    *flat = nf;
+    nb = (uint32_t *)jxl_realloc_array(ctx, *bnode, *cap, ncap,
+                                       sizeof(uint32_t));
+    if (!nb) return -1;
+    *bnode = nb;
+    *cap = ncap;
+    return 0;
+}
+
+/* Rewrite the binary tree into the two-levels-per-entry form that
+   ma_get_leaf walks. Slots are filled breadth-first: by the time the loop
+   reaches slot fi, bnode[fi] names the binary node it stands for, and filling
+   it appends the four grandchild slots to the end. A leaf is copied in whole,
+   so a finished walk needs no further indirection; a child that is a leaf has
+   no test to contribute, so its slot in the parent gets property 0 with a
+   split no property value can exceed and both its grandchild slots hold that
+   same leaf. */
+static int ma_flatten(jxl_ctx *ctx, jxl_ma_config *ma, const jxl_ma_node *raw,
+                      uint32_t count, uint32_t root,
+                      const jxl_ma_leaf *leaves) {
+    jxl_ma_flat *flat = NULL;
+    uint32_t *bnode = NULL;
+    uint32_t cap = 0, n = 0, fi;
+    int rc = -1;
+
+    if (ma_flat_grow(ctx, &flat, &bnode, &cap, 1) != 0) goto done;
+    bnode[0] = root;
+    n = 1;
+
+    for (fi = 0; fi < n; fi++) {
+        uint32_t b = bnode[fi], base, side;
+
+        if (raw[b].property < 0) {
+            flat[fi].property = -1;
+            flat[fi].u.leaf = leaves[raw[b].child];
+            continue;
+        }
+        /* Each entry that is not a leaf appends four and consumes a distinct
+           decision node, so this bound cannot be reached by a well-formed
+           tree; it just keeps a malformed one from allocating without end. */
+        if (n > 4 * count + 4) {
+            JXL_ERR(ctx, "modular: MA tree does not flatten");
+            goto done;
+        }
+        if (ma_flat_grow(ctx, &flat, &bnode, &cap, n + 4) != 0) goto done;
+        base = n;
+        n += 4;
+        flat[fi].property = raw[b].property;
+        flat[fi].u.dec.split0 = raw[b].value;
+        flat[fi].u.dec.child = base;
+
+        for (side = 0; side < 2; side++) {
+            uint32_t c = raw[b].child + side;   /* left, then right */
+            uint32_t slot = base + 2 * side;
+            int32_t p, s;
+
+            if (raw[c].property < 0) {
+                p = 0;
+                s = 0x7fffffff;
+                bnode[slot] = c;
+                bnode[slot + 1] = c;
+            } else {
+                p = raw[c].property;
+                s = raw[c].value;
+                bnode[slot] = raw[c].child;
+                bnode[slot + 1] = raw[c].child + 1;
+            }
+            if (side == 0) {
+                flat[fi].u.dec.prop1 = p;
+                flat[fi].u.dec.split1 = s;
+            } else {
+                flat[fi].u.dec.prop2 = p;
+                flat[fi].u.dec.split2 = s;
+            }
+        }
+    }
+
+    ma->flat = flat;
+    ma->nflat = n;
+    flat = NULL;
+    rc = 0;
+
+done:
+    jxl_free(ctx, bnode);
+    jxl_free(ctx, flat);
+    return rc;
+}
+
 /* Nodes arrive in a "folding" order: a running counter says how many are
    still expected, and the tree is rebuilt afterwards by walking the list
    backwards through a queue (matching libjxl's DecodeTree). */
@@ -257,14 +358,8 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
             goto done;
         }
     }
-    ma->root = dq[dq_head];
-    ma->nodes = raw;
-    ma->leaves = leaves;
-    ma->count = count;
-    ma->nleaves = ctx_count;
+    if (ma_flatten(ctx, ma, raw, count, dq[dq_head], leaves) != 0) goto done;
     ma->valid = 1;
-    raw = NULL;
-    leaves = NULL;
     rc = 0;
 
 done:
@@ -278,12 +373,9 @@ done:
 
 void jxl_ma_config_free(jxl_ctx *ctx, jxl_ma_config *ma) {
     if (!ma) return;
-    jxl_free(ctx, ma->nodes);
-    ma->nodes = NULL;
-    ma->count = 0;
-    jxl_free(ctx, ma->leaves);
-    ma->leaves = NULL;
-    ma->nleaves = 0;
+    jxl_free(ctx, ma->flat);
+    ma->flat = NULL;
+    ma->nflat = 0;
     jxl_dec_free(&ma->dec);
     ma->valid = 0;
 }
@@ -1489,38 +1581,56 @@ int jxl_modular_transform_channels(jxl_ctx *ctx, jxl_modular *m,
 static const jxl_ma_leaf *ma_get_leaf(const jxl_ma_config *ma,
                                       const jxl_pred_state *ps,
                                       const jxl_props *pr) {
-    const jxl_ma_node *nodes = ma->nodes;
-    const jxl_ma_node *node = &nodes[ma->root];
-    while (node->property >= 0) {
-        int32_t p = node->property;
+    const jxl_ma_flat *flat = ma->flat;
+    const jxl_ma_flat *f = flat;
+    while (f->property >= 0) {
+        int32_t p = f->property, s;
         int32_t v = p < 16 ? pr->cache[p]
                            : props_get_extra(ps, (uint32_t)p - 16);
-        node = &nodes[node->child + (v <= node->value)];
+        uint32_t o0 = v > f->u.dec.split0 ? 0u : 1u;
+        if (o0) { p = f->u.dec.prop2; s = f->u.dec.split2; }
+        else    { p = f->u.dec.prop1; s = f->u.dec.split1; }
+        v = p < 16 ? pr->cache[p] : props_get_extra(ps, (uint32_t)p - 16);
+        f = &flat[f->u.dec.child + 2 * o0 + (v > s ? 0u : 1u)];
     }
-    return &ma->leaves[node->child];
+    return &f->u.leaf;
 }
 
 /* True when the tree can ask for the self-correcting predictor or property
    15, the only cases where running it is needed. */
 static int ma_needs_self_correcting(const jxl_ma_config *ma) {
     uint32_t i;
-    for (i = 0; i < ma->count; i++) {
-        if (ma->nodes[i].property == 15) return 1;
-    }
-    for (i = 0; i < ma->nleaves; i++) {
-        if (ma->leaves[i].predictor == JXL_PRED_SELF_CORRECTING) return 1;
+    for (i = 0; i < ma->nflat; i++) {
+        const jxl_ma_flat *f = &ma->flat[i];
+        if (f->property < 0) {
+            if (f->u.leaf.predictor == JXL_PRED_SELF_CORRECTING) return 1;
+        } else if (f->property == 15 || f->u.dec.prop1 == 15 ||
+                   f->u.dec.prop2 == 15) {
+            return 1;
+        }
     }
     return 0;
 }
 
-/* Deepest previous-channel index any property in the tree can reach. */
+/* Deepest previous-channel index any property in the tree can reach. Every
+   test lives in some entry's property/prop1/prop2, and the filler property a
+   leaf child gets is 0, so it never contributes. */
 static uint32_t ma_max_prev_channels(const jxl_ma_config *ma) {
     uint32_t i, max = 0;
-    for (i = 0; i < ma->count; i++) {
-        int32_t p = ma->nodes[i].property;
-        if (p >= 16) {
-            uint32_t d = ((uint32_t)p - 16) / 4 + 1;
-            if (d > max) max = d;
+    for (i = 0; i < ma->nflat; i++) {
+        const jxl_ma_flat *f = &ma->flat[i];
+        int32_t props[3];
+        int k;
+
+        if (f->property < 0) continue;
+        props[0] = f->property;
+        props[1] = f->u.dec.prop1;
+        props[2] = f->u.dec.prop2;
+        for (k = 0; k < 3; k++) {
+            if (props[k] >= 16) {
+                uint32_t d = ((uint32_t)props[k] - 16) / 4 + 1;
+                if (d > max) max = d;
+            }
         }
     }
     return max;

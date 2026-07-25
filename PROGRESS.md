@@ -53,8 +53,8 @@ is met for sRGB content.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-821-file corpus we are **2.64x libjxl** (was 3.22x). libjxl is AVX2; we are
-scalar C, so a constant factor is expected.
+821-file corpus we are **2.54x libjxl** (was 3.22x, then 2.64x). libjxl is
+AVX2; we are scalar C, so a constant factor is expected.
 
 `bun cmd/prof.ts <file.jxl>` profiles our decoder alone through the sibling
 `../samply` and prints samply's `-print-agent` report (top self-time
@@ -172,14 +172,53 @@ Interleaved A/B, 5 runs, two passes, libjxl column flat throughout:
 | `flower_alpha.m_e3` (control) | 852ms | 847ms |
 | total of the five | 4549ms | 4454ms (-2.1%) |
 
-### What is left in the MA walk
-`ma_get_leaf` is still ~69% of a lossy-Modular decode. Both wins so far made
-the chain *narrower*; the remaining lever is making it *shorter*. Average leaf
-depth is 16.7 (max 31) on `flower_alpha.lm_d1`, 10.9 on `flower.lm_d1`, 5.1 on
-the small `m_e3` trees -- so the worst file serializes ~17 dependent loads per
-sample. libjxl flattens two tree levels into one 32-byte node, halving that;
-it does not shrink the working set (same bytes per level) but it halves both
-the latency chain and the number of cache lines a walk touches.
+### Two tree levels per entry: the walk's chain, halved
+The two shrinks above made the chain *narrower*. This one makes it *shorter*,
+and it is worth more than both together. Average leaf depth is 16.7 (max 31)
+on `flower_alpha.lm_d1`, 10.9 on `flower.lm_d1`, 5.1 on the small `m_e3`
+trees, so the worst file serialised ~17 dependent loads per sample.
+
+Each entry now holds two levels: its own test plus the test at whichever child
+that first test selects. The four grandchildren sit contiguously at
+`child + 0..3` as LL, LR, RL, RR, so the second level picks
+`child + 2*o0 + o1` and one load advances two levels. A leaf carries its
+payload inline instead of pointing into a side array, which also removes the
+last indirection of every walk. A child that is a leaf has no test to
+contribute: its slot gets property 0 (the channel index -- always defined,
+always cheap) with a split of `INT32_MAX`, so the comparison is
+unconditionally false and both of its grandchild slots hold that same leaf.
+
+Interleaved A/B, 5 runs, two passes, libjxl column flat throughout:
+
+| file | one level | two levels |
+|---|---|---|
+| `flower_alpha.lm_d1` | 1126ms, 3.90x | 991ms, 3.40x |
+| `flower_alpha.m_e9` | 1203ms, 1.72x | 1099ms, 1.55x |
+| `flower.lm_d1` | 581ms, 3.54x | 549ms, 3.26x |
+| `splines.lm_d1` | 666ms, 5.31x | 637ms, 4.92x |
+| `flower_alpha.m_e3` | 854ms, 2.21x | 821ms, 2.12x |
+| total of the five | 4430ms | 4097ms (-7.5%) |
+| corpus total | 2.71x | **2.54x** |
+
+`ma_get_leaf` is 8225 samples, from 9374 before this change and 11025 at the
+start of the three. Unlike the two shrinks, this one also helps the 67-node
+`m_e3` trees, which is the expected signature of a load-*count* win rather
+than a footprint one.
+
+### Correction: node size was not the mechanism
+The two entries below explain their gains as cache-footprint effects. A later
+experiment says that is wrong, so do not reason from it. Padding the 12-byte
+node back out to 20 with a field nothing ever reads -- pure footprint, no
+extra loads, no extra work -- costs **nothing measurable** (3726/3760ms padded
+against 3770/3758ms unpadded over four alternating runs). At these sizes the
+array footprint is simply not the binding constraint.
+
+The gains were real and repeatable, but they came from the fields that were
+*removed being fields the walk actually loaded* -- `right` every step, and the
+leaf payload riding along in the same access -- not from the array getting
+smaller. That is also why the flattening above pays so much better: it attacks
+the number of dependent loads, which is what actually binds. When optimizing
+this walk, count loads, not bytes.
 
 ### MA tree walk: a leaf is now always a leaf (not a speedup)
 `ma_get_leaf` carried a step counter that `break`s out of the walk once it

@@ -347,27 +347,19 @@ typedef enum {
     JXL_PRED_AVG_ALL
 } jxl_predictor;
 
-/* Split in two because the tree walk is memory-bound, not compute-bound: a
-   big tree (1901 nodes for flower_alpha.lm_d1, walked to an average leaf
-   depth of 16.7) overflows L1 at 28 bytes per node, and every level of every
-   walk is a dependent load. These three fields are all the walk reads, so at
-   12 bytes better than five decision nodes share a cache line. The node array
-   is breadth-first, which puts the decision nodes -- the only ones a walk
-   passes through -- in its first half, so the part that stays resident is
-   half of an already shrunken array.
-
+/* The binary MA tree as decoded, used only while building the flat form.
    Only one child index is stored: the rebuild in jxl_ma_config_read feeds a
    FIFO with strictly decreasing indices and pops two per decision node, so
    the children are always neighbours with the right one second. `child` is
    the left child and `child + 1` the right; jxl_ma_config_read rejects a tree
-   where that does not hold. For a leaf, `child` indexes into leaves[]. */
+   where that does not hold. For a leaf, `child` indexes into the leaf list. */
 typedef struct {
     int32_t property;     /* -1 marks a leaf */
     int32_t value;
     uint32_t child;
 } jxl_ma_node;
 
-/* The rest of a leaf, read once per sample once the walk has finished. */
+/* What a leaf carries: the predictor to run and how to scale its residual. */
 typedef struct {
     int32_t offset;
     uint32_t multiplier;
@@ -375,12 +367,39 @@ typedef struct {
     uint8_t predictor;
 } jxl_ma_leaf;
 
+/* The walked form. Decoding a sample is one root-to-leaf walk, and the walk
+   is bound by the length of its chain of dependent loads, not by arithmetic
+   and not by the size of the array (padding a node from 12 to 20 bytes costs
+   nothing measurable). Average leaf depth is 16.7 on flower_alpha.lm_d1, so a
+   node-per-level walk serialises ~17 loads per sample.
+
+   So each entry holds *two* levels: its own test, plus the test at whichever
+   child that first test selects. One load then advances two levels, which
+   halves the chain. The four grandchildren sit contiguously at `child + 0..3`
+   in the order LL, LR, RL, RR, so the second level picks `child + 2*o0 + o1`.
+   A leaf carries its payload inline rather than pointing into a side array,
+   which removes the last indirection at the end of every walk.
+
+   When a child is a leaf there is no test to put in prop1/prop2. That slot
+   gets property 0 (the channel index, always cheap and always defined) with
+   a split of INT32_MAX so the comparison is unconditionally false, and both
+   of its grandchild slots hold that same leaf. */
 typedef struct {
-    jxl_ma_node *nodes;
-    jxl_ma_leaf *leaves;
-    uint32_t count;
-    uint32_t nleaves;
-    uint32_t root;
+    int32_t property;         /* -1 marks a leaf */
+    union {
+        struct {
+            int32_t split0;
+            int32_t prop1, split1;   /* test at the left child  */
+            int32_t prop2, split2;   /* test at the right child */
+            uint32_t child;          /* base of LL, LR, RL, RR  */
+        } dec;
+        jxl_ma_leaf leaf;
+    } u;
+} jxl_ma_flat;
+
+typedef struct {
+    jxl_ma_flat *flat;
+    uint32_t nflat;
     jxl_dec dec;          /* histograms for the sample stream */
     int valid;
 } jxl_ma_config;
