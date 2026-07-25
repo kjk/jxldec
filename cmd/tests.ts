@@ -40,7 +40,9 @@ options:
   -clang          build/test with clang instead of MSVC
   -asan           build and run the clang+AddressSanitizer harness
   -cpu N          worker count (default: cores - 1)
-  -tol N          max allowed abs sample difference for lossy files (default 1)
+  -tol N          max allowed abs difference in 8-bit steps (default 1);
+                  16-bit output is normalised, so the threshold means the
+                  same thing at either depth
   -v              print per-file detail even when they match
 
 ${corpusSummary()}`,
@@ -71,18 +73,26 @@ function parsePam(buf: Uint8Array): Pam | null {
   };
 }
 
-type Cmp = { same: boolean; maxDiff: number; meanDiff: number; note?: string };
+type Cmp = {
+  same: boolean;
+  maxDiff: number;      // in the file's own sample units
+  meanDiff: number;
+  scale: number;        // sample units per 8-bit step (1 or 257)
+  note?: string;
+};
 
 function compare(ours: Uint8Array, ref: Uint8Array): Cmp {
   if (ours.length === ref.length && Buffer.compare(Buffer.from(ours), Buffer.from(ref)) === 0) {
-    return { same: true, maxDiff: 0, meanDiff: 0 };
+    return { same: true, maxDiff: 0, meanDiff: 0, scale: 1 };
   }
   const a = parsePam(ours);
   const b = parsePam(ref);
-  if (!a || !b) return { same: false, maxDiff: 255, meanDiff: 255, note: "unparsable PAM" };
+  if (!a || !b) {
+    return { same: false, maxDiff: 255, meanDiff: 255, scale: 1, note: "unparsable PAM" };
+  }
   if (a.width !== b.width || a.height !== b.height || a.depth !== b.depth) {
     return {
-      same: false, maxDiff: 255, meanDiff: 255,
+      same: false, maxDiff: 255, meanDiff: 255, scale: 1,
       note: `geometry ${a.width}x${a.height}x${a.depth} vs ${b.width}x${b.height}x${b.depth}`,
     };
   }
@@ -105,7 +115,9 @@ function compare(ours: Uint8Array, ref: Uint8Array): Cmp {
       count++;
     }
   }
-  return { same: false, maxDiff, meanDiff: count ? sum / count : 0 };
+  // 16-bit output has 257 sample steps per 8-bit step; compare like for like.
+  const scale = a.maxval > 255 ? 257 : 1;
+  return { same: false, maxDiff, meanDiff: count ? sum / count : 0, scale };
 }
 
 type Result = { file: string; ok: boolean; msg: string; ms: number };
@@ -144,8 +156,14 @@ async function testOne(file: string, slot: number): Promise<Result> {
                       new Uint8Array(readFileSync(refPam)));
   if (cmp.same) return { file, ok: true, msg: "same", ms };
   if (cmp.note) return { file, ok: false, msg: `diff ${cmp.note}`, ms };
-  const detail = `max ${cmp.maxDiff}, mean ${cmp.meanDiff.toFixed(3)}`;
-  if (cmp.maxDiff <= TOL) return { file, ok: true, msg: `close (${detail})`, ms };
+  // Tolerances are expressed in 8-bit steps regardless of the output depth.
+  const max8 = cmp.maxDiff / cmp.scale;
+  const mean8 = cmp.meanDiff / cmp.scale;
+  const detail =
+    cmp.scale === 1
+      ? `max ${cmp.maxDiff}, mean ${cmp.meanDiff.toFixed(3)}`
+      : `max ${max8.toFixed(2)}/8bit (${cmp.maxDiff}/16bit), mean ${mean8.toFixed(3)}`;
+  if (max8 <= TOL) return { file, ok: true, msg: `close (${detail})`, ms };
   return { file, ok: false, msg: `DIFF (${detail})`, ms };
 }
 

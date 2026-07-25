@@ -21,6 +21,15 @@ jxl_doc *jxl_doc_open(jxl_ctx *ctx, const uint8_t *data, size_t len) {
 
     if (doc->meta.colour.want_icc) {
         if (jxl_read_icc(ctx, &br, &doc->icc, &doc->icc_len) != 0) goto fail;
+        /* The enumerated primaries/white-point/transfer fields were not
+           coded, and reconstructing them from the profile is not what libjxl
+           does: without a CMS it falls back to linear sRGB and hands the
+           profile to the caller (jxl_doc_icc_profile) to color-manage. Match
+           that, so our output equals djxl's. */
+        doc->meta.colour.primaries = JXL_PRIMARIES_SRGB;
+        doc->meta.colour.white_point = JXL_WP_D65;
+        doc->meta.colour.tf_have_gamma = 0;
+        doc->meta.colour.tf = JXL_TF_LINEAR;
     }
     jxl_br_zero_pad_to_byte(&br);
     if (br.err) {

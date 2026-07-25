@@ -912,7 +912,16 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
             jxl_linear_to_tf(out->plane[i].data, n, &meta->colour,
                              meta->tone_mapping.intensity_target);
         }
-        if (meta->colour.colour_space == JXL_CS_GRAY) out->ncolor = 1;
+        /* Grayscale XYB decodes into three identical planes; drop two so the
+           extra channels (alpha!) keep their expected plane indices. */
+        if (meta->colour.colour_space == JXL_CS_GRAY && out->ncolor == 3) {
+            uint32_t k;
+            jxl_free(ctx, out->plane[1].data);
+            jxl_free(ctx, out->plane[2].data);
+            for (k = 3; k < out->nplane; k++) out->plane[k - 2] = out->plane[k];
+            out->nplane -= 2;
+            out->ncolor = 1;
+        }
     }
     rc = 0;
 

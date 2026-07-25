@@ -17,6 +17,13 @@ const CORPUS_DIR = join(DEPS_DIR, "corpus");
 const SRC_DIR = join(CORPUS_DIR, "src");
 const GEN_DIR = join(CORPUS_DIR, "gen");
 
+// ProPhoto is wide enough that cjxl keeps the profile verbatim instead of
+// matching it to an enum.
+const ICC_PROFILE = join(
+  LIBJXL_DIR, "testdata", "external", "Compact-ICC-Profiles", "profiles",
+  "ProPhoto-v4.icc",
+);
+
 /** cjxl settings, one per generated variant. */
 export const PRESETS: { name: string; args: string[] }[] = [
   { name: "m_e1", args: ["-d", "0", "-e", "1"] },
@@ -29,6 +36,10 @@ export const PRESETS: { name: string; args: string[] }[] = [
   { name: "v_d05", args: ["-d", "0.5", "-e", "7"] },
   { name: "v_prog", args: ["-d", "1", "-e", "7", "--progressive"] },
   { name: "lm_d1", args: ["-d", "1", "-e", "7", "-m", "1"] },
+  // An ICC profile cjxl cannot reduce to the enumerated colour fields, so the
+  // codestream carries the profile itself and the decoder takes the
+  // want_icc path.
+  { name: "v_icc", args: ["-d", "1", "-e", "7", "-x", `icc_pathname=${ICC_PROFILE}`] },
 ];
 
 function walk(dir: string, pred: (name: string) => boolean): string[] {
