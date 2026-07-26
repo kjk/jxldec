@@ -171,6 +171,50 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### The sRGB transfer function eight wide, after getting it wrong once
+With `flower.v_e3` (pure VarDCT, 2.13x) profiled properly, the stage-by-stage
+comparison against libjxl is:
+
+| stage | ours | libjxl |
+|---|---|---|
+| EPF | `epf_row8` **14.8%** | `EPF1Stage::ProcessRow` 4.5% |
+| sRGB transfer | `tf_srgb_x4` **6.4%** | `FromLinearStage` 2.2% |
+| entropy | `dec_read_symbol` 5.4% | `ReadHybridUintClustered` 6.2% |
+| HF coefficients | 11.0% incl | `DecodeACVarBlock` 8.7% incl |
+
+Entropy decoding is at parity, which is worth knowing. The transfer function
+is the one with an obvious cause -- libjxl runs its render pipeline eight wide
+and we were four -- so that is the one taken here.
+
+The first attempt was **2% slower**. Everything either side of the table
+lookup widened cleanly, but the sixteen-entry power table cannot be indexed
+from a vector, so eight indices are spilled to memory, looked up as scalars,
+and reassembled. Writing them back and reloading the buffer with a 32-byte
+load is eight narrow stores followed by a wide load of the same address, which
+cannot store-forward; that stall cost more than the extra width won. The
+four-lane version had never had the problem because it reassembles with
+`_mm_setr_epi32`, in registers. Doing the same with `_mm256_setr_epi32` turned
+a 2% loss into a win.
+
+Modest but real -- five VarDCT presets aggregated, five runs, three passes:
+
+| | 4-lane | 8-lane |
+|---|---|---|
+| pass 3 | 1.7365x (4566ms) | **1.7143x (4472ms)** |
+| pass 4 | 1.7397x (4560ms) | **1.7125x (4496ms)** |
+| pass 5 | 1.7400x (4555ms) | **1.7208x (4500ms)** |
+
+About 1.3%, no overlap. Scalar, SSE2-only and AVX2 all diffed byte-identical
+over the 1242 corpus files. Corpus **1.45x -> 1.44x**. ASan clean, 115
+reproducers clean, amalgamation compiles.
+
+EPF is left alone deliberately. It is the bigger gap at 3.3x, but counting the
+work does not explain it: the four 5-point SAD windows share only 4 of their
+20 absolute differences, and libjxl's own kernel comes out only ~25% cheaper
+on an operation count. Something else accounts for the rest, and guessing at
+it would be the third speculative EPF change in a row. It wants a proper
+investigation, not a patch.
+
 ### Profiling the right file: noise synthesis, and a measurement mistake
 Re-profiling turned up something that had been hidden for several rounds. The
 VarDCT presets were being profiled on `flower_alpha`, and those files carry an

@@ -20,6 +20,7 @@
      (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
 #define JXL_COLOR_SSE2 1
 #include <emmintrin.h>
+#include <immintrin.h>
 #endif
 
 
@@ -261,6 +262,68 @@ static void tf_srgb_x4(float *v, size_t n, size_t *pos) {
     *pos = i;
 }
 
+/* Eight lanes of tf_srgb, operation for operation with the four-lane version
+   above. The profile of a pure VarDCT file put this at 6.4% against libjxl's
+   equivalent stage at 2.2%, and the difference is width -- libjxl runs its
+   render pipeline eight wide on AVX2.
+
+   The sixteen-entry power table is the one part that does not widen: SSE2 and
+   AVX2 both have to leave the vector to index it, so the eight indices are
+   spilled and read back as scalars. Everything either side of that is twice
+   as wide, and no FMA, so the result matches the four-lane path bit for bit. */
+JXL_TARGET_AVX2
+static void tf_srgb_x8(float *v, size_t n, size_t *pos) {
+    const __m256i signmask = _mm256_set1_epi32((int)0x80000000u);
+    const __m256i absmask = _mm256_set1_epi32(0x7fffffff);
+    const __m256i adj_or = _mm256_set1_epi32(0x3e800000);
+    const __m256i adj_and = _mm256_set1_epi32(0x3effffff);
+    const __m256 k3 = _mm256_set1_ps(0.059914046f);
+    const __m256 k2 = _mm256_set1_ps(-0.10889456f);
+    const __m256 k1 = _mm256_set1_ps(0.107963754f);
+    const __m256 k0 = _mm256_set1_ps(0.018092343f);
+    const __m256 c1292 = _mm256_set1_ps(12.92f), c055 = _mm256_set1_ps(0.055f);
+    const __m256 cutoff = _mm256_set1_ps(0.0031308f);
+    size_t i = *pos;
+    for (; i + 8 <= n; i += 8) {
+        __m256i bits = _mm256_castps_si256(_mm256_loadu_ps(v + i));
+        __m256i sign = _mm256_and_si256(bits, signmask);
+        __m256i vi = _mm256_and_si256(bits, absmask);
+        __m256 v_adj = _mm256_castsi256_ps(
+            _mm256_and_si256(_mm256_or_si256(vi, adj_or), adj_and));
+        __m256 pw = _mm256_add_ps(_mm256_mul_ps(k3, v_adj), k2);
+        __m256 fv = _mm256_castsi256_ps(vi);
+        __m256i idx = _mm256_and_si256(
+            _mm256_sub_epi32(_mm256_srli_epi32(vi, 23), _mm256_set1_epi32(118)),
+            _mm256_set1_epi32(0xf));
+        int ix[8];
+        __m256i mul_bits;
+        __m256 small, acc, out, m;
+        int j;
+        pw = _mm256_add_ps(_mm256_mul_ps(pw, v_adj), k1);
+        pw = _mm256_add_ps(_mm256_mul_ps(pw, v_adj), k0);
+        _mm256_storeu_si256((__m256i *)ix, idx);
+        /* Rebuilt in registers rather than written back and reloaded: eight
+           narrow stores followed by a 32-byte load of the same buffer cannot
+           store-forward, and that stall cost more than the extra width won. */
+        for (j = 0; j < 8; j++) {
+            ix[j] = (int)(0x40000000u |
+                    ((uint32_t)srgb_powtable_upper[ix[j] & 0xf] << 18) |
+                    ((uint32_t)srgb_powtable_lower[ix[j] & 0xf] << 10));
+        }
+        mul_bits = _mm256_setr_epi32(ix[0], ix[1], ix[2], ix[3],
+                                     ix[4], ix[5], ix[6], ix[7]);
+        small = _mm256_mul_ps(fv, c1292);
+        acc = _mm256_sub_ps(_mm256_mul_ps(pw, _mm256_castsi256_ps(mul_bits)),
+                            c055);
+        m = _mm256_cmp_ps(fv, cutoff, _CMP_LE_OQ);
+        out = _mm256_or_ps(_mm256_and_ps(m, small), _mm256_andnot_ps(m, acc));
+        _mm256_storeu_ps(v + i, _mm256_castsi256_ps(
+            _mm256_or_si256(_mm256_castps_si256(out), sign)));
+    }
+    _mm256_zeroupper();
+    *pos = i;
+}
+
 /* Four lanes of fast_log2f / fast_pow2f, operation for operation, so the
    vector and scalar builds agree bit for bit. SSE2 has no floor, but the
    exponent here stays well inside int32 range, so truncate-and-correct is
@@ -360,6 +423,7 @@ void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
         default:
             i = 0;
 #ifdef JXL_COLOR_SSE2
+            if (jxl_has_avx2()) tf_srgb_x8(v, n, &i);
             tf_srgb_x4(v, n, &i);
 #endif
             for (; i < n; i++) v[i] = tf_srgb(v[i]);
