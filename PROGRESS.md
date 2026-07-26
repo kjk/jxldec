@@ -169,6 +169,52 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Upsampling: across x, not across the taps
+`v_rs2` at 3.82x and `v_rs4` at 3.23x were the worst remaining ratios, and
+`jxl_upsample_plane` was 36% of a resampled file's decode -- still 35.8%
+after the easy fixes below, so the shape of the loop was the problem, not
+its details.
+
+The filter expands each input sample to an NxN block, every output of which
+is a 5x5 weighted sum of the input neighbourhood, then clamps it to the min
+and max of that neighbourhood. Written per output sample that is: gather 25
+taps into a scratch array, reduce them to a min and a max, then do NxN
+25-tap dot products each ending in a horizontal reduction.
+
+Vectorising **across x** instead changes all of it. The tap a lane wants is
+`srow[py][x + px - 2]`, so four consecutive x are four consecutive floats:
+the neighbourhood is never gathered, each tap is one unaligned load feeding
+four outputs at once, and the horizontal reduction disappears -- one
+accumulator per output column, 25 products added in plain scalar order. The
+clamp bounds come from five sliding 5-wide min/max windows over the same
+loads. Each vector then holds one output column for four input samples, so
+the row wants them interleaved: N=2 is an unpack pair, N=4 a 4x4 transpose.
+
+Two smaller fixes first, both worth having on their own: the 25-element min
+and max was 48 scalar compares per input sample, and the two innermost loops
+re-tested `dx >= out_w` and `dy >= out_h` per output sample when they can
+only fire on the last partial block. Together 3.82x -> 3.51x and
+3.23x -> 2.93x; the restructure took it the rest of the way.
+
+| | before | +bounds/minmax | +across-x |
+|---|---|---|---|
+| `v_rs2` | 3.82x | 3.51x | **2.81x** |
+| `v_rs4` | 3.23x | 2.93x | **2.63x** |
+
+The wide path handles the interior; the first and last two columns, the last
+partial block, and any plane too narrow for it still go one sample at a time.
+Those helpers are now plain scalar, which is a **correctness** improvement as
+much as a simplification: the hand-vectorised 25-tap dot product they used to
+run summed four partial accumulators and reduced them, an association the
+scalar loop does not use, so the scalar and vector builds had never actually
+agreed. Diffing the two builds over the corpus found 56 files differing.
+With the interior on the wide path and the border scalar, all 1242 agree
+byte for byte -- which is what `-DJXL_UPSAMPLE_FORCE_SCALAR` now exists to
+check.
+
+Corpus **1.76x -> 1.72x**. Verdicts against libjxl unchanged, ASan clean,
+115 reproducers clean.
+
 ### The spline splat, four and eight lanes wide
 With the Modular work done, the single worst file in the corpus was
 `splines.jxl`: 743ms lost at 4.30x, 2.5% of the whole corpus in one 81-byte

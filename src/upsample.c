@@ -60,33 +60,123 @@ static void build_kernel(float *kernel, uint32_t shift, const float *w) {
 
 /* SSE2 is baseline on x64. This is the innermost operation in the whole
    filter -- N*N of them per input sample, 25 multiply-adds each -- so it is
-   the one place worth writing by hand. */
-#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
-    (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+   the one place worth writing by hand. -DJXL_UPSAMPLE_FORCE_SCALAR builds
+   the scalar path alone, so the vector paths can be diffed against it. */
+#if !defined(JXL_UPSAMPLE_FORCE_SCALAR) && \
+    (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
+     (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
 #define JXL_UPSAMPLE_SSE2 1
 #include <emmintrin.h>
 #endif
 
-static float up_dot25(const float *a, const float *b) {
-#ifdef JXL_UPSAMPLE_SSE2
-    __m128 acc = _mm_mul_ps(_mm_loadu_ps(a), _mm_loadu_ps(b));
-    __m128 t;
-    int i;
-    for (i = 4; i + 4 <= 24; i += 4) {
-        acc = _mm_add_ps(acc, _mm_mul_ps(_mm_loadu_ps(a + i),
-                                         _mm_loadu_ps(b + i)));
+/* These two run only where up_block4 below cannot: the first two and last
+   two columns of a row, the last partial block of a row or column, and any
+   plane too narrow for the wide path at all. That is a thin border, so both
+   are left scalar -- which is also what lets the whole filter be bit-identical
+   between the scalar and vector builds. The earlier hand-vectorised dot
+   product summed four partial accumulators and reduced them, an association
+   the scalar loop does not use, so the two builds did not agree; now they do.
+*/
+static void up_minmax25(const float *a, float *out_lo, float *out_hi) {
+    float lo = a[0], hi = a[0];
+    int n;
+    for (n = 1; n < 25; n++) {
+        if (a[n] < lo) lo = a[n];
+        if (a[n] > hi) hi = a[n];
     }
-    /* 25 is odd; lanes 0..23 are vectorised and the last tap stays scalar. */
-    t = _mm_add_ps(acc, _mm_movehl_ps(acc, acc));
-    t = _mm_add_ss(t, _mm_shuffle_ps(t, t, 1));
-    return _mm_cvtss_f32(t) + a[24] * b[24];
-#else
+    *out_lo = lo;
+    *out_hi = hi;
+}
+
+static float up_dot25(const float *a, const float *b) {
     float sum = 0.0f;
     int n;
     for (n = 0; n < 25; n++) sum += a[n] * b[n];
     return sum;
-#endif
 }
+
+#ifdef JXL_UPSAMPLE_SSE2
+/* Four consecutive input samples at once, for the interior where none of
+   them needs mirroring and all of them write a full N wide block.
+
+   Vectorising across x rather than across the 25 taps changes the shape of
+   the work completely. The tap a lane needs is `srow[py][x + px - 2]`, so
+   four consecutive x are four consecutive floats: the neighbourhood never
+   has to be gathered into nb[] at all, each tap is one unaligned load, and
+   the 25 products accumulate in the plain scalar order -- no horizontal
+   reduction per output, and the result is bit-identical to the scalar path
+   rather than merely close to it, which the per-tap version was not.
+
+   Returns the number of input samples consumed, always 4. */
+static void up_block4(const float *const *srow, uint32_t x, uint32_t N,
+                      const float *kernel, float *dst_rows[8], uint32_t ny) {
+    __m128 vlo, vhi;
+    uint32_t oy, ox;
+    int py, px;
+
+    {   /* The clamp bounds for each of the four lanes: min and max over that
+           lane's own 5x5 window, taken as five sliding 5-wide windows. */
+        __m128 mn = _mm_loadu_ps(srow[0] + x - 2), mx = mn;
+        for (py = 0; py < 5; py++) {
+            const float *r = srow[py] + x - 2;
+            for (px = (py == 0) ? 1 : 0; px < 5; px++) {
+                __m128 v = _mm_loadu_ps(r + px);
+                mn = _mm_min_ps(mn, v);
+                mx = _mm_max_ps(mx, v);
+            }
+        }
+        vlo = mn;
+        vhi = mx;
+    }
+
+    for (oy = 0; oy < ny; oy++) {
+        float *drow = dst_rows[oy];
+        __m128 out[8];
+        for (ox = 0; ox < N; ox++) {
+            const float *k = kernel + ((size_t)oy * N + ox) * 25;
+            __m128 acc = _mm_setzero_ps();
+            __m128 m;
+            int t = 0;
+            for (py = 0; py < 5; py++) {
+                const float *r = srow[py] + x - 2;
+                for (px = 0; px < 5; px++, t++) {
+                    acc = _mm_add_ps(acc, _mm_mul_ps(_mm_loadu_ps(r + px),
+                                                     _mm_set1_ps(k[t])));
+                }
+            }
+            /* Select rather than min/max so an unordered compare keeps acc,
+               exactly as the scalar `if (sum < lo)` pair does. */
+            m = _mm_cmplt_ps(acc, vlo);
+            acc = _mm_or_ps(_mm_and_ps(m, vlo), _mm_andnot_ps(m, acc));
+            m = _mm_cmpgt_ps(acc, vhi);
+            acc = _mm_or_ps(_mm_and_ps(m, vhi), _mm_andnot_ps(m, acc));
+            out[ox] = acc;
+        }
+        /* Each vector holds one output column for four input samples, but
+           the row wants them interleaved. N is 2, 4 or 8; the first two are
+           a shuffle, the last falls back to lane stores. */
+        if (N == 2) {
+            _mm_storeu_ps(drow + x * 2, _mm_unpacklo_ps(out[0], out[1]));
+            _mm_storeu_ps(drow + x * 2 + 4, _mm_unpackhi_ps(out[0], out[1]));
+        } else if (N == 4) {
+            _MM_TRANSPOSE4_PS(out[0], out[1], out[2], out[3]);
+            _mm_storeu_ps(drow + x * 4, out[0]);
+            _mm_storeu_ps(drow + x * 4 + 4, out[1]);
+            _mm_storeu_ps(drow + x * 4 + 8, out[2]);
+            _mm_storeu_ps(drow + x * 4 + 12, out[3]);
+        } else {
+            for (ox = 0; ox < N; ox++) {
+                float tmp[4];
+                _mm_storeu_ps(tmp, out[ox]);
+                drow[(size_t)(x + 0) * N + ox] = tmp[0];
+                drow[(size_t)(x + 1) * N + ox] = tmp[1];
+                drow[(size_t)(x + 2) * N + ox] = tmp[2];
+                drow[(size_t)(x + 3) * N + ox] = tmp[3];
+            }
+        }
+    }
+}
+#endif
 
 /* Picks the weight set for a shift of 1, 2 or 3. */
 static const float *weights_for(const jxl_image_metadata *meta, uint32_t shift) {
@@ -126,12 +216,29 @@ int jxl_upsample_plane(jxl_ctx *ctx, jxl_fplane *p, uint32_t shift,
             srow[iy + 2] = p->data +
                 (size_t)up_mirror((int64_t)y + iy, h) * p->stride;
         }
-        for (x = 0; x < w; x++) {
+        for (x = 0; x < w; ) {
             float nb[25];
             float lo, hi;
-            uint32_t oy, ox;
+            uint32_t oy, ox, ny, nx;
             int ix;
             int n = 0;
+
+#ifdef JXL_UPSAMPLE_SSE2
+            /* Four at a time when all four are interior (no mirroring, so
+               the taps are plain contiguous loads) and all four write a
+               whole N-wide block inside the crop. */
+            if (x >= 2 && x + 6 <= w && (uint64_t)(x + 4) * N <= out_w &&
+                (uint64_t)(y + 1) * N <= out_h) {
+                float *drows[8];
+                for (oy = 0; oy < N; oy++) {
+                    drows[oy] = dst.data + (size_t)(y * N + oy) * dst.stride;
+                }
+                up_block4(srow, x, N, kernel, drows, N);
+                x += 4;
+                continue;
+            }
+#endif
+
             if (x >= 2 && x + 2 < w) {
                 for (iy = 0; iy < 5; iy++) {
                     const float *r = srow[iy] + x - 2;
@@ -146,27 +253,28 @@ int jxl_upsample_plane(jxl_ctx *ctx, jxl_fplane *p, uint32_t shift,
                     }
                 }
             }
-            lo = hi = nb[0];
-            for (n = 1; n < 25; n++) {
-                if (nb[n] < lo) lo = nb[n];
-                if (nb[n] > hi) hi = nb[n];
-            }
-            for (oy = 0; oy < N; oy++) {
-                uint32_t dy = y * N + oy;
-                float *drow;
-                if (dy >= out_h) break;
-                drow = dst.data + (size_t)dy * dst.stride;
-                for (ox = 0; ox < N; ox++) {
-                    uint32_t dx = x * N + ox;
-                    const float *k = kernel + ((size_t)oy * N + ox) * 25;
-                    float sum;
-                    if (dx >= out_w) break;
-                    sum = up_dot25(nb, k);
+            up_minmax25(nb, &lo, &hi);
+            /* The image can end mid-block, so the last input sample of a row
+               or column writes fewer than N outputs. Deciding that once per
+               input sample keeps the per-output bounds test out of the two
+               innermost loops, where it never fires except on that last
+               block. */
+            ny = y * N < out_h ? out_h - y * N : 0;
+            if (ny > N) ny = N;
+            nx = x * N < out_w ? out_w - x * N : 0;
+            if (nx > N) nx = N;
+            for (oy = 0; oy < ny; oy++) {
+                float *drow = dst.data + (size_t)(y * N + oy) * dst.stride;
+                const float *krow = kernel + ((size_t)oy * N) * 25;
+                uint32_t dx0 = x * N;
+                for (ox = 0; ox < nx; ox++) {
+                    float sum = up_dot25(nb, krow + (size_t)ox * 25);
                     if (sum < lo) sum = lo;
                     if (sum > hi) sum = hi;
-                    drow[dx] = sum;
+                    drow[dx0 + ox] = sum;
                 }
             }
+            x++;
         }
     }
 
