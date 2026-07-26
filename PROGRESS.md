@@ -169,6 +169,46 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Handing the coefficient planes over instead of copying them out
+The VarDCT coefficient planes are padded out to whole 8x8 blocks, so they are
+wider than the image. Cropping them into the output planes was a row-by-row
+`memcpy` of the whole image, three times per frame -- 41MB on a 2268x1512
+image -- plus three full-image allocations to copy into. `memcpy_repmovs` was
+**9.4%** of a VarDCT decode and `memset_repstos` another 6.0%, the two of them
+second only to the DCT.
+
+None of it was necessary. A `jxl_fplane` already carries its own stride, so
+the crop is nothing more than a smaller `w` and `h` over the same buffer: the
+plane can simply take ownership of the coefficient allocation and keep the
+block padding as stride. No copy, no second allocation, and the pages are
+already warm.
+
+What made this a real change rather than a one-liner is that two things
+downstream assumed a plane's rows were contiguous -- `jxl_ycbcr_to_rgb` and
+the `jxl_xyb_to_linear` / `jxl_linear_to_tf` pair were each handed
+`w * h` samples as one run. Both now go a row at a time, which costs nothing
+measurable: a row is thousands of samples, far more than the vector loops
+inside them need to amortise a call. Everything else in the pipeline -- the
+loop filters, upsampling, splines, noise, `write_pixels` -- was already
+reading `plane.stride` and needed no change.
+
+Every VarDCT preset moved, which is the point of it:
+
+| preset | before | after |
+|---|---|---|
+| `jpeg` | 2.28x | **2.28x** |
+| `v_prog` | 2.32x | **2.22x** |
+| `v_icc` | 2.24x | **2.09x** |
+| `v_e3` | 2.20x | **2.08x** |
+| `v_p3` | 2.17x | **2.04x** |
+| `v_d1` | 2.17x | **2.02x** |
+| `v_2020` | 2.14x | **2.01x** |
+
+Corpus **1.70x -> 1.66x**. Verdicts against libjxl unchanged, ASan clean --
+which is the check that matters here, since the fix moves ownership of an
+allocation and a stale free would show up as a double free. 115 reproducers
+clean.
+
 ### The 709 curve was paying for precision libjxl does not use
 `v_2020` sat at 2.61x while `v_p3` -- same kind of file, same pipeline --
 sat at 2.17x. The only difference is the transfer function: P3 files declare

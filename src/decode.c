@@ -947,16 +947,20 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
             scale = 1.0f / (float)((1u << bits) - 1);
         }
         if (is_vardct) {
-            uint32_t x, y;
+            /* The coefficient planes are padded out to whole blocks, so they
+               are wider than the image -- but a plane carries its own stride,
+               so the crop is just a smaller w and h over the same buffer.
+               Handing the allocation over rather than copying it out saves
+               three full-image allocations and three full-image copies per
+               frame; on a 2268x1512 image that is 41MB of memcpy that was
+               showing up as ~9% of the decode. Ownership moves, so the
+               vardct teardown must not free them again. */
             for (i = 0; i < 3; i++) {
-                if (jxl_fplane_alloc_uninit(ctx, &out->plane[i], color_w, color_h) != 0)
-                    goto done;
-                for (y = 0; y < color_h; y++) {
-                    memcpy(out->plane[i].data + (size_t)y * out->plane[i].stride,
-                           vd.coeff[i] + (size_t)y * vd.pw,
-                           (size_t)color_w * sizeof(float));
-                }
-                (void)x;
+                out->plane[i].data = vd.coeff[i];
+                out->plane[i].w = color_w;
+                out->plane[i].h = color_h;
+                out->plane[i].stride = vd.pw;
+                vd.coeff[i] = NULL;
             }
             base = 3;
         }
@@ -1049,20 +1053,37 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     }
 
     /* ----- YCbCr / XYB -> the image's color space ----- */
+    /* A plane's rows are only contiguous when its stride equals its width,
+       which stopped being true once the VarDCT coefficient planes were
+       handed over with their block padding intact. Both conversions run a
+       row at a time, which costs nothing -- a row is thousands of samples,
+       far more than enough for the vector loops inside. */
     if (apply_ct && fh->do_ycbcr && out->ncolor >= 3) {
-        size_t n = (size_t)out->plane[0].w * out->plane[0].h;
-        jxl_ycbcr_to_rgb(out->plane[0].data, out->plane[1].data,
-                         out->plane[2].data, n);
+        uint32_t row, rows = out->plane[0].h, rw = out->plane[0].w;
+        for (row = 0; row < rows; row++) {
+            jxl_ycbcr_to_rgb(out->plane[0].data + (size_t)row * out->plane[0].stride,
+                             out->plane[1].data + (size_t)row * out->plane[1].stride,
+                             out->plane[2].data + (size_t)row * out->plane[2].stride,
+                             rw);
+        }
     } else if (apply_ct && meta->xyb_encoded && out->ncolor >= 3) {
-        size_t n = (size_t)out->plane[0].w * out->plane[0].h;
+        uint32_t row, rows = out->plane[0].h, rw = out->plane[0].w;
         float opsin[9];
         jxl_opsin_matrix_for(meta, opsin);
-        jxl_xyb_to_linear(out->plane[0].data, out->plane[1].data,
-                          out->plane[2].data, n, opsin,
-                          meta->opsin_bias, meta->tone_mapping.intensity_target);
+        for (row = 0; row < rows; row++) {
+            jxl_xyb_to_linear(out->plane[0].data + (size_t)row * out->plane[0].stride,
+                              out->plane[1].data + (size_t)row * out->plane[1].stride,
+                              out->plane[2].data + (size_t)row * out->plane[2].stride,
+                              rw, opsin, meta->opsin_bias,
+                              meta->tone_mapping.intensity_target);
+        }
         for (i = 0; i < 3; i++) {
-            jxl_linear_to_tf(out->plane[i].data, n, &meta->colour,
-                             meta->tone_mapping.intensity_target);
+            for (row = 0; row < rows; row++) {
+                jxl_linear_to_tf(out->plane[i].data +
+                                     (size_t)row * out->plane[i].stride,
+                                 rw, &meta->colour,
+                                 meta->tone_mapping.intensity_target);
+            }
         }
         /* Grayscale XYB decodes into three identical planes; drop two so the
            extra channels (alpha!) keep their expected plane indices. */
