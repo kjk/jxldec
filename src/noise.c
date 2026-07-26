@@ -154,8 +154,8 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
     uint32_t group_dim = jxl_frame_group_dim(fh);
     uint32_t groups_per_row, group_rows, gx, gy;
     float *raw[3] = {NULL, NULL, NULL};
-    float *conv[3] = {NULL, NULL, NULL};
-    float *hsum = NULL;          /* one row-summed scratch, reused per channel */
+    float *hsum = NULL;          /* five row-summed rows, reused per channel */
+    uint32_t hsum_row[5];        /* which source row is in each ring slot    */
     uint64_t seed0 = ((uint64_t)visible_frames << 32) + invisible_frames;
     float lut[9];
     uint32_t x, y;
@@ -166,17 +166,22 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
     lut[8] = np->lut[7];
 
     /* Groups tile the frame and each writes its whole extent, and every
-       sample of conv is assigned, so none of these need zeroing first --
-       calloc was clearing 24 bytes per pixel that the next loop overwrote. */
+       every sample is assigned before it is read, so none of these need
+       zeroing first -- calloc was clearing bytes the next loop overwrote. */
     {
         size_t n;
         if (!jxl_size_mul((size_t)width * height, sizeof(float), &n)) goto done;
         for (c = 0; c < 3; c++) {
             raw[c] = (float *)jxl_malloc(ctx, n);
-            conv[c] = (float *)jxl_malloc(ctx, n);
-            if (!raw[c] || !conv[c]) goto done;
+            if (!raw[c]) goto done;
         }
-        hsum = (float *)jxl_malloc(ctx, n);
+        /* Five rows, not a whole plane: the vertical pass never looks further
+           than two rows either side, so the horizontal sums for a row can be
+           computed just before they are first needed and dropped once they
+           are three rows behind. That is the same total arithmetic, but the
+           scratch stays in cache instead of being a full plane written once
+           and then streamed back five times. */
+        hsum = (float *)jxl_malloc(ctx, (size_t)width * 5 * sizeof(float));
         if (!hsum) goto done;
     }
 
@@ -217,19 +222,32 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
        ten adds a sample instead of twenty-five multiply-adds, and the
        mirroring is resolved once per row rather than once per tap. */
     for (c = 0; c < 3; c++) {
-        for (y = 0; y < height; y++) {
-            noise_hbox5(raw[c] + (size_t)y * width, hsum + (size_t)y * width,
-                        width);
-        }
+        uint32_t slot;
+        for (slot = 0; slot < 5; slot++) hsum_row[slot] = (uint32_t)-1;
         for (y = 0; y < height; y++) {
             const float *rows[5];
             int dy;
+            /* Fill any of the five needed source rows that is not already in
+               the ring. Mirroring at the top and bottom repeats rows, and a
+               repeat maps to the same slot holding the same row, so it costs
+               nothing; in the interior the five rows are consecutive and land
+               in five distinct slots. */
             for (dy = -2; dy <= 2; dy++) {
-                rows[dy + 2] = hsum +
-                    (size_t)noise_mirror((int64_t)y + dy, height) * width;
+                uint32_t r = noise_mirror((int64_t)y + dy, height);
+                uint32_t sl = r % 5;
+                if (hsum_row[sl] != r) {
+                    noise_hbox5(raw[c] + (size_t)r * width,
+                                hsum + (size_t)sl * width, width);
+                    hsum_row[sl] = r;
+                }
+                rows[dy + 2] = hsum + (size_t)sl * width;
             }
+            /* In place: vbox reads centre[x] before storing dst[x], and by
+               now every horizontal sum that row y feeds has been taken. A
+               slot is only recycled for row y+5, which is first needed at
+               output row y+3 -- by which point row y is out of the window. */
             noise_vbox5(rows, raw[c] + (size_t)y * width,
-                        conv[c] + (size_t)y * width, width);
+                        raw[c] + (size_t)y * width, width);
         }
     }
 
@@ -237,9 +255,9 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
         float *rx = img->plane[0].data + (size_t)y * img->plane[0].stride;
         float *ry = img->plane[1].data + (size_t)y * img->plane[1].stride;
         float *rb = img->plane[2].data + (size_t)y * img->plane[2].stride;
-        const float *nxr = conv[0] + (size_t)y * width;
-        const float *nyr = conv[1] + (size_t)y * width;
-        const float *nbr = conv[2] + (size_t)y * width;
+        const float *nxr = raw[0] + (size_t)y * width;
+        const float *nyr = raw[1] + (size_t)y * width;
+        const float *nbr = raw[2] + (size_t)y * width;
         for (x = 0; x < width && x < img->plane[0].w; x++) {
             float gx_ = rx[x], gy_ = ry[x];
             float in_x = gx_ + gy_;
@@ -270,7 +288,6 @@ done:
     jxl_free(ctx, hsum);
     for (c = 0; c < 3; c++) {
         jxl_free(ctx, raw[c]);
-        jxl_free(ctx, conv[c]);
     }
     return rc;
 }

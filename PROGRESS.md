@@ -171,6 +171,57 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Profiling the right file: noise synthesis, and a measurement mistake
+Re-profiling turned up something that had been hidden for several rounds. The
+VarDCT presets were being profiled on `flower_alpha`, and those files carry an
+alpha channel decoded through Modular -- where we are only 1.2-1.3x -- which
+*dilutes* the ratio. Comparing the same source and preset with and without
+alpha:
+
+| preset | `flower` (no alpha) | `flower_alpha` |
+|---|---|---|
+| `v_noise` | **2.32x** | 1.55x |
+| `v_e3` | **2.13x** | 1.49x |
+| `v_d1` | **2.04x** | 1.45x |
+
+The pure VarDCT path is the weak one, and every profile taken of it so far had
+been of a file where Modular masked it. Worth remembering when picking a file
+to profile: the biggest file for a preset is not necessarily the most
+representative one.
+
+Profiling `flower.v_noise` instead put the answer immediately:
+
+| | |
+|---|---|
+| ours `jxl_render_noise` | **21.4% inclusive** |
+| libjxl `ConvolveNoiseStage::ProcessRow` | **2.6%** |
+
+with `KiPageFault` at another 9% inclusive. The reason for both is that the
+stage allocated **seven full-image float planes** -- three raw, three
+convolved, one row-sum scratch -- which is 96MB on a 2268x1512 frame, freshly
+faulted in every frame.
+
+Two of those groups were unnecessary. The vertical pass reads `centre[x]` and
+writes `dst[x]` at the same index, so it can run in place and the three
+`conv` planes disappear. And it never looks further than two rows either side,
+so the row sums do not need a plane at all: five rows in a ring, filled just
+before first use, is the same arithmetic with the scratch staying in cache
+instead of a full plane written once and streamed back five times. A slot is
+only recycled for row y+5, which is first needed at output row y+3, by which
+point row y has left the window.
+
+Seven planes to three plus five rows: **96MB -> 41MB**.
+
+| preset | 7 planes p1 / p2 | ring p1 / p2 |
+|---|---|---|
+| `v_noise` | 1.858x / 1.889x (1186/1191ms) | **1.774x / 1.772x (1124/1129ms)** |
+| `v_d1` | 1.677x / 1.681x | 1.683x / 1.688x (no noise) |
+| `v_e3` | 1.886x / 1.888x | 1.882x / 1.880x (no noise) |
+
+The two controls not moving is the check that the gain is where it claims.
+Output byte-identical to the previous commit across all 1242 corpus files.
+Corpus **1.45x**. ASan clean, 115 reproducers clean, amalgamation compiles.
+
 ### FMA: costs reproducibility, buys nothing
 The one lever left after the fused-loop rewrite failed. libjxl uses FMA in
 its upsampling stage, so the obvious place to try it is `up_block8`, which
