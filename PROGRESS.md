@@ -169,6 +169,37 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Gaborish in place, with two saved rows
+`memcpy_repmovs` was 6.0% of a VarDCT decode even after the coefficient
+planes stopped being copied out. Most of what was left was gaborish: it
+filled a full w*h scratch plane and then copied the whole thing back, three
+full passes over the image per channel, all of it through DRAM.
+
+None of that is needed. The filter writes row y from rows y-1, y and y+1 of
+the *input*, and row y+1 has not been written yet when row y is produced --
+so it can be read straight out of the plane. Only rows y-1 and y need to
+survive being overwritten, and two saved rows is enough to run the whole
+filter in place: save row y into a two-row ring just before writing over it,
+and row y-1 is still in the other half from the previous iteration. A
+row-sized buffer that stays in L1 replaces a full-image scratch plane.
+
+Measured interleaved, five runs, two passes:
+
+| preset | scratch p1 / p2 | in-place p1 / p2 |
+|---|---|---|
+| `v_icc` | 1.934x / 1.909x | **1.869x / 1.875x** |
+| `v_d1` | 1.881x / 1.879x | **1.816x / 1.822x** |
+| `jpeg` | 2.064x / 2.046x | 2.067x / 2.063x |
+
+`jpeg` does not move because those files mostly do not run gaborish at all,
+which is a reasonable check that the measurement is attributing the gain to
+the right thing.
+
+The arithmetic is untouched -- only where its inputs are read from -- so the
+output should be *exactly* what it was, and that was checked rather than
+assumed: all 1242 corpus files decode byte-identically to the previous
+commit's binary. Corpus **1.60x**. ASan clean, 115 reproducers clean.
+
 ### The DCT column pass, eight wide
 With dequantisation and chroma-from-luma vectorised, `dct_1d_v4` was left
 holding 16.5% of a VarDCT decode -- the largest single item and, unlike the

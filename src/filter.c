@@ -40,12 +40,18 @@ static uint32_t jxl_mirror(int64_t offset, uint32_t len) {
 
 int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
                     size_t stride, const float weights[3][2]) {
-    float *tmp;
+    float *ring;
     int c;
     if (w == 0 || h == 0) return 0;
-    /* Every sample is written before it is read back, so no zeroing. */
-    tmp = (float *)jxl_malloc(ctx, (size_t)w * h * sizeof(float));
-    if (!tmp) return -1;
+    /* The filter writes row y from rows y-1, y and y+1 of the input. Row y+1
+       has not been written yet when row y is produced, so it can be read
+       straight out of the plane; only rows y-1 and y need to survive being
+       overwritten. Two saved rows is therefore enough to run the whole thing
+       in place, where this used to fill a full w*h scratch plane and copy it
+       back -- three full passes over the image per channel, in DRAM, against
+       one row-sized buffer that stays in L1. */
+    ring = (float *)jxl_malloc(ctx, (size_t)w * 2 * sizeof(float));
+    if (!ring) return -1;
 
     for (c = 0; c < 3; c++) {
         float w0 = weights[c][0], w1 = weights[c][1];
@@ -59,10 +65,15 @@ int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
             /* Clamping depends only on the row, so resolve the three row
                pointers once instead of calling sample_clamped -- four
                branches -- eight times per sample. */
-            const float *rn = plane[c] + (size_t)(y > 0 ? y - 1 : 0) * stride;
-            const float *rc = plane[c] + (size_t)y * stride;
-            const float *rs = plane[c] + (size_t)(y + 1 < h ? y + 1 : h - 1) * stride;
-            float *dst = tmp + (size_t)y * w;
+            float *cur = ring + (size_t)(y & 1u) * w;
+            const float *rn, *rc, *rs;
+            float *dst = plane[c] + (size_t)y * stride;
+            /* Save row y before it is overwritten; row y-1 is still in the
+               other half of the ring from the previous iteration. */
+            memcpy(cur, dst, (size_t)w * sizeof(float));
+            rc = cur;
+            rn = y > 0 ? ring + (size_t)((y - 1) & 1u) * w : cur;
+            rs = y + 1 < h ? plane[c] + (size_t)(y + 1) * stride : cur;
             uint32_t xlo = w > 1 ? 1 : 0, xhi = w > 1 ? w - 1 : 0;
 
             for (x = 0; x < xlo; x++) {
@@ -106,12 +117,8 @@ int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
                           (rn[xm] + rn[xp] + rs[xm] + rs[xp]) * w1) * gw;
             }
         }
-        for (y = 0; y < h; y++) {
-            memcpy(plane[c] + (size_t)y * stride, tmp + (size_t)y * w,
-                   (size_t)w * sizeof(float));
-        }
     }
-    jxl_free(ctx, tmp);
+    jxl_free(ctx, ring);
     return 0;
 }
 
