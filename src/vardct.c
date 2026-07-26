@@ -22,6 +22,7 @@
      (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
 #define JXL_VARDCT_SSE2 1
 #include <emmintrin.h>
+#include <immintrin.h>
 #endif
 
 /* ===================================================================== */
@@ -1744,13 +1745,66 @@ void jxl_chroma_upsample(float *p, uint32_t w, uint32_t h, size_t stride,
 /* Full-range BT.601 as defined by JFIF clause 7. The planes arrive as
    (Cb, Y, Cr) -- the same slots XYB uses for (X, Y, B) -- and leave as
    (R, G, B) already in the image's encoded color space. */
+#ifdef JXL_VARDCT_SSE2
+JXL_TARGET_AVX2
+static void ycbcr_to_rgb_x8(float *cb, float *y, float *cr, size_t n,
+                            size_t *idx) {
+    const __m256 yoff = _mm256_set1_ps(128.0f / 255.0f);
+    const __m256 crcr = _mm256_set1_ps(1.402f);
+    const __m256 cgcb = _mm256_set1_ps(-0.114f * 1.772f / 0.587f);
+    const __m256 cgcr = _mm256_set1_ps(-0.299f * 1.402f / 0.587f);
+    const __m256 cbcb = _mm256_set1_ps(1.772f);
+    size_t i = *idx;
+    for (; i + 8 <= n; i += 8) {
+        __m256 b = _mm256_loadu_ps(cb + i);
+        __m256 yv = _mm256_add_ps(_mm256_loadu_ps(y + i), yoff);
+        __m256 r = _mm256_loadu_ps(cr + i);
+        _mm256_storeu_ps(cb + i,
+                        _mm256_add_ps(yv, _mm256_mul_ps(crcr, r)));
+        _mm256_storeu_ps(y + i,
+                        _mm256_add_ps(_mm256_add_ps(
+                            yv, _mm256_mul_ps(cgcb, b)),
+                            _mm256_mul_ps(cgcr, r)));
+        _mm256_storeu_ps(cr + i,
+                        _mm256_add_ps(yv, _mm256_mul_ps(cbcb, b)));
+    }
+    _mm256_zeroupper();
+    *idx = i;
+}
+
+static void ycbcr_to_rgb_x4(float *cb, float *y, float *cr, size_t n,
+                            size_t *idx) {
+    const __m128 yoff = _mm_set1_ps(128.0f / 255.0f);
+    const __m128 crcr = _mm_set1_ps(1.402f);
+    const __m128 cgcb = _mm_set1_ps(-0.114f * 1.772f / 0.587f);
+    const __m128 cgcr = _mm_set1_ps(-0.299f * 1.402f / 0.587f);
+    const __m128 cbcb = _mm_set1_ps(1.772f);
+    size_t i = *idx;
+    for (; i + 4 <= n; i += 4) {
+        __m128 b = _mm_loadu_ps(cb + i);
+        __m128 yv = _mm_add_ps(_mm_loadu_ps(y + i), yoff);
+        __m128 r = _mm_loadu_ps(cr + i);
+        _mm_storeu_ps(cb + i, _mm_add_ps(yv, _mm_mul_ps(crcr, r)));
+        _mm_storeu_ps(y + i,
+                      _mm_add_ps(_mm_add_ps(yv, _mm_mul_ps(cgcb, b)),
+                                 _mm_mul_ps(cgcr, r)));
+        _mm_storeu_ps(cr + i, _mm_add_ps(yv, _mm_mul_ps(cbcb, b)));
+    }
+    *idx = i;
+}
+#endif
+
 void jxl_ycbcr_to_rgb(float *cb, float *y, float *cr, size_t n) {
     const float crcr = 1.402f;
     const float cgcb = -0.114f * 1.772f / 0.587f;
     const float cgcr = -0.299f * 1.402f / 0.587f;
     const float cbcb = 1.772f;
-    size_t i;
-    for (i = 0; i < n; i++) {
+    size_t i = 0;
+#ifdef JXL_VARDCT_SSE2
+    if (jxl_has_avx2()) ycbcr_to_rgb_x8(cb, y, cr, n, &i);
+    ycbcr_to_rgb_x4(cb, y, cr, n, &i);
+#endif
+    for (; i < n; i++) {
         float yv = y[i] + 128.0f / 255.0f;
         float b_ = cb[i], r_ = cr[i];
         cb[i] = yv + crcr * r_;

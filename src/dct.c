@@ -426,6 +426,91 @@ static int dct_cols8(float *data, size_t stride, int w, int h, int inverse) {
     return x;
 }
 
+JXL_TARGET_AVX2
+static void transpose8_ps(__m256 *r0, __m256 *r1, __m256 *r2, __m256 *r3,
+                          __m256 *r4, __m256 *r5, __m256 *r6, __m256 *r7) {
+    __m256 t0 = _mm256_unpacklo_ps(*r0, *r1);
+    __m256 t1 = _mm256_unpackhi_ps(*r0, *r1);
+    __m256 t2 = _mm256_unpacklo_ps(*r2, *r3);
+    __m256 t3 = _mm256_unpackhi_ps(*r2, *r3);
+    __m256 t4 = _mm256_unpacklo_ps(*r4, *r5);
+    __m256 t5 = _mm256_unpackhi_ps(*r4, *r5);
+    __m256 t6 = _mm256_unpacklo_ps(*r6, *r7);
+    __m256 t7 = _mm256_unpackhi_ps(*r6, *r7);
+    __m256 s0 = _mm256_shuffle_ps(t0, t2, 0x44);
+    __m256 s1 = _mm256_shuffle_ps(t0, t2, 0xee);
+    __m256 s2 = _mm256_shuffle_ps(t1, t3, 0x44);
+    __m256 s3 = _mm256_shuffle_ps(t1, t3, 0xee);
+    __m256 s4 = _mm256_shuffle_ps(t4, t6, 0x44);
+    __m256 s5 = _mm256_shuffle_ps(t4, t6, 0xee);
+    __m256 s6 = _mm256_shuffle_ps(t5, t7, 0x44);
+    __m256 s7 = _mm256_shuffle_ps(t5, t7, 0xee);
+    *r0 = _mm256_permute2f128_ps(s0, s4, 0x20);
+    *r1 = _mm256_permute2f128_ps(s1, s5, 0x20);
+    *r2 = _mm256_permute2f128_ps(s2, s6, 0x20);
+    *r3 = _mm256_permute2f128_ps(s3, s7, 0x20);
+    *r4 = _mm256_permute2f128_ps(s0, s4, 0x31);
+    *r5 = _mm256_permute2f128_ps(s1, s5, 0x31);
+    *r6 = _mm256_permute2f128_ps(s2, s6, 0x31);
+    *r7 = _mm256_permute2f128_ps(s3, s7, 0x31);
+}
+
+/* Eight rows at once. The transpose keeps each row in one SIMD lane while
+   the 1-D kernel runs, then restores the ordinary row-major layout. */
+JXL_TARGET_AVX2
+static void dct_rows8(float *data, size_t stride, int w, int inverse) {
+    __m256 vrow[256], vscratch[256];
+    int j;
+    for (j = 0; j + 8 <= w; j += 8) {
+        __m256 r0 = _mm256_loadu_ps(data + j);
+        __m256 r1 = _mm256_loadu_ps(data + stride + j);
+        __m256 r2 = _mm256_loadu_ps(data + 2 * stride + j);
+        __m256 r3 = _mm256_loadu_ps(data + 3 * stride + j);
+        __m256 r4 = _mm256_loadu_ps(data + 4 * stride + j);
+        __m256 r5 = _mm256_loadu_ps(data + 5 * stride + j);
+        __m256 r6 = _mm256_loadu_ps(data + 6 * stride + j);
+        __m256 r7 = _mm256_loadu_ps(data + 7 * stride + j);
+        transpose8_ps(&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7);
+        vrow[j] = r0; vrow[j + 1] = r1; vrow[j + 2] = r2; vrow[j + 3] = r3;
+        vrow[j + 4] = r4; vrow[j + 5] = r5; vrow[j + 6] = r6; vrow[j + 7] = r7;
+    }
+    for (; j < w; j++) {
+        vrow[j] = _mm256_setr_ps(data[j], data[stride + j],
+                                 data[2 * stride + j], data[3 * stride + j],
+                                 data[4 * stride + j], data[5 * stride + j],
+                                 data[6 * stride + j], data[7 * stride + j]);
+    }
+    dct_1d_v8(vrow, w, vscratch, inverse);
+    for (j = 0; j + 8 <= w; j += 8) {
+        __m256 r0 = vrow[j], r1 = vrow[j + 1];
+        __m256 r2 = vrow[j + 2], r3 = vrow[j + 3];
+        __m256 r4 = vrow[j + 4], r5 = vrow[j + 5];
+        __m256 r6 = vrow[j + 6], r7 = vrow[j + 7];
+        transpose8_ps(&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7);
+        _mm256_storeu_ps(data + j, r0);
+        _mm256_storeu_ps(data + stride + j, r1);
+        _mm256_storeu_ps(data + 2 * stride + j, r2);
+        _mm256_storeu_ps(data + 3 * stride + j, r3);
+        _mm256_storeu_ps(data + 4 * stride + j, r4);
+        _mm256_storeu_ps(data + 5 * stride + j, r5);
+        _mm256_storeu_ps(data + 6 * stride + j, r6);
+        _mm256_storeu_ps(data + 7 * stride + j, r7);
+    }
+    for (; j < w; j++) {
+        JXL_ALIGN32 float t[8];
+        _mm256_store_ps(t, vrow[j]);
+        data[j] = t[0];
+        data[stride + j] = t[1];
+        data[2 * stride + j] = t[2];
+        data[3 * stride + j] = t[3];
+        data[4 * stride + j] = t[4];
+        data[5 * stride + j] = t[5];
+        data[6 * stride + j] = t[6];
+        data[7 * stride + j] = t[7];
+    }
+    _mm256_zeroupper();
+}
+
 /* Four *rows* at once. Rows are contiguous, so unlike the column pass this
    needs a real transpose in and out -- but the transform in between is the
    same 4-lane kernel, and each lane still sees its own row's values in the
@@ -470,6 +555,9 @@ void jxl_dct_2d(float *data, size_t stride, int w, int h, int inverse) {
     float scratch[256];
     float col[256];
     int x, y;
+#ifdef JXL_DCT_SSE2
+    int use_avx2;
+#endif
 
     if (w * h <= 1) return;
 
@@ -520,15 +608,22 @@ void jxl_dct_2d(float *data, size_t stride, int w, int h, int inverse) {
         return;
     }
 
+#ifdef JXL_DCT_SSE2
+    use_avx2 = jxl_has_avx2();
+#endif
     y = 0;
 #ifdef JXL_DCT_SSE2
+    if (use_avx2) {
+        for (; y + 8 <= h; y += 8)
+            dct_rows8(data + (size_t)y * stride, stride, w, inverse);
+    }
     for (; y + 4 <= h; y += 4)
         dct_rows4(data + (size_t)y * stride, stride, w, inverse);
 #endif
     for (; y < h; y++) dct_1d(data + (size_t)y * stride, w, scratch, inverse);
     x = 0;
 #ifdef JXL_DCT_SSE2
-    if (jxl_has_avx2()) x = dct_cols8(data, stride, w, h, inverse);
+    if (use_avx2) x = dct_cols8(data, stride, w, h, inverse);
     {
         __m128 vcol[256], vscratch[256];
         for (; x + 4 <= w; x += 4) {

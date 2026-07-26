@@ -62,14 +62,14 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.42x libjxl** (2.74x before the SSE2 work below;
+1245-file corpus we are **1.41x libjxl** (2.74x before the SIMD work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
-average up). libjxl is AVX2 throughout; we are scalar C apart from the SSE2
-hot loops (noise, upsampling, EPF, gaborish, both DCT passes, the XYB
-inverse, the sRGB transfer function and the output quantiser), plus an AVX2
-`epf_pass` chosen at runtime, so a constant factor is expected. Each of those
-keeps a scalar twin and is checked bit-identical against it -- see the log.
+average up). libjxl is AVX2 throughout; our hot loops use runtime-selected
+SSE2/AVX2 kernels (noise, upsampling, EPF, gaborish, both DCT passes, YCbCr
+and XYB conversion, the sRGB transfer function and the output quantiser), so
+a constant factor is expected. Each keeps a scalar twin and is checked
+bit-identical against it -- see the log.
 
 `bun cmd/prof.ts <file.jxl>` profiles our decoder alone through the sibling
 `../winperf` and prints its `-print-agent` report (top self-time functions,
@@ -82,6 +82,45 @@ The worst ratio among files that take libjxl more than 5ms is
 `R2020-sRGB-blue.v_prog`; the `v_rs2` set follows, with an upsampling filter
 that is genuinely 25 taps per output sample. Modular is the strongest area.
 Files below ~1ms sit at much larger ratios purely on fixed setup cost.
+
+### Eight-wide DCT rows and YCbCr conversion
+A fresh side-by-side profile used the JPEG-transcoded
+`flower.png.im_q85_gray.jpeg.jxl`, then at 2.29x. It was deliberately chosen
+after the progressive Modular and resampling cases had already been worked
+heavily. The profile was broad, but it exposed two independent SIMD gaps.
+
+First, `memset_repstos` looked like the obvious 6.4% target. Reconstructing
+its stacks from winperf's Firefox profile showed that 2105 of its 2235
+samples came from `vardct_state_alloc`: the three full-size coefficient
+planes. Those zeros are required. HF decoding scatters only non-zero
+coefficients and accumulates progressive passes with `+=`, so this was left
+alone.
+
+The row half of the inverse DCT still processed four rows at once even on
+AVX2. `dct_rows8` now transposes an 8x8 tile into eight SIMD lanes, runs the
+existing expression-for-expression `dct_1d_v8`, and transposes it back. Widths
+below eight use a lane gather, and the SSE2 four-row path remains the fallback.
+The profile's DCT self samples fell from **3407 to 2502 (-26.6%)**.
+
+The final BT.601 YCbCr conversion was scalar too. Its AVX2/SSE2 loops keep
+each multiply and add separate and in the scalar order, with no FMA, so every
+lane rounds identically to the old loop.
+
+Best of 20 on the target:
+
+| stage | ours | ratio |
+|---|---:|---:|
+| before | 53.46ms | 2.29x |
+| vector YCbCr | 52.62ms | 2.24x |
+| eight-wide DCT rows | **50.54ms** | **2.15x** |
+
+That is **-5.5%** in our decoder. Across five JPEG-transcoded controls, the
+DCT step alone moved 233.77ms to 224.46ms (-4.0%). The full-corpus ratio moved
+from 1.42x to **1.41x**.
+
+Forced-scalar and SIMD builds produced byte-identical output on all 1245
+corpus files. `bun cmd/tests.ts -all`: 1245/1245 ok. All 115 fuzz reproducers
+clean; the amalgamation compiles cleanly with clang and MSVC.
 
 ### EPF pass 1: share the symmetric SAD terms
 A current `-vs` profile of the pure-VarDCT `flower.v_e3` put `epf_row8` back
