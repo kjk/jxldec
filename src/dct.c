@@ -18,6 +18,7 @@
 #if !defined(JXL_DCT_FORCE_SCALAR) &&     (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) ||      (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
 #define JXL_DCT_SSE2 1
 #include <emmintrin.h>
+#include <immintrin.h>
 #endif
 
 #define JXL_SQRT2 1.4142135623730951f
@@ -305,6 +306,126 @@ static void dct_1d_v4(__m128 *io, int n, __m128 *scratch, int inverse) {
         }
     }
 }
+/* Eight columns at a time, the same kernel one lane wider. Worth having only
+   for the column pass: that pass gathers whole rows, so widening it is a
+   wider load and nothing else, where the row pass would need an 8x8 transpose
+   in and out. On the 8x8 blocks that dominate a VarDCT frame this turns the
+   two column passes into one.
+
+   No FMA: fusing would round once where the four-lane and scalar versions
+   round twice, and these three are meant to agree with them bit for bit. */
+JXL_TARGET_AVX2
+static void dct4_v8(const __m256 in[4], __m256 out[4], int inverse) {
+    const __m256 sec0 = _mm256_set1_ps(0.5411961f);
+    const __m256 sec1 = _mm256_set1_ps(1.306563f);
+    const __m256 sqrt2 = _mm256_set1_ps(JXL_SQRT2);
+    const __m256 quarter = _mm256_set1_ps(0.25f);
+    if (!inverse) {
+        __m256 sum03 = _mm256_add_ps(in[0], in[3]);
+        __m256 sum12 = _mm256_add_ps(in[1], in[2]);
+        __m256 tmp0 = _mm256_mul_ps(_mm256_sub_ps(in[0], in[3]), sec0);
+        __m256 tmp1 = _mm256_mul_ps(_mm256_sub_ps(in[1], in[2]), sec1);
+        __m256 out0 = _mm256_mul_ps(_mm256_add_ps(tmp0, tmp1), quarter);
+        __m256 out1 = _mm256_mul_ps(_mm256_sub_ps(tmp0, tmp1), quarter);
+        out[0] = _mm256_mul_ps(_mm256_add_ps(sum03, sum12), quarter);
+        out[1] = _mm256_add_ps(_mm256_mul_ps(out0, sqrt2), out1);
+        out[2] = _mm256_mul_ps(_mm256_sub_ps(sum03, sum12), quarter);
+        out[3] = out1;
+    } else {
+        __m256 tmp0 = _mm256_mul_ps(in[1], sqrt2);
+        __m256 tmp1 = _mm256_add_ps(in[1], in[3]);
+        __m256 out0 = _mm256_mul_ps(_mm256_add_ps(tmp0, tmp1), sec0);
+        __m256 out1 = _mm256_mul_ps(_mm256_sub_ps(tmp0, tmp1), sec1);
+        __m256 sum02 = _mm256_add_ps(in[0], in[2]);
+        __m256 sub02 = _mm256_sub_ps(in[0], in[2]);
+        out[0] = _mm256_add_ps(sum02, out0);
+        out[1] = _mm256_add_ps(sub02, out1);
+        out[2] = _mm256_sub_ps(sub02, out1);
+        out[3] = _mm256_sub_ps(sum02, out0);
+    }
+}
+
+JXL_TARGET_AVX2
+static void dct_1d_v8(__m256 *io, int n, __m256 *scratch, int inverse) {
+    const __m256 sqrt2 = _mm256_set1_ps(JXL_SQRT2);
+    const __m256 half_v = _mm256_set1_ps(0.5f);
+    int i;
+    if (n <= 1) return;
+    if (n == 2) {
+        __m256 t0 = _mm256_add_ps(io[0], io[1]);
+        __m256 t1 = _mm256_sub_ps(io[0], io[1]);
+        if (!inverse) {
+            io[0] = _mm256_mul_ps(t0, half_v);
+            io[1] = _mm256_mul_ps(t1, half_v);
+        } else { io[0] = t0; io[1] = t1; }
+        return;
+    }
+    if (n == 4) {
+        __m256 in[4], out[4];
+        for (i = 0; i < 4; i++) in[i] = io[i];
+        dct4_v8(in, out, inverse);
+        for (i = 0; i < 4; i++) io[i] = out[i];
+        return;
+    }
+    {
+        const float *sec = sec_half(n);
+        int hn = n / 2;
+        __m256 *in0 = scratch;
+        __m256 *in1 = scratch + hn;
+        if (!inverse) {
+            for (i = 0; i < hn; i++) {
+                in0[i] = _mm256_mul_ps(_mm256_add_ps(io[i], io[n - i - 1]),
+                                       half_v);
+                in1[i] = _mm256_mul_ps(_mm256_sub_ps(io[i], io[n - i - 1]),
+                                       half_v);
+            }
+            for (i = 0; i < hn; i++)
+                in1[i] = _mm256_mul_ps(in1[i], _mm256_set1_ps(sec[i]));
+            dct_1d_v8(in0, hn, io, 0);
+            dct_1d_v8(in1, hn, io + hn, 0);
+            in1[0] = _mm256_mul_ps(in1[0], sqrt2);
+            for (i = 0; i < hn - 1; i++)
+                in1[i] = _mm256_add_ps(in1[i], in1[i + 1]);
+            for (i = 0; i < hn; i++) io[i * 2] = in0[i];
+            for (i = 0; i < hn; i++) io[i * 2 + 1] = in1[i];
+        } else {
+            for (i = 0; i < hn; i++) {
+                in0[i] = io[i * 2];
+                in1[i] = io[i * 2 + 1];
+            }
+            for (i = 1; i < hn; i++)
+                in1[hn - i] = _mm256_add_ps(in1[hn - i], in1[hn - i - 1]);
+            in1[0] = _mm256_mul_ps(in1[0], sqrt2);
+            dct_1d_v8(in0, hn, io, 1);
+            dct_1d_v8(in1, hn, io + hn, 1);
+            for (i = 0; i < hn; i++)
+                in1[i] = _mm256_mul_ps(in1[i], _mm256_set1_ps(sec[i]));
+            for (i = 0; i < hn; i++) {
+                __m256 a = scratch[i];
+                __m256 b = scratch[i + hn];
+                io[i] = _mm256_add_ps(a, b);
+                io[n - i - 1] = _mm256_sub_ps(a, b);
+            }
+        }
+    }
+}
+
+/* The column pass, eight wide. Returns the first column not yet done. */
+JXL_TARGET_AVX2
+static int dct_cols8(float *data, size_t stride, int w, int h, int inverse) {
+    __m256 vcol[256], vscratch[256];
+    int x = 0, y;
+    for (; x + 8 <= w; x += 8) {
+        for (y = 0; y < h; y++)
+            vcol[y] = _mm256_loadu_ps(data + (size_t)y * stride + x);
+        dct_1d_v8(vcol, h, vscratch, inverse);
+        for (y = 0; y < h; y++)
+            _mm256_storeu_ps(data + (size_t)y * stride + x, vcol[y]);
+    }
+    _mm256_zeroupper();
+    return x;
+}
+
 /* Four *rows* at once. Rows are contiguous, so unlike the column pass this
    needs a real transpose in and out -- but the transform in between is the
    same 4-lane kernel, and each lane still sees its own row's values in the
@@ -407,6 +528,7 @@ void jxl_dct_2d(float *data, size_t stride, int w, int h, int inverse) {
     for (; y < h; y++) dct_1d(data + (size_t)y * stride, w, scratch, inverse);
     x = 0;
 #ifdef JXL_DCT_SSE2
+    if (jxl_has_avx2()) x = dct_cols8(data, stride, w, h, inverse);
     {
         __m128 vcol[256], vscratch[256];
         for (; x + 4 <= w; x += 4) {

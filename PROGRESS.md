@@ -169,6 +169,39 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### The DCT column pass, eight wide
+With dequantisation and chroma-from-luma vectorised, `dct_1d_v4` was left
+holding 16.5% of a VarDCT decode -- the largest single item and, unlike the
+memset beside it, actual arithmetic.
+
+It was already four lanes wide. The reason to widen only the *column* pass is
+structural: that pass gathers a whole row per step, and four consecutive
+floats from a row are exactly four columns' values at that row, so the gather
+already is the transpose and widening it is a wider load and nothing else.
+The row pass would need a real 8x8 transpose in and out to match. On the 8x8
+blocks that dominate a VarDCT frame, this turns the two column passes into
+one.
+
+`dct4_v8` and `dct_1d_v8` mirror the four-lane pair expression for
+expression, so every lane performs the same operations in the same order as
+the scalar code. No FMA, for the usual reason: fusing would round once where
+the other two round twice.
+
+Measured interleaved, five runs, two passes -- because the first full-corpus
+sweep came back 1.64x against 1.63x and it was worth establishing whether
+that was the change or the noise. It was the noise:
+
+| preset | SSE2 pass 1 / 2 | AVX2 pass 1 / 2 |
+|---|---|---|
+| `v_icc` | 2.011x / 2.017x | **1.922x / 1.916x** |
+| `v_d1` | 1.932x / 1.948x | **1.873x / 1.868x** |
+| `jpeg` | 2.084x / 2.079x | **2.045x / 2.063x** |
+
+Corpus **1.61x** (best of five; the `-runs 3` sweeps this session read about
+a point higher and vary by about that much between runs). Scalar, SSE2-only
+and AVX2 builds all diffed byte-identical over the 1242 corpus files,
+verdicts against libjxl unchanged, ASan clean, 115 reproducers clean.
+
 ### Two VarDCT loops: a divide per sample, and a scalar dequantiser
 With the presets clustered around 2x and no single file standing out, the
 next targets came from the shared VarDCT core rather than any one preset.
