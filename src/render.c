@@ -519,7 +519,17 @@ jxl_image *jxl_frame_render(jxl_doc *doc, int frame_no, jxl_format fmt) {
         out = NULL;
         goto done;
     }
-    out->data = (uint8_t *)jxl_calloc(ctx, total ? total : 1, 1);
+    /* write_pixels covers every byte of every row -- stride is exactly
+       width * bpp and it writes all of them -- so zeroing this first is
+       pure cost. -DJXL_POISON_UNINIT fills this and the LZ77 window with
+       0xCD instead of leaving them to the allocator, so that anything
+       depending on the old zeroing shows up as a difference rather than as
+       a silent zero that happens to look right. Diffed that way against the
+       zero-filled build over the whole corpus: no file changed. */
+    out->data = (uint8_t *)jxl_malloc(ctx, total ? total : 1);
+#ifdef JXL_POISON_UNINIT
+    if (out->data) memset(out->data, 0xCD, total ? total : 1);
+#endif
     if (!out->data) {
         jxl_free(ctx, out);
         out = NULL;

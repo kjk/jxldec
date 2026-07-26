@@ -169,6 +169,48 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Two buffers that were being zeroed for nothing
+`memset_repstos` sat at 7.6% of a VarDCT decode, and the coefficient planes
+-- the obvious suspect, 41MB a frame -- genuinely need their zeros, because
+the HF scatter writes only the non-zero coefficients and accumulates them
+with `+=`. But 41MB is about 2% of that decode, not 7.6%, so the arithmetic
+did not add up and it was worth counting rather than assuming. Instrumenting
+`jxl_calloc` to report every allocation over 64KB gave 65MB zeroed per
+decode:
+
+| | |
+|---|---|
+| 3 x 13.7MB | coefficient planes -- **required** |
+| 1 x 10.3MB | the output image buffer |
+| 3 x 4.0MB | the LZ77 windows |
+
+The other 23MB is waste. `write_pixels` covers every byte of the output
+buffer -- its stride is exactly `width * bpp` and it writes all of them --
+so zeroing it first is pure cost. And the LZ77 window never reads a slot it
+has not written: a copy reads `window[copy_pos]` for `copy_pos` in
+`[num_decoded - distance, num_decoded)`, `distance` is clamped to
+`num_decoded` immediately above, and every index below `num_decoded` was
+written by the store at the end of `jxl_dec_read_clustered`. That holds for
+malformed streams too, so the output stays deterministic rather than
+depending on what the allocator handed back.
+
+Both arguments are the kind that are easy to get wrong, so neither is left
+as an argument: `-DJXL_POISON_UNINIT` fills both buffers with 0xCD, and that
+build was diffed against the zero-filled one over the whole corpus. No file
+changed. (A first attempt at this checked nothing -- it passed an env var
+the test runner does not read, so it silently re-ran the ordinary build.)
+
+Measured interleaved, five runs, two passes:
+
+| preset | calloc p1 / p2 | malloc p1 / p2 |
+|---|---|---|
+| `v_icc` | 1.891x / 1.892x | **1.698x / 1.713x** |
+| `jpeg` | 2.076x / 2.076x | **1.983x / 1.993x** |
+| `v_d1` | 1.826x / 1.834x | **1.764x / 1.777x** |
+
+Corpus **1.60x -> 1.58x**. Verdicts unchanged, ASan clean, 115 reproducers
+clean.
+
 ### Gaborish in place, with two saved rows
 `memcpy_repmovs` was 6.0% of a VarDCT decode even after the coefficient
 planes stopped being copied out. Most of what was left was gaborish: it

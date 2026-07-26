@@ -913,11 +913,24 @@ int jxl_dec_init(jxl_ctx *ctx, jxl_dec *dec, jxl_br *br, uint32_t num_dist) {
     return dec_parse_inner(ctx, dec, br, num_dist);
 }
 
-/* Lazily allocated: only LZ77 streams need the 4 MB window. */
+/* Lazily allocated: only LZ77 streams need the 4 MB window, and it does
+   not need zeroing. A copy reads window[copy_pos] for copy_pos in
+   [num_decoded - distance, num_decoded), distance is clamped to
+   num_decoded just below, and every index below num_decoded has been
+   written by the store at the end of jxl_dec_read_clustered. So no read
+   can reach a slot that was never written, even from a malformed stream --
+   which also keeps the output deterministic rather than dependent on
+   whatever the allocator handed back. */
 static int lz77_ensure_window(jxl_dec *dec) {
     if (dec->window) return 0;
-    dec->window = (uint32_t *)jxl_calloc(dec->ctx, LZ77_WINDOW_SIZE,
-                                         sizeof(uint32_t));
+    dec->window = (uint32_t *)jxl_malloc(
+        dec->ctx, (size_t)LZ77_WINDOW_SIZE * sizeof(uint32_t));
+#ifdef JXL_POISON_UNINIT
+    if (dec->window) {
+        memset(dec->window, 0xCD,
+               (size_t)LZ77_WINDOW_SIZE * sizeof(uint32_t));
+    }
+#endif
     return dec->window ? 0 : -1;
 }
 
