@@ -82,6 +82,20 @@ static uint32_t quantize(float v, uint32_t maxval) {
 #include <emmintrin.h>
 
 /* Four samples through the exact logic of quantize() above. */
+static __m128i quantize4v(const float *src, uint32_t maxval) {
+    const __m128 vm = _mm_set1_ps((float)maxval);
+    const __m128 zero = _mm_setzero_ps();
+    __m128 v = _mm_loadu_ps(src);
+    __m128 s = _mm_add_ps(_mm_mul_ps(v, vm), _mm_set1_ps(0.5f));
+    __m128i t = _mm_cvttps_epi32(s);                  /* truncates, as (uint32_t) */
+    __m128 pos = _mm_cmpgt_ps(v, zero);               /* false for <= 0 and NaN */
+    __m128 sat = _mm_cmpge_ps(s, vm);
+    __m128i mx = _mm_set1_epi32((int)maxval);
+    t = _mm_or_si128(_mm_and_si128(_mm_castps_si128(sat), mx),
+                     _mm_andnot_si128(_mm_castps_si128(sat), t));
+    return _mm_and_si128(_mm_castps_si128(pos), t);
+}
+
 static void quantize4(const float *src, uint32_t maxval, uint32_t out[4]) {
     const __m128 vm = _mm_set1_ps((float)maxval);
     const __m128 zero = _mm_setzero_ps();
@@ -211,6 +225,40 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
            calling quantize(). Only the straight-through case qualifies --
            anything with orientation or a subsampled plane keeps the general
            path. */
+        /* The two common 8-bit RGB formats pack without any shuffling: each
+           lane's three or four components are already 0..255 in separate
+           32-bit lanes, so r | g<<8 | b<<16 | a<<24 lays a whole pixel out in
+           one lane and four pixels are one store.
+           RGB24 has no fourth component to carry the alpha slot, so each
+           pixel is written as a 4-byte store whose top byte lands on the next
+           pixel and is overwritten by it. The loop stops four pixels short of
+           the row so the last such overhang stays inside the row and the
+           scalar tail below rewrites it. */
+        if (direct && !wide && !gray && !bgr && (ncomp == 3 || ncomp == 4)) {
+            uint32_t lim = ncomp == 4 ? ow : (ow >= 4 ? ow - 4 : 0);
+            const __m128i amax = _mm_set1_epi32((int)maxval);
+            for (; ox + 4 <= lim; ox += 4) {
+                __m128i r = quantize4v(pr + ox, maxval);
+                __m128i g = quantize4v(pg + ox, maxval);
+                __m128i b = quantize4v(pb + ox, maxval);
+                /* RGB24 discards this lane, so do not pay to quantise it. */
+                __m128i a = (pa && ncomp == 4) ? quantize4v(pa + ox, maxval)
+                                               : amax;
+                __m128i packed = _mm_or_si128(
+                    _mm_or_si128(r, _mm_slli_epi32(g, 8)),
+                    _mm_or_si128(_mm_slli_epi32(b, 16), _mm_slli_epi32(a, 24)));
+                if (ncomp == 4) {
+                    _mm_storeu_si128((__m128i *)(row8 + (size_t)ox * 4), packed);
+                } else {
+                    uint32_t tmp[4];
+                    uint32_t j;
+                    _mm_storeu_si128((__m128i *)tmp, packed);
+                    for (j = 0; j < 4; j++) {
+                        memcpy(row8 + (size_t)(ox + j) * 3, &tmp[j], 4);
+                    }
+                }
+            }
+        }
         if (direct) {
             uint32_t qr[4], qg[4], qb[4], qa[4];
             for (; ox + 4 <= ow; ox += 4) {

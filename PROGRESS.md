@@ -169,6 +169,38 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Packing output pixels without shuffling
+`write_pixels` was 8.0% of a VarDCT decode -- about 12 cycles a pixel for
+what is a quantise and a store. The quantise was already vectorised; the
+store was not. Four pixels came back from `quantize4` as four separate
+`uint32` arrays and were then written component by component, through a
+per-pixel chain of tests on `gray`, `bgr`, `has_alpha`, `wide` and `ncomp`
+that are fixed for the entire image.
+
+The two common 8-bit RGB formats need no shuffling at all to pack. Each
+lane's components are already 0..255 in separate 32-bit lanes, so
+`r | g<<8 | b<<16 | a<<24` lays out a whole pixel per lane and four pixels
+become one store. RGBA32 stores those sixteen bytes directly.
+
+RGB24 has no fourth component to absorb the alpha slot, so each pixel is
+written as a **4-byte** store whose top byte lands on the next pixel and is
+overwritten by it. The loop stops four pixels short of the row so the final
+overhang stays inside the row, and the scalar tail rewrites it. ASan over
+the corpus is the check that the bound is right.
+
+Measured interleaved, five runs, two passes:
+
+| preset | scalar p1 / p2 | packed p1 / p2 |
+|---|---|---|
+| `jpeg` | 1.973x / 1.984x | **1.855x / 1.856x** |
+| `v_icc` | 1.708x / 1.734x | **1.642x / 1.641x** |
+| `v_d1` | 1.775x / 1.761x | **1.703x / 1.706x** |
+
+The packed path produces the same bytes as the scalar one, so output should
+be exactly unchanged, and all 1242 corpus files decode byte-identically to
+the previous commit's binary. Corpus **1.58x -> 1.54x**. ASan clean, 115
+reproducers clean.
+
 ### Two buffers that were being zeroed for nothing
 `memset_repstos` sat at 7.6% of a VarDCT decode, and the coefficient planes
 -- the obvious suspect, 41MB a frame -- genuinely need their zeros, because
