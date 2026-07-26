@@ -198,6 +198,115 @@ static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
         _mm256_storeu_ps(out[c] + row + x, _mm256_mul_ps(sum8[c], sw));
     _mm256_zeroupper();
 }
+
+/* Pass 1 has four neighbours and a five-point SAD footprint. Four of its 20
+   absolute differences are the same centre-edge pair seen from opposite
+   directions. Load the 13 unique positions once and share those four
+   differences, while adding every SAD in the generic loop's
+   top,centre,bottom,left,right order so the result stays bit-identical. */
+JXL_TARGET_AVX2
+static void epf_row8_pass1(float *in[3], float *out[3], size_t row, uint32_t x,
+                           size_t stride, const float cscale[3],
+                           float sigma_val, float step_mul, float border_mul,
+                           int is_y_border) {
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 one = _mm256_set1_ps(1.0f);
+    __m256 dist8[4] = {zero, zero, zero, zero};
+    __m256 sum8[3], sw, nis, smv;
+    int c, k;
+
+    if (is_y_border) {
+        smv = _mm256_set1_ps(border_mul);
+    } else {
+        smv = _mm256_setr_ps(border_mul, step_mul, step_mul, step_mul,
+                             step_mul, step_mul, step_mul, border_mul);
+    }
+    nis = _mm256_mul_ps(_mm256_set1_ps(EPF_SIGMA_MUL / sigma_val), smv);
+
+    for (c = 0; c < 3; c++) {
+        const float *p = in[c] + row + x;
+        const __m256 p20 = _mm256_loadu_ps(p - 2 * (ptrdiff_t)stride);
+        const __m256 p21 = _mm256_loadu_ps(p - (ptrdiff_t)stride);
+        const __m256 p11 = _mm256_loadu_ps(p - (ptrdiff_t)stride - 1);
+        const __m256 p31 = _mm256_loadu_ps(p - (ptrdiff_t)stride + 1);
+        const __m256 p02 = _mm256_loadu_ps(p - 2);
+        const __m256 p12 = _mm256_loadu_ps(p - 1);
+        const __m256 p22 = _mm256_loadu_ps(p);
+        const __m256 p32 = _mm256_loadu_ps(p + 1);
+        const __m256 p42 = _mm256_loadu_ps(p + 2);
+        const __m256 p13 = _mm256_loadu_ps(p + (ptrdiff_t)stride - 1);
+        const __m256 p23 = _mm256_loadu_ps(p + (ptrdiff_t)stride);
+        const __m256 p33 = _mm256_loadu_ps(p + (ptrdiff_t)stride + 1);
+        const __m256 p24 = _mm256_loadu_ps(p + 2 * (ptrdiff_t)stride);
+        const __m256 ct = _mm256_and_ps(absmask, _mm256_sub_ps(p21, p22));
+        const __m256 cb = _mm256_and_ps(absmask, _mm256_sub_ps(p22, p23));
+        const __m256 cl = _mm256_and_ps(absmask, _mm256_sub_ps(p12, p22));
+        const __m256 cr = _mm256_and_ps(absmask, _mm256_sub_ps(p32, p22));
+        const __m256 cs = _mm256_set1_ps(cscale[c]);
+        __m256 acc0, acc1, acc2, acc3;
+
+        acc0 = _mm256_add_ps(zero,
+            _mm256_and_ps(absmask, _mm256_sub_ps(p20, p21)));
+        acc0 = _mm256_add_ps(acc0, ct);
+        acc0 = _mm256_add_ps(acc0, cb);
+        acc0 = _mm256_add_ps(acc0,
+            _mm256_and_ps(absmask, _mm256_sub_ps(p11, p12)));
+        acc0 = _mm256_add_ps(acc0,
+            _mm256_and_ps(absmask, _mm256_sub_ps(p31, p32)));
+
+        acc1 = _mm256_add_ps(zero, ct);
+        acc1 = _mm256_add_ps(acc1, cb);
+        acc1 = _mm256_add_ps(acc1,
+            _mm256_and_ps(absmask, _mm256_sub_ps(p24, p23)));
+        acc1 = _mm256_add_ps(acc1,
+            _mm256_and_ps(absmask, _mm256_sub_ps(p13, p12)));
+        acc1 = _mm256_add_ps(acc1,
+            _mm256_and_ps(absmask, _mm256_sub_ps(p33, p32)));
+
+        acc2 = _mm256_add_ps(zero,
+            _mm256_and_ps(absmask, _mm256_sub_ps(p11, p21)));
+        acc2 = _mm256_add_ps(acc2, cl);
+        acc2 = _mm256_add_ps(acc2,
+            _mm256_and_ps(absmask, _mm256_sub_ps(p13, p23)));
+        acc2 = _mm256_add_ps(acc2,
+            _mm256_and_ps(absmask, _mm256_sub_ps(p02, p12)));
+        acc2 = _mm256_add_ps(acc2, cr);
+
+        acc3 = _mm256_add_ps(zero,
+            _mm256_and_ps(absmask, _mm256_sub_ps(p31, p21)));
+        acc3 = _mm256_add_ps(acc3, cr);
+        acc3 = _mm256_add_ps(acc3,
+            _mm256_and_ps(absmask, _mm256_sub_ps(p33, p23)));
+        acc3 = _mm256_add_ps(acc3, cl);
+        acc3 = _mm256_add_ps(acc3,
+            _mm256_and_ps(absmask, _mm256_sub_ps(p42, p32)));
+
+        dist8[0] = _mm256_add_ps(dist8[0], _mm256_mul_ps(cs, acc0));
+        dist8[1] = _mm256_add_ps(dist8[1], _mm256_mul_ps(cs, acc1));
+        dist8[2] = _mm256_add_ps(dist8[2], _mm256_mul_ps(cs, acc2));
+        dist8[3] = _mm256_add_ps(dist8[3], _mm256_mul_ps(cs, acc3));
+    }
+
+    for (c = 0; c < 3; c++) sum8[c] = _mm256_loadu_ps(in[c] + row + x);
+    sw = one;
+    for (k = 0; k < 4; k++) {
+        const ptrdiff_t off = k == 0 ? -(ptrdiff_t)stride :
+                              k == 1 ?  (ptrdiff_t)stride :
+                              k == 2 ? -1 : 1;
+        __m256 wgt = _mm256_add_ps(one, _mm256_mul_ps(dist8[k], nis));
+        wgt = _mm256_max_ps(wgt, zero);
+        sw = _mm256_add_ps(sw, wgt);
+        for (c = 0; c < 3; c++) {
+            sum8[c] = _mm256_add_ps(sum8[c], _mm256_mul_ps(wgt,
+                _mm256_loadu_ps(in[c] + row + x + off)));
+        }
+    }
+    sw = _mm256_div_ps(one, sw);
+    for (c = 0; c < 3; c++)
+        _mm256_storeu_ps(out[c] + row + x, _mm256_mul_ps(sum8[c], sw));
+    _mm256_zeroupper();
+}
 #endif
 
 /* A sample whose whole footprint is inside the image needs no mirroring, so
@@ -276,8 +385,14 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                     x += 8;
                     continue;
                 }
-                epf_row8(in, out, row, x, koff, doff, nkernel, ndist, cscale,
-                         sigma_val, step_mul, border_mul, is_y_border);
+                if (step == 1) {
+                    epf_row8_pass1(in, out, row, x, stride, cscale, sigma_val,
+                                   step_mul, border_mul, is_y_border);
+                } else {
+                    epf_row8(in, out, row, x, koff, doff, nkernel, ndist,
+                             cscale, sigma_val, step_mul, border_mul,
+                             is_y_border);
+                }
                 x += 8;
                 continue;
             }

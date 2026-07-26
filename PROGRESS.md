@@ -62,7 +62,7 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.43x libjxl** (2.74x before the SSE2 work below;
+1245-file corpus we are **1.42x libjxl** (2.74x before the SSE2 work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
 average up). libjxl is AVX2 throughout; we are scalar C apart from the SSE2
@@ -82,6 +82,37 @@ The worst ratio among files that take libjxl more than 5ms is
 `R2020-sRGB-blue.v_prog`; the `v_rs2` set follows, with an upsampling filter
 that is genuinely 25 taps per output sample. Modular is the strongest area.
 Files below ~1ms sit at much larger ratios purely on fixed setup cost.
+
+### EPF pass 1: share the symmetric SAD terms
+A current `-vs` profile of the pure-VarDCT `flower.v_e3` put `epf_row8` back
+at the top: 3484 self samples, **15.0%** of the combined profile, against
+libjxl's EPF1 stage at 1045 samples / 4.5%. The generic loop computed four
+five-point SADs independently, 20 absolute differences per channel.
+
+Four of those terms are the same centre-edge difference viewed in opposite
+directions. The AVX2 pass-1 kernel now loads the 13 unique pixel positions
+once and computes 16 differences, sharing centre-top, centre-bottom,
+centre-left and centre-right. Each of the four SADs still adds its five terms
+in exactly the generic loop's top/centre/bottom/left/right order; only the
+absolute differences are shared, so the floating-point result is
+bit-identical rather than merely close.
+
+Best of 9 before and after:
+
+| file | generic pass 1 | shared SADs |
+|---|---:|---:|
+| `flower.v_e3` | 91.71ms, 2.12x | **81.65ms, 1.89x** |
+| `splines.v_e3` | 90.08ms, 2.44x | **78.40ms, 2.10x** |
+| `flower.v_d1` | 90.38ms, 1.99x | **84.20ms, 1.85x** |
+| total | 272.16ms | **244.25ms (-10.3%)** |
+
+Two later 15-run passes gave 244.25ms and 243.50ms. Re-profiling dropped EPF
+from 3484 to **1964** self samples and the complete trace from 23182 to 21332
+samples. The whole-corpus ratio moved from 1.43x to **1.42x**.
+
+The scalar and AVX2 paths produce identical output on all 1245 corpus files.
+`bun cmd/tests.ts -all`: 1245/1245 ok. All 115 fuzz reproducers clean, and the
+amalgamation compiles cleanly with clang and MSVC.
 
 ### Constant-folding the default weighted predictor
 The full-corpus benchmark put `R2020-sRGB-blue.v_prog` at the top of the
@@ -173,11 +204,11 @@ What is left is qualitatively different from the rounds above:
 - **AVX2 beyond `epf_pass`.** The dispatch machinery exists now, but widening
   a kernel only paid for the one that is genuinely compute-bound; see the log
   for the measurements that killed the others.
-- **`epf_pass` SAD symmetry.** The taps are symmetric pairs and the SAD is
-  symmetric under swapping the two footprints, so `dist(x, y, k) ==
-  dist(x+kx, y+ky, -k)`. Caching six SADs per sample in a rolling three-row
-  window would halve the SAD work. The `sigma < 0.3` early-out complicates
-  it: a skipped sample's neighbours still want its cached values.
+- **Further `epf_pass` SAD symmetry.** Pass 1 now shares the four repeated
+  centre-edge terms within a sample. Sharing whole SADs between neighbouring
+  samples (`dist(x, y, k) == dist(x+kx, y+ky, -k)`) would need a rolling
+  three-row cache. The `sigma < 0.3` early-out complicates it: a skipped
+  sample's neighbours still want its cached values.
 - **Multithreading**, which is not implemented at all and would dwarf both.
 
 ### Unrolling the predictor's four-lane steps
