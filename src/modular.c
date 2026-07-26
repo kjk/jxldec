@@ -384,19 +384,22 @@ void jxl_ma_config_free(jxl_ctx *ctx, jxl_ma_config *ma) {
 /* predictors                                                             */
 /* ===================================================================== */
 
-static uint32_t jxl_div_lookup[65];
-static int jxl_div_lookup_init;
-
-static const uint32_t *div_lookup(void) {
-    if (!jxl_div_lookup_init) {
-        int i;
-        for (i = 1; i <= 64; i++) {
-            jxl_div_lookup[i] = (uint32_t)((1u << 24) / (unsigned)i);
-        }
-        jxl_div_lookup_init = 1;
-    }
-    return jxl_div_lookup;
-}
+/* (1 << 24) / i for i in 1..64, and 0 at index 0. This used to be built
+   lazily, which put an init check and a call in sc_predict -- once per
+   sample. As a constant the compiler also knows the values never move. */
+static const uint32_t jxl_div_lookup[65] = {
+    0u, 16777216u, 8388608u, 5592405u, 4194304u, 3355443u,
+    2796202u, 2396745u, 2097152u, 1864135u, 1677721u, 1525201u,
+    1398101u, 1290555u, 1198372u, 1118481u, 1048576u, 986895u,
+    932067u, 883011u, 838860u, 798915u, 762600u, 729444u,
+    699050u, 671088u, 645277u, 621378u, 599186u, 578524u,
+    559240u, 541200u, 524288u, 508400u, 493447u, 479349u,
+    466033u, 453438u, 441505u, 430185u, 419430u, 409200u,
+    399457u, 390167u, 381300u, 372827u, 364722u, 356962u,
+    349525u, 342392u, 335544u, 328965u, 322638u, 316551u,
+    310689u, 305040u, 299593u, 294337u, 289262u, 284359u,
+    279620u, 275036u, 270600u, 266305u, 262144u
+};
 
 typedef struct {
     int64_t prediction;
@@ -480,7 +483,7 @@ static int32_t pred_ww(const jxl_pred_state *ps) {
 
 static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
                        int32_t w, int32_t nn, jxl_sc_result *out) {
-    const uint32_t *dl = div_lookup();
+    const uint32_t *dl = jxl_div_lookup;
     int64_t te_w = sc->true_err_w, te_nw = sc->true_err_nw;
     int64_t te_n = sc->true_err_n, te_ne = sc->true_err_ne;
     int64_t n3 = (int64_t)n << 3, nw3 = (int64_t)nw << 3;

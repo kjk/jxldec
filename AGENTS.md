@@ -69,12 +69,17 @@ PNGs to PNM in TypeScript. Don't re-investigate this.
 - `bun cmd/bench.ts <selection> [-runs N]` — times our decode against libjxl's,
   both in one process, single-threaded, best of N. Windows/MSVC only: it links
   libjxl's static libraries, which need `-MD` and `-DJXL_STATIC_DEFINE`.
-- `bun cmd/prof.ts <file.jxl> [-runs N]` — sampling profile of *our* decoder
+- `bun cmd/prof.ts <file.jxl> [-runs N] [-vs]` — sampling profile of *our* decoder
   alone on one file, via the sibling `../samply` (build it once with
   `cd ../samply && bun cmd/build.ts -release`). It builds `jxl_prof` with
   `-Zi` into `out/prof/` and passes samply `-print-agent`, which prints the
   top self-time functions, the hot source lines and the heaviest call path.
-  Needs Administrator rights and `xperf.exe` from the Windows ADK.
+  Needs Administrator rights and `xperf.exe` from the Windows ADK. `-vs`
+  profiles ours *and* libjxl in one process with both symbolized, by linking
+  the benchmark harness against a debug-info libjxl (built on demand into
+  `deps/libjxl-dbg`); that is how to see which side of a ratio is slow. Give
+  samply an absolute path -- it fails to attach to a relative one and the
+  trace fills with unrelated processes instead of erroring.
 - `bun cmd/build-dist.ts` — regenerate the `dist/jxl.c` + `dist/jxl.h`
   amalgamation and verify it compiles with every available toolchain.
 

@@ -15,7 +15,7 @@ import { $ } from "bun";
 import { copyFileSync, existsSync, mkdirSync, rmSync, statSync } from "fs";
 import { resolve as resolvePath } from "path";
 import { DIST_C, DIST_H, ensureDist } from "./build-dist";
-import { getDeps } from "./get-deps";
+import { buildRefDebug, getDeps } from "./get-deps";
 import { SRCS } from "./sources";
 
 // Forward slashes: Bun's shell treats backslashes as escapes.
@@ -322,6 +322,48 @@ function libjxlLibs(): string[] {
 
 /** Build jxl_bench: our amalgamation and libjxl in one process, MSVC only
  *  (libjxl is built as C++ with the MSVC runtime). */
+/* The benchmark harness linked against the debug-info libjxl, so a profile
+   attributes libjxl's own time to its own functions instead of one opaque
+   module. Same harness, so both decoders run the same work in one process
+   under identical conditions -- which is the only way to compare them
+   honestly. Used by cmd/prof.ts -vs. */
+export async function buildBenchHarnessDbg(): Promise<string> {
+  if (!isWindows) throw new Error("the benchmark harness needs the MSVC toolchain");
+  await ensureDist();
+  await buildRefDebug();
+  const dir = `${OUT_ROOT}/prof`;
+  const exePath = `${dir}/${binName("jxl_bench_dbg")}`;
+  const inc = `${ROOT}/deps/libjxl/lib/include`;
+  const d = `${ROOT}/deps/libjxl-dbg`;
+  mkdirSync(dir, { recursive: true });
+  const clMd = `${JXLDEC_MSVC_CL_C.replace("-MT", "-MD")} -Zi -Fd${dir}/`;
+  const libObj = `${dir}/dist_dbg.obj`;
+  const benchObj = `${dir}/bench_dbg.obj`;
+  if (needsRebuild(libObj, DIST_C, DIST_H)) {
+    await runCmd(`cl ${clMd} -Idist -Fo${libObj} -c dist/jxl.c`, ROOT);
+  }
+  if (needsRebuild(benchObj, `${ROOT}/test/jxl_bench.c`, DIST_H)) {
+    await runCmd(
+      `cl ${clMd} -DJXL_STATIC_DEFINE -Idist -I${inc} -I${d}/lib/include -Fo${benchObj} -c test/jxl_bench.c`,
+      ROOT,
+    );
+  }
+  const libs = [
+    `${d}/lib/jxl.lib`, `${d}/lib/jxl_cms.lib`,
+    `${d}/third_party/brotli/brotlidec.lib`,
+    `${d}/third_party/brotli/brotlienc.lib`,
+    `${d}/third_party/brotli/brotlicommon.lib`,
+    `${d}/third_party/highway/hwy.lib`,
+  ];
+  if (needsRebuild(exePath, libObj, benchObj, ...libs)) {
+    await runCmd(
+      `cl -nologo ${libObj} ${benchObj} -Fe:${exePath} -link -DEBUG ${libs.join(" ")}`,
+      ROOT,
+    );
+  }
+  return exePath;
+}
+
 export async function buildBenchHarness(): Promise<string> {
   if (!isWindows) throw new Error("the benchmark harness needs the MSVC toolchain");
   await ensureDist();

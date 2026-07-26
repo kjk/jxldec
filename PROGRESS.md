@@ -146,6 +146,44 @@ What is left is qualitatively different from the rounds above:
 
 ## Log
 
+### Profiling libjxl next to ourselves
+`bun cmd/prof.ts -vs <file>` profiles the *benchmark* harness rather than the
+standalone one, so both decoders run the same work in one process, and links
+it against a second libjxl built RelWithDebInfo (`deps/libjxl-dbg`, built on
+demand). libjxl's own functions are then attributed by name instead of showing
+up as one opaque module, which is what makes "where are we slower" answerable
+rather than a guess.
+
+Two things had to be fixed to get a usable trace. samply silently fails to
+attach when handed a **relative** exe path -- the symptom is a trace full of
+unrelated system processes and a duration far shorter than the run, which is
+easy to misread as "the profiler does not work here". And `prof.ts` treated
+every flag as taking a value, so `-vs <file>` swallowed the filename; the same
+bug `tests.ts` had with `-tol`.
+
+On `flower.m_e3`, 61k samples over 16s:
+
+    35.5%  jxl::detail::DecodeModularChannelMAANS<0>   (libjxl, all of it)
+    25.3%  sc_predict                                  (ours)
+    11.0%  ma_get_leaf
+     7.5%  ans_read_symbol
+     5.9%  jxl_modular_decode (self)
+     4.8%  sc_record
+           ------
+    35.5%  libjxl total vs 54.5% ours -- 1.53x, matching the measured 1.65x
+
+The structural difference is visible: libjxl templates its whole per-sample
+Modular pipeline into **one** function, where ours is five with a call each.
+That looked like the explanation, so I forced the three hot ones inline --
+and it was 8.7% *slower* (`m_e3` 1.65x -> 1.76x). Call overhead is not the
+cost; the bloat is worse than the calls. Reverted.
+
+What did help, slightly, came out of reading `sc_predict` line by line
+afterwards: `div_lookup()` rebuilt a 65-entry table behind an init check on
+every call, and it is called once per sample. As a `static const` table that
+is a call and a branch per sample gone -- worth 1-3% on Modular files
+(`lm_d1` 2.42x -> 2.35x), and nothing at corpus level.
+
 ### A software bit-scan was 37% of a Modular decode
 Every profile so far had been taken on a VarDCT file, so all the SIMD work
 went there -- while Modular is about 60% of the corpus by time. Profiling

@@ -1,4 +1,5 @@
-// prof.ts -- profile our decoder on one file with ../samply.
+// prof.ts -- profile our decoder on one file with ../samply (-vs profiles
+// ours and libjxl together).
 //
 //   bun cmd/prof.ts <file.jxl> [-runs N] [-hz N]
 //
@@ -9,7 +10,7 @@
 // Performance Toolkit and Administrator rights.
 import { existsSync } from "fs";
 import { dirname, resolve } from "path";
-import { buildProfHarness, isWindows } from "./build";
+import { buildBenchHarnessDbg, buildProfHarness, isWindows } from "./build";
 
 const ROOT = dirname(import.meta.dir);
 // JXLDEC_SAMPLY overrides; otherwise try the two places it usually lives.
@@ -31,12 +32,18 @@ const flagVal = (name: string, dflt: string) => {
 };
 const RUNS = flagVal("-runs", "10");
 const HZ = flagVal("-hz", "4000");
-const files = argv.filter((a, i) => !a.startsWith("-") && !argv[i - 1]?.startsWith("-"));
+// Only these take a value; treating every flag as if it did would swallow
+// the filename after a boolean one like -vs.
+const VALUE_FLAGS = ["-runs", "-hz"];
+const files = argv.filter(
+  (a, i) => !a.startsWith("-") && !VALUE_FLAGS.includes(argv[i - 1] ?? ""));
 
 if (!isWindows || files.length !== 1) {
   console.error(`usage: bun cmd/prof.ts <file.jxl> [-runs N] [-hz N]
   -runs N   decodes of the file inside the profiled process (default 10)
   -hz N     sampling rate (default 4000)
+  -vs       profile ours *and* libjxl together, both symbolized (builds a
+            debug-info libjxl the first time, which is slow)
 Windows only: samply records with xperf and needs Administrator rights.`);
   process.exit(2);
 }
@@ -46,12 +53,19 @@ if (!existsSync(SAMPLY)) {
   process.exit(2);
 }
 
-const EXE = await buildProfHarness();
+// -vs profiles the benchmark harness instead, which decodes with *both*
+// decoders in one process. Linked against a debug-info libjxl, so libjxl's
+// own functions are attributed rather than showing up as one opaque module --
+// that is what makes "where are we slower than libjxl" answerable.
+const vs = argv.includes("-vs");
+const EXE = vs ? await buildBenchHarnessDbg() : await buildProfHarness();
 // Keep the .etl and the Firefox profile JSON inside out/, which is gitignored.
 const OUT = `${ROOT}/out/prof/samply.etl`;
 const proc = Bun.spawnSync({
+  // Absolute paths: samply silently fails to attach to a relative one, which
+  // shows up as a trace full of unrelated system processes.
   cmd: [SAMPLY, "record", "-i", HZ, "-o", OUT, "-print-agent",
-        "--", EXE, "-runs", RUNS, files[0]],
+        "--", resolve(EXE), "-runs", RUNS, resolve(files[0])],
   stdout: "inherit",
   stderr: "inherit",
   cwd: ROOT,

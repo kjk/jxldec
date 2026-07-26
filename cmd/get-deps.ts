@@ -21,6 +21,10 @@ export const DEPS_DIR = join(ROOT, "deps");
 export const LIBJXL_DIR = process.env.JXLDEC_LIBJXL || join(DEPS_DIR, "libjxl");
 export const LIBJXL_BUILD = join(DEPS_DIR, "libjxl-build");
 export const JXL_OXIDE_DIR = join(DEPS_DIR, "jxl-oxide");
+/* A second libjxl build with debug info, so a profile can attribute libjxl's
+   own time to its own functions. Only cmd/prof.ts -vs needs it, and it is
+   built on demand -- the Release build above carries no symbols. */
+export const LIBJXL_BUILD_DBG = join(DEPS_DIR, "libjxl-dbg");
 
 export const isWindows = process.platform === "win32";
 const exe = (name: string) => (isWindows ? `${name}.exe` : name);
@@ -138,6 +142,30 @@ export async function buildRef(): Promise<void> {
   }
   await $`cmake --build ${LIBJXL_BUILD} --target cjxl djxl jxlinfo`;
   console.log("deps: libjxl tools ready");
+}
+
+/* Configure + build the debug-info libjxl and the static libs the benchmark
+   harness links. Separate build tree so the Release one is untouched. */
+export async function buildRefDebug(): Promise<void> {
+  const marker = join(LIBJXL_BUILD_DBG, "lib", "jxl.lib");
+  if (existsSync(marker)) return;
+  console.log("deps: building libjxl with debug info (one-time, slow)...");
+  const flags = [
+    "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+    "-DCMAKE_C_COMPILER=clang-cl", "-DCMAKE_CXX_COMPILER=clang-cl",
+    "-DBUILD_TESTING=OFF", "-DBUILD_SHARED_LIBS=OFF",
+    "-DJPEGXL_ENABLE_TOOLS=ON", "-DJPEGXL_ENABLE_BENCHMARK=OFF",
+    "-DJPEGXL_ENABLE_EXAMPLES=OFF", "-DJPEGXL_ENABLE_MANPAGES=OFF",
+    "-DJPEGXL_ENABLE_SJPEG=OFF", "-DJPEGXL_ENABLE_OPENEXR=OFF",
+    "-DJPEGXL_ENABLE_JNI=OFF", "-DJPEGXL_ENABLE_DOXYGEN=OFF",
+    "-DJPEGXL_ENABLE_PLUGINS=OFF", "-DJPEGXL_BUNDLE_LIBPNG=OFF",
+    "-DJPEGXL_ENABLE_SKCMS=ON",
+  ];
+  await $`cmake -S ${LIBJXL_DIR} -B ${LIBJXL_BUILD_DBG} -G Ninja ${flags}`.quiet();
+  // djxl pulls in jxl.lib and jxl_cms.lib; the rest are linked separately by
+  // the benchmark harness.
+  await $`cmake --build ${LIBJXL_BUILD_DBG} --target djxl brotlidec brotlienc brotlicommon hwy`.quiet();
+  console.log("deps: debug libjxl ready");
 }
 
 if (import.meta.main) {
