@@ -573,14 +573,26 @@ int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
         for (c = 0; c < 3; c++) { t = in[c]; in[c] = out[c]; out[c] = t; }
     }
 
-    /* `in` holds the result; copy it back when it is the scratch buffer. */
+    /* `in` holds the result. On an odd pass count that is the scratch
+       allocation, so hand it to the caller and free the old plane instead of
+       copying the full image back. The forced-copy build makes that ownership
+       change directly testable against the old path. */
     for (c = 0; c < 3; c++) {
-        uint32_t y;
         if (in[c] == plane[c]) continue;
-        for (y = 0; y < h; y++) {
-            memcpy(plane[c] + (size_t)y * stride, in[c] + (size_t)y * stride,
-                   (size_t)w * sizeof(float));
+#ifdef JXL_EPF_FORCE_COPY_BACK
+        {
+            uint32_t y;
+            for (y = 0; y < h; y++) {
+                memcpy(plane[c] + (size_t)y * stride,
+                       in[c] + (size_t)y * stride,
+                       (size_t)w * sizeof(float));
+            }
         }
+#else
+        t = plane[c];
+        plane[c] = in[c];
+        scratch[c] = t;
+#endif
     }
     rc = 0;
 

@@ -83,6 +83,42 @@ The worst ratio among files that take libjxl more than 5ms is
 that is genuinely 25 taps per output sample. Modular is the strongest area.
 Files below ~1ms sit at much larger ratios purely on fixed setup cost.
 
+### Handing the final EPF scratch plane over
+A fresh profile of `P3-sRGB-color-bars.v_d1` was broad: the already-vectorized
+DCT led at 8.4%, while no other decoder function exceeded 6.6%. The remaining
+copy traffic was more tractable. Reconstructing callers from winperf's Firefox
+profile showed that **417 of 762** `memcpy` samples came from `jxl_apply_epf`.
+
+EPF ping-pongs between the coefficient plane and one scratch plane. With an
+odd pass count, the scratch allocation contains the final image, but the old
+code copied every real row back into the original allocation and then freed
+the scratch. It now transfers the finished allocation to the frame and frees
+the old coefficient plane instead. Even pass counts already finish in the
+original plane and are unchanged.
+
+Best of 20:
+
+| file | copy back | handoff |
+|---|---:|---:|
+| `P3-sRGB-color-bars.v_d1` | 15.14ms | **14.68ms** |
+| `flower.v_d1` | 82.90ms | **81.01ms** |
+| `flower.v_e3` | 79.85ms | **78.38ms** |
+| `flower.v_noise` | 116.31ms | **114.12ms** |
+| `splines.v_e3` | 75.80ms | **74.95ms** |
+| total | 370.00ms | **363.14ms (-1.9%)** |
+
+The follow-up profile has no `jxl_apply_epf` copy samples, and its total fell
+from 20854 to 20184 samples. Two full-corpus timing attempts were unusably
+throttled: both decoders slowed sharply and inconsistently, so the stable
+1.40x headline above is deliberately left unchanged rather than replaced by
+a contaminated measurement.
+
+`-DJXL_EPF_FORCE_COPY_BACK` restores the old ownership path. Copy-back and
+handoff builds produced byte-identical output on all 1245 corpus files.
+`bun cmd/tests.ts -all`: 1245/1245 ok; an ASan run over the three affected
+VarDCT presets was 244/244 ok. All 115 fuzz reproducers clean, and the
+amalgamation compiles cleanly with clang and MSVC.
+
 ### Oriented output without per-pixel coordinate mapping
 The post-DCT corpus ranking put `flower.v_orient` at 112.27ms against
 libjxl's 48.98ms: **2.29x**, with a 63.29ms absolute gap. A 50-run side-by-side

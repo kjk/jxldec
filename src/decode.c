@@ -930,6 +930,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
             if (jxl_apply_epf(ctx, planes, color_w, color_h, vd.pw, vd.epf_sigma,
                               vd.bw, &fh->epf) != 0)
                 goto done;
+            for (c = 0; c < 3; c++) vd.coeff[c] = planes[c];
         }
     }
 
