@@ -62,7 +62,7 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.96x libjxl** (2.74x before the SSE2 work below;
+1245-file corpus we are **1.91x libjxl** (2.74x before the SSE2 work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
 average up). libjxl is AVX2 throughout; we are scalar C apart from the SSE2
@@ -201,12 +201,31 @@ disappear for trees shaped like `m_e1`'s.
 Corpus **1.99x -> 1.96x**. 1245/1245 ok with Modular still byte-exact, ASan
 clean, 115 fuzz reproducers clean.
 
-The corpus moves less than the files because `m_e3` and `m_e7` are the heavier
-presets and both test property 15, so they still walk the tree. That is the
-next track: for a tree testing only properties 0 and 15, build a
-16384-entry table from the clamped WP error to the leaf, once per channel.
-It removes `ma_get_leaf` (11%) and fourteen of the sixteen properties, but not
-`sc_predict` (25%), which is sequential work both decoders have to do.
+**The WP table, the second track.** When the tree tests nothing but channel,
+stream and the weighted-predictor error, the leaf is a function of one value,
+so it can be tabulated: 16384 entries from the clamped error, built once per
+channel, replacing the walk with an array index. `sc_predict` still runs --
+the predictor's state is sequential and libjxl computes it too -- but the walk
+and fifteen of the sixteen property slots leave the loop.
+
+The table is only valid if clamping the index cannot change a decision. The
+walk tests `v > split`, so clamping to HI agrees with the truth when
+`split < HI`, and to LO when `split >= LO`; `ma_wp_lut_ok` checks every split
+tested against property 15 and refuses the track otherwise, which is the same
+bail-out libjxl's `TreeToLookupTable` has. Building it costs 16384 walks, so
+it is only taken on channels with several times that many samples.
+
+    flower.m_e3   449.4ms  1.61x -> 347.2ms  1.25x   (-23%)
+
+Both tracks together, by preset:
+
+    m_e1   2.41x     m_e3   1.42x     m_e7   1.31x
+    m_e9   1.27x     m_resp 1.65x     lm_d1  2.86x
+
+Corpus **1.99x -> 1.91x** over the two tracks. What is left in Modular is
+`sc_predict` itself, which neither decoder can avoid, and `lm_d1` at 2.86x --
+lossy Modular, whose tree tests properties 0,1,4..8 and so takes neither
+track.
 
 ### Profiling libjxl next to ourselves
 `bun cmd/prof.ts -vs <file>` profiles the *benchmark* harness rather than the

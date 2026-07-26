@@ -1654,6 +1654,35 @@ static uint32_t ma_props_mask(const jxl_ma_config *ma) {
     return mask;
 }
 
+/* The weighted-predictor error (property 15) is unbounded in principle, so a
+   lookup table over it is only valid if clamping the index cannot change any
+   decision. The walk tests `v > split`, so for a value above the range,
+   clamping to HI agrees with the true answer when split < HI; below the
+   range, clamping to LO agrees when split >= LO. Checking every split tested
+   against property 15 against that is what makes the table safe -- libjxl's
+   TreeToLookupTable bails out on the same condition. */
+#define JXL_WP_LUT_LO (-8192)
+#define JXL_WP_LUT_HI (8191)
+#define JXL_WP_LUT_N  (JXL_WP_LUT_HI - JXL_WP_LUT_LO + 1)
+
+static int ma_wp_lut_ok(const jxl_ma_config *ma) {
+    uint32_t i;
+    for (i = 0; i < ma->nflat; i++) {
+        const jxl_ma_flat *f = &ma->flat[i];
+        if (f->property < 0) continue;
+        if (f->property == 15 &&
+            !(f->u.dec.split0 >= JXL_WP_LUT_LO && f->u.dec.split0 < JXL_WP_LUT_HI))
+            return 0;
+        if (f->u.dec.prop1 == 15 &&
+            !(f->u.dec.split1 >= JXL_WP_LUT_LO && f->u.dec.split1 < JXL_WP_LUT_HI))
+            return 0;
+        if (f->u.dec.prop2 == 15 &&
+            !(f->u.dec.split2 >= JXL_WP_LUT_LO && f->u.dec.split2 < JXL_WP_LUT_HI))
+            return 0;
+    }
+    return 1;
+}
+
 static int ma_needs_self_correcting(const jxl_ma_config *ma) {
     uint32_t i;
     for (i = 0; i < ma->nflat; i++) {
@@ -1703,6 +1732,8 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
     uint32_t max_prev;
     int need_sc;
     uint32_t props_mask;
+    int wp_lut_usable = 0;
+    const jxl_ma_leaf **wp_lut = NULL;
     int rc = -1;
 
     if (!ma || !ma->valid) {
@@ -1720,6 +1751,15 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
     memset(&ps, 0, sizeof(ps));
     need_sc = ma_needs_self_correcting(ma);
     props_mask = ma_props_mask(ma);
+    /* Tree tests nothing but channel, stream and the WP error: the leaf is a
+       function of one clamped value, so it can be tabulated per channel. */
+    wp_lut_usable = need_sc && (props_mask & ~(1u | 2u | 0x8000u)) == 0 &&
+                    ma_wp_lut_ok(ma);
+    if (wp_lut_usable) {
+        wp_lut = (const jxl_ma_leaf **)jxl_calloc(ctx, JXL_WP_LUT_N,
+                                                  sizeof(*wp_lut));
+        if (!wp_lut) goto done;
+    }
     max_prev = ma_max_prev_channels(ma);
     if (max_prev) {
         prev = (const jxl_mchan **)jxl_calloc(ctx, cl->n, sizeof(jxl_mchan *));
@@ -1749,6 +1789,54 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
         if (pred_state_reset(ctx, &ps, ch->w, need_sc ? &m->header.wp : NULL,
                              prev, nprev) != 0)
             goto done;
+
+        /* Fast track: leaf as a function of the clamped WP error alone.
+           Building the table costs JXL_WP_LUT_N walks, so it only pays on a
+           channel with many more samples than that. sc_predict still runs --
+           the weighted predictor's state is sequential and both decoders have
+           to do it -- but the tree walk and fifteen of the sixteen property
+           slots drop out of the loop. */
+        if (wp_lut && (uint64_t)ch->w * ch->h >= 4 * JXL_WP_LUT_N) {
+            jxl_props pr;
+            uint32_t v;
+            memset(&pr, 0, sizeof(pr));
+            pr.cache[0] = (int32_t)ci;
+            pr.cache[1] = (int32_t)stream_idx;
+            for (v = 0; v < JXL_WP_LUT_N; v++) {
+                pr.cache[15] = JXL_WP_LUT_LO + (int32_t)v;
+                wp_lut[v] = ma_get_leaf(ma, &ps, &pr);
+            }
+            pr.has_sc = 1;
+            for (y = 0; y < ch->h; y++) {
+                int32_t *row = ch->data + (size_t)y * ch->stride;
+                for (x = 0; x < ch->w; x++) {
+                    const jxl_ma_leaf *leaf;
+                    uint32_t token;
+                    int32_t diff, value, me;
+                    sc_predict(&ps.sc, ps.n, ps.nw, pred_ne(&ps), ps.w,
+                               pred_nn(&ps), &pr.sc);
+                    me = pr.sc.max_error;
+                    if (me < JXL_WP_LUT_LO) me = JXL_WP_LUT_LO;
+                    else if (me > JXL_WP_LUT_HI) me = JXL_WP_LUT_HI;
+                    leaf = wp_lut[me - JXL_WP_LUT_LO];
+                    token = jxl_dec_read_clustered(dec, br, leaf->cluster,
+                                                   dist_multiplier);
+                    diff = jxl_unpack_signed(token);
+                    diff = (int32_t)((uint32_t)diff * leaf->multiplier +
+                                     (uint32_t)leaf->offset);
+                    value = (int32_t)((uint32_t)diff +
+                            (uint32_t)predict_sample(&ps, &pr, leaf->predictor));
+                    row[x] = value;
+                    pred_record(&ps, &pr, value);
+                }
+                if (br->err || dec->err) {
+                    JXL_ERR(ctx, "modular: truncated stream %u",
+                            (unsigned)stream_idx);
+                    goto done;
+                }
+            }
+            continue;
+        }
 
         /* Fast track: the tree only tests channel and stream index, both
            fixed for this channel, so the leaf is fixed too -- resolve it once
@@ -1828,6 +1916,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
     rc = 0;
 
 done:
+    jxl_free(ctx, wp_lut);
     pred_state_free(ctx, &ps);
     jxl_free(ctx, prev);
     return rc;
