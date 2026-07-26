@@ -67,6 +67,7 @@ static void build_kernel(float *kernel, uint32_t shift, const float *w) {
      (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
 #define JXL_UPSAMPLE_SSE2 1
 #include <emmintrin.h>
+#include <immintrin.h>
 #endif
 
 /* These two run only where up_block4 below cannot: the first two and last
@@ -176,6 +177,101 @@ static void up_block4(const float *const *srow, uint32_t x, uint32_t N,
         }
     }
 }
+/* Eight input samples at a time. Same shape as up_block4 -- the profile put
+   26.4% of a resampled decode in that function against libjxl's 6.2% for the
+   identical stage, and the difference is lanes: libjxl runs this eight wide
+   on AVX2 where we ran four.
+
+   The accumulate widens directly. Only the store needs thought, because each
+   vector holds one output column for eight input samples while the row wants
+   them interleaved. Splitting each accumulator into its two 128-bit halves
+   turns that back into exactly the four-sample interleave up_block4 already
+   does, applied twice -- no 8-wide shuffle network, and the N == 2 and N == 4
+   cases keep their existing unpack and transpose.
+
+   No FMA, for the usual reason: it would round once where the scalar and SSE2
+   paths round twice, and all three are diffed against each other. */
+JXL_TARGET_AVX2
+static void up_block8(const float *const *srow, uint32_t x, uint32_t N,
+                      const float *kernel, float *dst_rows[8], uint32_t ny) {
+    __m256 vlo, vhi;
+    uint32_t oy, ox;
+    int py, px;
+
+    {
+        __m256 mn = _mm256_loadu_ps(srow[0] + x - 2), mx = mn;
+        for (py = 0; py < 5; py++) {
+            const float *r = srow[py] + x - 2;
+            for (px = (py == 0) ? 1 : 0; px < 5; px++) {
+                __m256 v = _mm256_loadu_ps(r + px);
+                mn = _mm256_min_ps(mn, v);
+                mx = _mm256_max_ps(mx, v);
+            }
+        }
+        vlo = mn;
+        vhi = mx;
+    }
+
+    for (oy = 0; oy < ny; oy++) {
+        float *drow = dst_rows[oy];
+        __m128 lo[8], hi[8];
+        for (ox = 0; ox < N; ox++) {
+            const float *k = kernel + ((size_t)oy * N + ox) * 25;
+            __m256 acc = _mm256_setzero_ps();
+            __m256 m;
+            int t = 0;
+            for (py = 0; py < 5; py++) {
+                const float *r = srow[py] + x - 2;
+                for (px = 0; px < 5; px++, t++) {
+                    acc = _mm256_add_ps(acc,
+                        _mm256_mul_ps(_mm256_loadu_ps(r + px),
+                                      _mm256_set1_ps(k[t])));
+                }
+            }
+            m = _mm256_cmp_ps(acc, vlo, _CMP_LT_OQ);
+            acc = _mm256_or_ps(_mm256_and_ps(m, vlo),
+                               _mm256_andnot_ps(m, acc));
+            m = _mm256_cmp_ps(acc, vhi, _CMP_GT_OQ);
+            acc = _mm256_or_ps(_mm256_and_ps(m, vhi),
+                               _mm256_andnot_ps(m, acc));
+            lo[ox] = _mm256_castps256_ps128(acc);
+            hi[ox] = _mm256_extractf128_ps(acc, 1);
+        }
+        if (N == 2) {
+            _mm_storeu_ps(drow + x * 2, _mm_unpacklo_ps(lo[0], lo[1]));
+            _mm_storeu_ps(drow + x * 2 + 4, _mm_unpackhi_ps(lo[0], lo[1]));
+            _mm_storeu_ps(drow + (x + 4) * 2, _mm_unpacklo_ps(hi[0], hi[1]));
+            _mm_storeu_ps(drow + (x + 4) * 2 + 4,
+                          _mm_unpackhi_ps(hi[0], hi[1]));
+        } else if (N == 4) {
+            _MM_TRANSPOSE4_PS(lo[0], lo[1], lo[2], lo[3]);
+            _mm_storeu_ps(drow + x * 4, lo[0]);
+            _mm_storeu_ps(drow + x * 4 + 4, lo[1]);
+            _mm_storeu_ps(drow + x * 4 + 8, lo[2]);
+            _mm_storeu_ps(drow + x * 4 + 12, lo[3]);
+            _MM_TRANSPOSE4_PS(hi[0], hi[1], hi[2], hi[3]);
+            _mm_storeu_ps(drow + (x + 4) * 4, hi[0]);
+            _mm_storeu_ps(drow + (x + 4) * 4 + 4, hi[1]);
+            _mm_storeu_ps(drow + (x + 4) * 4 + 8, hi[2]);
+            _mm_storeu_ps(drow + (x + 4) * 4 + 12, hi[3]);
+        } else {
+            for (ox = 0; ox < N; ox++) {
+                float t0[4], t1[4];
+                _mm_storeu_ps(t0, lo[ox]);
+                _mm_storeu_ps(t1, hi[ox]);
+                drow[(size_t)(x + 0) * N + ox] = t0[0];
+                drow[(size_t)(x + 1) * N + ox] = t0[1];
+                drow[(size_t)(x + 2) * N + ox] = t0[2];
+                drow[(size_t)(x + 3) * N + ox] = t0[3];
+                drow[(size_t)(x + 4) * N + ox] = t1[0];
+                drow[(size_t)(x + 5) * N + ox] = t1[1];
+                drow[(size_t)(x + 6) * N + ox] = t1[2];
+                drow[(size_t)(x + 7) * N + ox] = t1[3];
+            }
+        }
+    }
+    _mm256_zeroupper();
+}
 #endif
 
 /* Picks the weight set for a shift of 1, 2 or 3. */
@@ -193,6 +289,9 @@ int jxl_upsample_plane(jxl_ctx *ctx, jxl_fplane *p, uint32_t shift,
     float *kernel = NULL;
     jxl_fplane dst;
     int rc = -1;
+#ifdef JXL_UPSAMPLE_SSE2
+    const int use_avx2 = jxl_has_avx2();
+#endif
 
     if (shift == 0 || shift > 3) return 0;
     if (w == 0 || h == 0) return 0;
@@ -207,6 +306,11 @@ int jxl_upsample_plane(jxl_ctx *ctx, jxl_fplane *p, uint32_t shift,
     if (jxl_fplane_alloc_uninit(ctx, &dst, out_w, out_h) != 0) goto done;
 
     for (y = 0; y < h; y++) {
+        /* Whether this input row's whole N-row output block is inside the
+           crop -- the wide paths below all write N full rows. */
+#ifdef JXL_UPSAMPLE_SSE2
+        const int y_full = (uint64_t)(y + 1) * N <= out_h;
+#endif
         /* The five source rows depend only on y, so mirror them once per row
            rather than once per sample -- and inside the row, only the first
            and last two columns need mirroring at all. */
@@ -224,18 +328,32 @@ int jxl_upsample_plane(jxl_ctx *ctx, jxl_fplane *p, uint32_t shift,
             int n = 0;
 
 #ifdef JXL_UPSAMPLE_SSE2
-            /* Four at a time when all four are interior (no mirroring, so
-               the taps are plain contiguous loads) and all four write a
-               whole N-wide block inside the crop. */
-            if (x >= 2 && x + 6 <= w && (uint64_t)(x + 4) * N <= out_w &&
-                (uint64_t)(y + 1) * N <= out_h) {
+            /* Four (or eight) at a time when they are all interior -- no
+               mirroring, so the taps are plain contiguous loads -- and all of
+               them write a whole N-wide block inside the crop. The eight-wide
+               guard needs four more input samples of margin on the right for
+               the last tap, and four more output blocks inside the crop. */
+            if (y_full) {
                 float *drows[8];
-                for (oy = 0; oy < N; oy++) {
-                    drows[oy] = dst.data + (size_t)(y * N + oy) * dst.stride;
+                if (use_avx2 && x >= 2 && x + 10 <= w &&
+                    (uint64_t)(x + 8) * N <= out_w) {
+                    for (oy = 0; oy < N; oy++) {
+                        drows[oy] = dst.data +
+                                    (size_t)(y * N + oy) * dst.stride;
+                    }
+                    up_block8(srow, x, N, kernel, drows, N);
+                    x += 8;
+                    continue;
                 }
-                up_block4(srow, x, N, kernel, drows, N);
-                x += 4;
-                continue;
+                if (x >= 2 && x + 6 <= w && (uint64_t)(x + 4) * N <= out_w) {
+                    for (oy = 0; oy < N; oy++) {
+                        drows[oy] = dst.data +
+                                    (size_t)(y * N + oy) * dst.stride;
+                    }
+                    up_block4(srow, x, N, kernel, drows, N);
+                    x += 4;
+                    continue;
+                }
             }
 #endif
 

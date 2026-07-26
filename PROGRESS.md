@@ -171,6 +171,49 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Upsampling eight wide, and one thing that looked obvious and was not
+`v_rs2` and `v_rs4` were the worst ratios left, and a `-vs` profile of
+`P3-sRGB-red.v_rs2` made the comparison unusually direct, because both
+decoders name the same stage:
+
+| | |
+|---|---|
+| ours `up_block4` | **26.4%** |
+| libjxl `UpsamplingStage::ProcessRowImpl<2>` | **6.2%** |
+
+Four times slower at the identical filter. Reading libjxl's version, the
+algorithm is the same -- 25 taps per output, vectorised across x -- and it
+differs in three ways: it runs eight lanes on AVX2, it uses FMA, and it sums
+into **three** accumulators rather than one.
+
+The three accumulators looked like the interesting one. Twenty-five products
+summed into a single register is a 25-deep chain of dependent adds, and at
+~4 cycles each that is 100 cycles of pure latency per output. Splitting it
+three ways (and taking libjxl's exact grouping, so the rounding would match
+the reference too) should have been most of the gap.
+
+It is a **wash**: 700/683ms against 691/693ms on `v_rs2`. The reason is that
+the chain was never exposed -- the `ox` loop already runs N independent
+outputs over the same taps, so the out-of-order engine had plenty to overlap
+the chain with. Reverted; it was 25 lines of unrolled code for nothing.
+
+The gap was simply lanes. `up_block8` is `up_block4` widened, and only the
+store needed thought: each vector holds one output column for eight input
+samples while the row wants them interleaved, so splitting each accumulator
+into its two 128-bit halves turns the problem back into exactly the
+four-sample interleave that already existed, applied twice -- no 8-wide
+shuffle network, and the N == 2 unpack and N == 4 transpose are reused as-is.
+No FMA, so all three builds still agree bit for bit.
+
+| preset | SSE2 4-wide p1 / p2 | AVX2 8-wide p1 / p2 |
+|---|---|---|
+| `v_rs2` | 2.405x / 2.417x (681/689ms) | **2.055x / 2.020x (587/585ms)** |
+| `v_rs4` | 2.310x / 2.315x (438/445ms) | **1.828x / 1.854x (354/355ms)** |
+
+Corpus **1.49x -> 1.48x**. Scalar, SSE2-only and AVX2 builds diffed
+byte-identical over all 1242 corpus files, verdicts unchanged, ASan clean,
+115 reproducers clean, amalgamation compiles.
+
 ### Caching the WP lookup table on the tree
 The WP-error table is 16384 tree walks to build, and it was built **per
 channel**. That is fine for one big channel and bad for the way frames are
