@@ -62,7 +62,7 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.91x libjxl** (2.74x before the SSE2 work below;
+1245-file corpus we are **1.43x libjxl** (2.74x before the SSE2 work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
 average up). libjxl is AVX2 throughout; we are scalar C apart from the SSE2
@@ -78,10 +78,44 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The worst ratios among files that take libjxl more than 5ms are the `v_rs2`
-set, whose upsampling filter is genuinely 25 taps per output sample. Modular
-is the strongest area -- `m_e9` is 1.25x and `m_e3` 1.65x. Files below ~1ms
-sit at up to 9x purely on fixed setup cost.
+The worst ratio among files that take libjxl more than 5ms is
+`R2020-sRGB-blue.v_prog`; the `v_rs2` set follows, with an upsampling filter
+that is genuinely 25 taps per output sample. Modular is the strongest area.
+Files below ~1ms sit at much larger ratios purely on fixed setup cost.
+
+### Constant-folding the default weighted predictor
+The full-corpus benchmark put `R2020-sRGB-blue.v_prog` at the top of the
+meaningful ratios: 49.73ms against libjxl's 17.01ms, **2.92x**. A side-by-side
+winperf `-print-agent` profile, 120 interleaved runs at 4kHz, made the gap
+specific:
+
+| function | self samples | self share |
+|---|---:|---:|
+| our `sc_predict` | 7008 | 19.8% |
+| libjxl `DecodeModularChannelMAANS<0>` (the whole corresponding decode) | 592 | 1.7% |
+
+The progressive LF tree needs the general Modular path, so the existing WP
+error lookup-table track cannot apply. But its weighted-predictor header uses
+cjxl's default eleven parameters. They are constant for the whole channel;
+the hot function nevertheless loaded them and performed their runtime
+multiplications for every pixel.
+
+`pred_state_reset` now recognizes the default set once. `sc_predict` then uses
+literal coefficients: the two zero terms in predictor 3 disappear, and the
+four weight scales become compile-time constants. Non-default headers keep
+the original arithmetic unchanged. Splitting the two cases into separate
+functions was also tried; the added dispatch cost lost the gain, so the
+single-function form remains. Explicitly unrolling the max-error scan was a
+wash and was reverted too.
+
+The target moved from 49.73ms / 2.92x to **47.54ms / 2.78x** in the two
+whole-corpus sweeps (-4.4% in our decoder). The same winperf profile dropped
+`sc_predict` from 7008 to **6664** self samples and the complete trace from
+35327 to 34455 samples. Corpus total moved from 24.341s / 1.45x to
+**23.601s / 1.43x**; libjxl was 16.770s and 16.520s in the two sweeps.
+
+`bun cmd/tests.ts -all`: 1245/1245 ok. All 115 fuzz reproducers clean, and the
+amalgamation compiles cleanly with clang and MSVC.
 
 ### The EPF and spline rewrites
 Three hot loops were doing the same work three or more times over.

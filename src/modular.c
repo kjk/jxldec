@@ -472,6 +472,7 @@ typedef struct {
     int32_t *true_err_row;
     uint32_t *subpred_err_row;   /* 4 per column */
     jxl_wp_header wp;
+    int default_wp;
     int32_t true_err_w, true_err_nw, true_err_n, true_err_ne;
     uint32_t subpred_err_nw_ww[4], subpred_err_n_w[4], subpred_err_ne[4];
 } jxl_sc_pred;
@@ -515,6 +516,12 @@ static int pred_state_reset(jxl_ctx *ctx, jxl_pred_state *ps, uint32_t width,
         ps->use_sc = 1;
         ps->sc.width = width;
         ps->sc.wp = *wp;
+        ps->sc.default_wp =
+            wp->p1 == 16 && wp->p2 == 10 &&
+            wp->p3a == 7 && wp->p3b == 7 && wp->p3c == 7 &&
+            wp->p3d == 0 && wp->p3e == 0 &&
+            wp->w0 == 13 && wp->w1 == 12 &&
+            wp->w2 == 12 && wp->w3 == 12;
         ps->sc.true_err_row =
             (int32_t *)jxl_calloc(ctx, width ? width : 1, sizeof(int32_t));
         ps->sc.subpred_err_row =
@@ -579,13 +586,19 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
     int64_t sp0, sp1, sp2, sp3, pred;
 
     sp0 = w3 + ne3 - n3;
-    sp1 = n3 - (((te_w + te_n + te_ne) * (int64_t)sc->wp.p1) >> 5);
-    sp2 = w3 - (((te_w + te_n + te_nw) * (int64_t)sc->wp.p2) >> 5);
-    sp3 = n3 - ((te_nw * (int64_t)sc->wp.p3a +
-                 te_n * (int64_t)sc->wp.p3b +
-                 te_ne * (int64_t)sc->wp.p3c +
-                 (nn3 - n3) * (int64_t)sc->wp.p3d +
-                 (nw3 - w3) * (int64_t)sc->wp.p3e) >> 5);
+    if (sc->default_wp) {
+        sp1 = n3 - (((te_w + te_n + te_ne) * 16) >> 5);
+        sp2 = w3 - (((te_w + te_n + te_nw) * 10) >> 5);
+        sp3 = n3 - (((te_nw + te_n + te_ne) * 7) >> 5);
+    } else {
+        sp1 = n3 - (((te_w + te_n + te_ne) * (int64_t)sc->wp.p1) >> 5);
+        sp2 = w3 - (((te_w + te_n + te_nw) * (int64_t)sc->wp.p2) >> 5);
+        sp3 = n3 - ((te_nw * (int64_t)sc->wp.p3a +
+                     te_n * (int64_t)sc->wp.p3b +
+                     te_ne * (int64_t)sc->wp.p3c +
+                     (nn3 - n3) * (int64_t)sc->wp.p3d +
+                     (nw3 - w3) * (int64_t)sc->wp.p3e) >> 5);
+    }
 
     es0 = sc->subpred_err_nw_ww[0] + sc->subpred_err_n_w[0] + sc->subpred_err_ne[0];
     es1 = sc->subpred_err_nw_ww[1] + sc->subpred_err_n_w[1] + sc->subpred_err_ne[1];
@@ -594,10 +607,17 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
 
 #define JXL_SC_WEIGHT(es, wn) (                                                   sc_weight_one((es), (wn), dl))
 
-    wt0 = JXL_SC_WEIGHT(es0, sc->wp.w0);
-    wt1 = JXL_SC_WEIGHT(es1, sc->wp.w1);
-    wt2 = JXL_SC_WEIGHT(es2, sc->wp.w2);
-    wt3 = JXL_SC_WEIGHT(es3, sc->wp.w3);
+    if (sc->default_wp) {
+        wt0 = JXL_SC_WEIGHT(es0, 13);
+        wt1 = JXL_SC_WEIGHT(es1, 12);
+        wt2 = JXL_SC_WEIGHT(es2, 12);
+        wt3 = JXL_SC_WEIGHT(es3, 12);
+    } else {
+        wt0 = JXL_SC_WEIGHT(es0, sc->wp.w0);
+        wt1 = JXL_SC_WEIGHT(es1, sc->wp.w1);
+        wt2 = JXL_SC_WEIGHT(es2, sc->wp.w2);
+        wt3 = JXL_SC_WEIGHT(es3, sc->wp.w3);
+    }
 #undef JXL_SC_WEIGHT
 
     sum_weights = wt0 + wt1 + wt2 + wt3;
