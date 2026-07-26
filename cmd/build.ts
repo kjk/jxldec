@@ -414,7 +414,8 @@ export async function buildProfHarness(): Promise<string> {
   if (needsRebuild(libObj, DIST_C, DIST_H)) {
     await runCmd(`cl ${clZi} -Fd${dir}/ -Idist -Fo${libObj} -c dist/jxl.c`, ROOT);
   }
-  if (needsRebuild(profObj, `${ROOT}/test/jxl_prof.c`, DIST_H)) {
+  if (needsRebuild(profObj, `${ROOT}/test/jxl_prof.c`, DIST_H,
+                   `${ROOT}/test/winperf_control.h`)) {
     await runCmd(
       `cl ${clZi} -Fd${dir}/ -Idist -Fo${profObj} -c test/jxl_prof.c`,
       ROOT,

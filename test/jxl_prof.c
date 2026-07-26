@@ -3,14 +3,27 @@
  *   jxl_prof [-runs N] file.jxl
  *
  * Only our decoder runs, so a sampling profile of this process is a profile
- * of jxldec alone. Built with debug info so samply can symbolize it; see
+ * of jxldec alone. Built with debug info so winperf can symbolize it; see
  * `bun cmd/prof.ts`.
+ *
+ * The decode loop is bracketed by winperf section marks, so reading the file,
+ * process startup and teardown are dropped from the profile rather than
+ * diluting it. The calls are no-ops when the process is not running under
+ * `winperf record`, so this harness still runs normally on its own.
  */
 #include "jxl.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+/* Vendored control client; calls are no-ops when winperf is not recording. */
+#include "winperf_control.h"
+#else
+static void winperf_profile_start(void) {}
+static void winperf_profile_stop(void) {}
+#endif
 
 static void on_error(void *user, jxl_severity sev, const char *msg) {
     (void)user;
@@ -55,8 +68,13 @@ int main(int argc, char **argv) {
     len = (size_t)n;
 
     for (i = 0; i < runs; i++) {
-        jxl_ctx *ctx = jxl_ctx_new(NULL, NULL, on_error, NULL);
-        jxl_image *img = jxl_decode(ctx, data, len, JXLDEC_FORMAT_NATIVE);
+        jxl_ctx *ctx;
+        jxl_image *img;
+
+        winperf_profile_start();
+        ctx = jxl_ctx_new(NULL, NULL, on_error, NULL);
+        img = jxl_decode(ctx, data, len, JXLDEC_FORMAT_NATIVE);
+        winperf_profile_stop();
         if (!img) {
             fprintf(stderr, "decode failed: %s\n", path);
             return 1;

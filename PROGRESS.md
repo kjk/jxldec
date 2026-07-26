@@ -72,9 +72,11 @@ inverse, the sRGB transfer function and the output quantiser), plus an AVX2
 keeps a scalar twin and is checked bit-identical against it -- see the log.
 
 `bun cmd/prof.ts <file.jxl>` profiles our decoder alone through the sibling
-`../samply` and prints samply's `-print-agent` report (top self-time
-functions, hot source lines, heaviest call path). That is how the numbers
-below were found.
+`../winperf` and prints its `-print-agent` report (top self-time functions,
+hot source lines, heaviest call path). That is how the numbers below were
+found. The tool was called `samply` until it was renamed, so log entries
+below that date the rename refer to it by the old name; the invocation and
+the report format are the same.
 
 The worst ratios among files that take libjxl more than 5ms are the `v_rs2`
 set, whose upsampling filter is genuinely 25 taps per output sample. Modular

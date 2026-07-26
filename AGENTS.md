@@ -39,6 +39,49 @@ natively, which is all the oracle needs; `cmd/png.ts` decodes the testdata
 PNGs to PNM in TypeScript. Don't re-investigate this.
 
 ## Build & test
+
+### Windows sampling profiles (winperf)
+
+The profiling harness vendors `test/winperf_control.h`, so a **winperf**
+checkout is not required to compile. To record profiles, first look for the
+private winperf repository at `..\winperf`. If it is absent, try to clone it
+there:
+
+```
+git clone https://github.com/kjk/winperf ..\winperf
+cd ..\winperf && bun cmd/build.ts -release
+```
+
+The clone requires access to the private repository. Keep the vendored header
+in sync with `..\winperf\client\winperf_control.h`.
+
+```
+bun cmd/prof.ts <file.jxl> [-runs N] [-hz N] [-vs]
+```
+
+Builds `out/prof/jxl_prof.exe` (MSVC `-O2 -Ob3 -Zi -Oy-`, no LTCG — LTCG
+inlines across the whole amalgamation and blurs attribution) and records it
+under winperf with `-print-agent`. Needs the **Windows Performance Toolkit**
+(`xperf.exe` from the ADK) and **Administrator rights** (UAC prompt).
+
+`jxl_prof` brackets each decode with `winperf_profile_start/stop` section
+marks, so reading the file and process startup are dropped rather than
+diluting the profile; the report says how many regions it saw
+(`profiling windows: 40 region(s)` for `-runs 40`) which is the quick check
+that the marks are being honoured. The marks are no-ops when the process is
+not running under `winperf record`. Override the winperf binary with
+`JXLDEC_WINPERF`. Give winperf an **absolute path** to the exe — it fails to
+attach to a relative one and the trace fills with unrelated system processes
+instead of erroring.
+
+Manual equivalent:
+
+```
+..\winperf\out\rel64\winperf.exe record -i 4000 -o out\prof\winperf.etl -print-agent -- out\prof\jxl_prof.exe -runs 40 deps\corpus\gen\flower.v_icc.jxl
+```
+
+(This tool used to be called `samply`; older PROGRESS.md entries name it that.)
+
 - `bun cmd/build.ts` — fetch deps, build the decoder + `jxl_test`. **MSVC is
   the default on Windows** (`out/msvc/jxl_test_msvc.exe`); `-clang` builds
   with clang (`out/clang/jxl_test_clang.exe`). `-clean` wipes `out/`.
@@ -69,17 +112,14 @@ PNGs to PNM in TypeScript. Don't re-investigate this.
 - `bun cmd/bench.ts <selection> [-runs N]` — times our decode against libjxl's,
   both in one process, single-threaded, best of N. Windows/MSVC only: it links
   libjxl's static libraries, which need `-MD` and `-DJXL_STATIC_DEFINE`.
-- `bun cmd/prof.ts <file.jxl> [-runs N] [-vs]` — sampling profile of *our* decoder
-  alone on one file, via the sibling `../samply` (build it once with
-  `cd ../samply && bun cmd/build.ts -release`). It builds `jxl_prof` with
-  `-Zi` into `out/prof/` and passes samply `-print-agent`, which prints the
-  top self-time functions, the hot source lines and the heaviest call path.
-  Needs Administrator rights and `xperf.exe` from the Windows ADK. `-vs`
-  profiles ours *and* libjxl in one process with both symbolized, by linking
-  the benchmark harness against a debug-info libjxl (built on demand into
-  `deps/libjxl-dbg`); that is how to see which side of a ratio is slow. Give
-  samply an absolute path -- it fails to attach to a relative one and the
-  trace fills with unrelated processes instead of erroring.
+- `bun cmd/prof.ts <file.jxl> [-runs N] [-hz N] [-vs]` — sampling profile of
+  *our* decoder alone on one file, via the sibling **winperf** (see below).
+  It builds `jxl_prof` with `-Zi` into `out/prof/` and passes winperf
+  `-print-agent`, which prints the top self-time functions, the hot source
+  lines and the heaviest call path. `-vs` profiles ours *and* libjxl in one
+  process with both symbolized, by linking the benchmark harness against a
+  debug-info libjxl (built on demand into `deps/libjxl-dbg`); that is how to
+  see which side of a ratio is slow.
 - `bun cmd/build-dist.ts` — regenerate the `dist/jxl.c` + `dist/jxl.h`
   amalgamation and verify it compiles with every available toolchain.
 
