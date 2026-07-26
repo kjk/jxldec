@@ -62,7 +62,7 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.99x libjxl** (2.74x before the SSE2 work below;
+1245-file corpus we are **1.96x libjxl** (2.74x before the SSE2 work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
 average up). libjxl is AVX2 throughout; we are scalar C apart from the SSE2
@@ -168,6 +168,45 @@ latency than three adds.
 Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
+
+### Specialising the Modular inner loop on the tree's shape
+On branch `modular-fused-loop`. The `-vs` profile said libjxl does the whole
+per-sample Modular pipeline in one function at 35.5% where ours takes five at
+54.5%, and force-inlining made that *worse*, so the difference is not call
+overhead. Reading `encoding.cc` shows what it actually is: libjxl keeps
+**specialised inner loops** picked by the shape of the MA tree
+(`is_gradient_only`, `is_wp_only`), and in those it replaces the tree walk
+with a precomputed `context_lookup[]` table and computes **one** property
+instead of sixteen.
+
+Measuring our own trees first, rather than guessing which specialisation is
+worth writing:
+
+    m_e1   props=0x1     only property 0 (channel)
+    m_e3   props=0x8001  channel + property 15 (the WP error)
+    m_e7   props=0x9e01  channel + 9..12 + WP
+    m_e9   props=0xfffd  nearly everything
+
+Property 0 is the channel index and 1 the stream index, both constant for a
+whole channel. So when the tree tests nothing else, **the leaf is constant for
+the channel** -- resolve it once and the tree walk leaves the per-sample loop.
+And since `predict_sample` only reads the property struct for the
+self-correcting predictor, with no weighted predictor in play the whole
+sixteen-property fill goes as well: `props_compute` and `ma_get_leaf` both
+disappear for trees shaped like `m_e1`'s.
+
+    flower_alpha.m_e1   292.5ms  3.10x -> 233.3ms  2.27x   (-20%)
+    flower.m_e1                            171.6ms  2.24x
+
+Corpus **1.99x -> 1.96x**. 1245/1245 ok with Modular still byte-exact, ASan
+clean, 115 fuzz reproducers clean.
+
+The corpus moves less than the files because `m_e3` and `m_e7` are the heavier
+presets and both test property 15, so they still walk the tree. That is the
+next track: for a tree testing only properties 0 and 15, build a
+16384-entry table from the clamped WP error to the leaf, once per channel.
+It removes `ma_get_leaf` (11%) and fourteen of the sixteen properties, but not
+`sc_predict` (25%), which is sequential work both decoders have to do.
 
 ### Profiling libjxl next to ourselves
 `bun cmd/prof.ts -vs <file>` profiles the *benchmark* harness rather than the
