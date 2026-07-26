@@ -51,6 +51,13 @@ int jxl_has_avx2(void);
    the dist/ amalgamation stays one file. MSVC needs nothing; clang and gcc
    need the target attribute per function. */
 #if defined(__clang__) || defined(__GNUC__)
+/* Note "avx2" and not "avx2,fma". Adding fma here would not just permit an
+   explicit _mm256_fmadd_ps -- clang defaults to -ffp-contract=on, so it would
+   also let it fuse the written-out multiply-then-add pairs in the spline, DCT
+   and EPF kernels, which are spelled that way precisely so they round like
+   their scalar twins. Measured: FMA in the upsample kernel bought ~0-1.5%
+   (that loop is load-bound, not FLOP-bound) and cost cross-machine
+   reproducibility, so nothing here uses it. */
 #define JXL_TARGET_AVX2 __attribute__((target("avx2")))
 #else
 #define JXL_TARGET_AVX2

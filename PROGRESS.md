@@ -171,6 +171,44 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### FMA: costs reproducibility, buys nothing
+The one lever left after the fused-loop rewrite failed. libjxl uses FMA in
+its upsampling stage, so the obvious place to try it is `up_block8`, which
+does 25 multiply-adds per output.
+
+Two things had to be got right before measuring. FMA3 needs its own CPUID
+bit alongside AVX2 (every AVX2 part has it, so requiring both costs nothing),
+and -- the part that would have been a silent bug -- the `fma` target feature
+must **not** be added to the shared `JXL_TARGET_AVX2` macro. clang defaults
+to `-ffp-contract=on`, so enabling fma for a translation unit lets it fuse
+written-out multiply-then-add pairs as well, and the spline, DCT and EPF
+kernels are spelled that way precisely so they round like their scalar twins.
+A separate `JXL_TARGET_AVX2_FMA` on the one kernel keeps it contained, and
+the corpus diff confirmed it: 80 resampled files changed, **0 others**.
+
+What it costs: output stops being reproducible across machines. The same file
+decodes differently on an AVX2 host than on one without. The difference is
+small -- max **1** in the last bit of an 8-bit sample, on 5-14 bytes out of
+750,063 -- but it is a property this decoder otherwise has and libjxl does
+not.
+
+What it buys, interleaved, five runs, two passes:
+
+| preset | mul+add p1 / p2 | FMA p1 / p2 |
+|---|---|---|
+| `v_rs2` | 1.997x / 2.062x (563/581ms) | 2.046x / 2.045x (577/577ms) |
+| `v_rs4` | 1.880x / 1.859x (352/351ms) | 1.848x / 1.836x (348/344ms) |
+
+Nothing. `v_rs2` overlaps entirely; `v_rs4` is maybe 1.5%. The reason is the
+same one that made the three-accumulator experiment a wash: this loop is
+**load-bound**, not FLOP-bound. Each output takes 25 unaligned 32-byte loads
+and 25 broadcasts, and halving the arithmetic does not touch that. libjxl
+gets its speed here from eight lanes -- which we now also have -- not from
+the fusing.
+
+Reverted, and the reason is recorded at `JXL_TARGET_AVX2` so that adding
+`fma` there later is a deliberate act rather than an accident.
+
 ### The fused-loop rewrite: the shadow rows are not redundant
 libjxl decodes a Modular channel in one function with the neighbour tracking,
 the property fill, the tree walk and the ANS read all inlined together. Ours
