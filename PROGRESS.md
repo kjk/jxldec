@@ -62,7 +62,7 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.41x libjxl** (2.74x before the SIMD work below;
+1245-file corpus we are **1.40x libjxl** (2.74x before the SIMD work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
 average up). libjxl is AVX2 throughout; our hot loops use runtime-selected
@@ -82,6 +82,47 @@ The worst ratio among files that take libjxl more than 5ms is
 `R2020-sRGB-blue.v_prog`; the `v_rs2` set follows, with an upsampling filter
 that is genuinely 25 taps per output sample. Modular is the strongest area.
 Files below ~1ms sit at much larger ratios purely on fixed setup cost.
+
+### Oriented output without per-pixel coordinate mapping
+The post-DCT corpus ranking put `flower.v_orient` at 112.27ms against
+libjxl's 48.98ms: **2.29x**, with a 63.29ms absolute gap. A 50-run side-by-side
+winperf trace made the cause unambiguous:
+
+| function | self samples | self share |
+|---|---:|---:|
+| our `write_pixels` | 4899 | 15.0% |
+| libjxl `WriteToOutputStage::OutputBuffers` | 611 | 1.9% |
+
+The existing fast path applied only to orientation 1. Every other orientation
+called `unapply_orientation` once and `plane_sample` three or four times per
+pixel, even when every plane was full-resolution. That repeated coordinate
+mapping, dimension checks and scaling divisions millions of times.
+
+Full-resolution planes now handle all eight orientations directly.
+Orientations 1..4 select one decoded row; horizontal flips load four
+contiguous samples, quantize them with SSE2 and reverse the finished lanes.
+Orientations 5..8 select a decoded column and advance by `+/-stride`; four
+scalar loads feed the same SIMD quantizer. Subsampled planes retain the
+general coordinate path.
+
+Best of 20/30:
+
+| orientation / file | before | after |
+|---|---:|---:|
+| 2, `flower.v_orient` | 102.96ms, 2.10x | **81.22ms, 1.67x** |
+| 3, `hdr_room.v_orient` | 10.42ms, 2.13x | **8.93ms, 1.60x** |
+| 5, `P3-sRGB-color-bars.v_orient` | 19.87ms, 2.41x | **14.98ms, 1.77x** |
+| 7, `colorful_chessboards.v_orient` | 47.78ms, 1.59x | **35.74ms, 1.25x** |
+
+Re-profiling orientation 2 dropped `write_pixels` from 4899 to **739** self
+samples (-84.9%) and the full trace from 32642 to 28962 samples. The whole
+corpus moved from 23235.74ms / 1.41x to **23025.25ms / 1.40x**.
+
+`-DJXL_RENDER_FORCE_GENERAL_ORIENTATION` restores the old mapping path. Its
+output and the fast path were byte-identical in 657 comparisons: every
+orientation corpus image crossed with all nine public formats. `bun
+cmd/tests.ts -all`: 1245/1245 ok. All 115 fuzz reproducers clean; the
+amalgamation compiles cleanly with clang and MSVC.
 
 ### Eight-wide DCT rows and YCbCr conversion
 A fresh side-by-side profile used the JPEG-transcoded

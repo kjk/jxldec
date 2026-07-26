@@ -68,12 +68,9 @@ static uint32_t quantize(float v, uint32_t maxval) {
     return (uint32_t)s;
 }
 
-/* SSE2 is baseline on x64. Only the arithmetic is vectorised here, not the
-   output packing: write_pixels covers eight formats crossed with orientation
-   and BGR order, and quantize -- a multiply, an add, two compares and a
-   truncating convert, per component per pixel -- is where its time goes.
-   Quantising four samples and letting the existing scalar code interleave
-   them from a small array keeps all of that format handling in one place.
+/* SSE2 is baseline on x64. Quantization is vectorised for all formats, and
+   the common RGB24/RGBA32 cases pack four complete pixels at once. Strided
+   orientations gather four samples before doing the same SIMD arithmetic.
    -DJXL_RENDER_FORCE_SCALAR builds without it, to diff against. */
 #if !defined(JXL_RENDER_FORCE_SCALAR) && \
     (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
@@ -82,10 +79,9 @@ static uint32_t quantize(float v, uint32_t maxval) {
 #include <emmintrin.h>
 
 /* Four samples through the exact logic of quantize() above. */
-static __m128i quantize4v(const float *src, uint32_t maxval) {
+static __m128i quantize4m(__m128 v, uint32_t maxval) {
     const __m128 vm = _mm_set1_ps((float)maxval);
     const __m128 zero = _mm_setzero_ps();
-    __m128 v = _mm_loadu_ps(src);
     __m128 s = _mm_add_ps(_mm_mul_ps(v, vm), _mm_set1_ps(0.5f));
     __m128i t = _mm_cvttps_epi32(s);                  /* truncates, as (uint32_t) */
     __m128 pos = _mm_cmpgt_ps(v, zero);               /* false for <= 0 and NaN */
@@ -96,20 +92,23 @@ static __m128i quantize4v(const float *src, uint32_t maxval) {
     return _mm_and_si128(_mm_castps_si128(pos), t);
 }
 
+static __m128i quantize4v(const float *src, uint32_t maxval) {
+    return quantize4m(_mm_loadu_ps(src), maxval);
+}
+
+static __m128i quantize4_stride(const float *src, ptrdiff_t step,
+                                uint32_t maxval) {
+    return quantize4m(_mm_setr_ps(src[0], src[step], src[2 * step],
+                                 src[3 * step]), maxval);
+}
+
 static void quantize4(const float *src, uint32_t maxval, uint32_t out[4]) {
-    const __m128 vm = _mm_set1_ps((float)maxval);
-    const __m128 zero = _mm_setzero_ps();
-    __m128 v = _mm_loadu_ps(src);
-    __m128 s = _mm_add_ps(_mm_mul_ps(v, vm), _mm_set1_ps(0.5f));
-    __m128i t = _mm_cvttps_epi32(s);                  /* truncates, as (uint32_t) */
-    __m128 pos = _mm_cmpgt_ps(v, zero);               /* false for <= 0 and NaN */
-    __m128 sat = _mm_cmpge_ps(s, vm);
-    __m128i mx = _mm_set1_epi32((int)maxval);
-    /* s >= maxval wins over the converted value, then !(v > 0) zeroes it. */
-    t = _mm_or_si128(_mm_and_si128(_mm_castps_si128(sat), mx),
-                     _mm_andnot_si128(_mm_castps_si128(sat), t));
-    t = _mm_and_si128(_mm_castps_si128(pos), t);
-    _mm_storeu_si128((__m128i *)out, t);
+    _mm_storeu_si128((__m128i *)out, quantize4v(src, maxval));
+}
+
+static void quantize4_stride_store(const float *src, ptrdiff_t step,
+                                   uint32_t maxval, uint32_t out[4]) {
+    _mm_storeu_si128((__m128i *)out, quantize4_stride(src, step, maxval));
 }
 #endif
 
@@ -175,7 +174,8 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
     uint32_t sw = img->w, sh = img->h;
     uint32_t ow, oh, ox, oy;
     uint32_t orientation = ctx->keep_orientation ? 1 : meta->orientation;
-    int ncomp = 0, wide = 0, has_alpha = 0, gray = 0, direct;
+    int ncomp = 0, wide = 0, has_alpha = 0, gray = 0;
+    int direct, reverse_x, transposed;
     uint32_t maxval;
     int bgr = ctx->bgr;
 
@@ -197,34 +197,60 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
     }
     maxval = wide ? 65535u : 255u;
 
-    /* With no orientation fixup and every plane at full resolution -- the
-       common case -- an output row maps straight onto one row of each plane,
-       so the coordinate mapping and the subsampling checks drop out and only
-       the row pointers are needed. */
-    direct = (orientation == 1) && plane_is_full(op.r, sw, sh) &&
+    /* With every plane at full resolution, orientations 1..4 select a decoded
+       row and possibly read it right-to-left; orientations 5..8 select a
+       column and advance by +/-stride. The per-pixel coordinate mapping and
+       subsampling checks drop out in both cases. */
+#ifdef JXL_RENDER_FORCE_GENERAL_ORIENTATION
+    direct = (orientation == 1) &&
+#else
+    direct = (orientation >= 1 && orientation <= 8) &&
+#endif
+             plane_is_full(op.r, sw, sh) &&
              (gray || (plane_is_full(op.g, sw, sh) &&
                        plane_is_full(op.b, sw, sh))) &&
              (!op.a || plane_is_full(op.a, sw, sh));
+    reverse_x = orientation == 2 || orientation == 3;
+    transposed = orientation >= 5;
 
     for (oy = 0; oy < oh; oy++) {
         uint8_t *row8 = dst + (size_t)oy * stride;
         uint16_t *row16 = (uint16_t *)row8;
         const float *pr = NULL, *pg = NULL, *pb = NULL, *pa = NULL;
+        ptrdiff_t sr = 1, sg = 1, sb = 1, sa = 1;
         if (direct) {
-            pr = op.r->data + (size_t)oy * op.r->stride;
-            if (!gray) {
-                pg = op.g->data + (size_t)oy * op.g->stride;
-                pb = op.b->data + (size_t)oy * op.b->stride;
+            uint32_t sx, sy;
+            if (transposed) {
+                sx = (orientation == 7 || orientation == 8)
+                         ? sw - 1 - oy : oy;
+                sy = (orientation == 6 || orientation == 7) ? sh - 1 : 0;
+            } else {
+                sx = 0;
+                sy = (orientation == 3 || orientation == 4)
+                         ? sh - 1 - oy : oy;
             }
-            if (op.a) pa = op.a->data + (size_t)oy * op.a->stride;
+            pr = op.r->data + (size_t)sy * op.r->stride + sx;
+            if (!gray) {
+                pg = op.g->data + (size_t)sy * op.g->stride + sx;
+                pb = op.b->data + (size_t)sy * op.b->stride + sx;
+            }
+            if (op.a) pa = op.a->data + (size_t)sy * op.a->stride + sx;
+            if (transposed) {
+                sr = (ptrdiff_t)op.r->stride;
+                sg = gray ? sr : (ptrdiff_t)op.g->stride;
+                sb = gray ? sr : (ptrdiff_t)op.b->stride;
+                sa = op.a ? (ptrdiff_t)op.a->stride : 1;
+                if (orientation == 6 || orientation == 7) {
+                    sr = -sr; sg = -sg; sb = -sb; sa = -sa;
+                }
+            }
         }
         ox = 0;
 #ifdef JXL_RENDER_SSE2
         /* Quantise four pixels' worth of each plane up front; the store loop
-           below is the same scalar code, reading the results instead of
-           calling quantize(). Only the straight-through case qualifies --
-           anything with orientation or a subsampled plane keeps the general
-           path. */
+           below reads those results instead of calling quantize(). Horizontal
+           flips reverse the finished lanes, while transposed orientations
+           gather four samples at +/-stride. */
         /* The two common 8-bit RGB formats pack without any shuffling: each
            lane's three or four components are already 0..255 in separate
            32-bit lanes, so r | g<<8 | b<<16 | a<<24 lays a whole pixel out in
@@ -234,19 +260,33 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
            pixel and is overwritten by it. The loop stops four pixels short of
            the row so the last such overhang stays inside the row and the
            scalar tail below rewrites it. */
-        if (direct && !wide && !gray && !bgr && (ncomp == 3 || ncomp == 4)) {
+        if (direct && !wide && !gray && !bgr &&
+            (ncomp == 3 || ncomp == 4)) {
             uint32_t lim = ncomp == 4 ? ow : (ow >= 4 ? ow - 4 : 0);
             const __m128i amax = _mm_set1_epi32((int)maxval);
             for (; ox + 4 <= lim; ox += 4) {
-                __m128i r = quantize4v(pr + ox, maxval);
-                __m128i g = quantize4v(pg + ox, maxval);
-                __m128i b = quantize4v(pb + ox, maxval);
+                uint32_t qx = reverse_x ? ow - ox - 4 : ox;
+                __m128i r, g, b, a;
+                if (transposed) {
+                    r = quantize4_stride(pr + (ptrdiff_t)ox * sr, sr, maxval);
+                    g = quantize4_stride(pg + (ptrdiff_t)ox * sg, sg, maxval);
+                    b = quantize4_stride(pb + (ptrdiff_t)ox * sb, sb, maxval);
+                    a = (pa && ncomp == 4)
+                            ? quantize4_stride(pa + (ptrdiff_t)ox * sa, sa, maxval)
+                            : amax;
+                } else {
+                    r = quantize4v(pr + qx, maxval);
+                    g = quantize4v(pg + qx, maxval);
+                    b = quantize4v(pb + qx, maxval);
+                    a = (pa && ncomp == 4) ? quantize4v(pa + qx, maxval)
+                                           : amax;
+                }
                 /* RGB24 discards this lane, so do not pay to quantise it. */
-                __m128i a = (pa && ncomp == 4) ? quantize4v(pa + ox, maxval)
-                                               : amax;
                 __m128i packed = _mm_or_si128(
                     _mm_or_si128(r, _mm_slli_epi32(g, 8)),
                     _mm_or_si128(_mm_slli_epi32(b, 16), _mm_slli_epi32(a, 24)));
+                if (!transposed && reverse_x)
+                    packed = _mm_shuffle_epi32(packed, _MM_SHUFFLE(0, 1, 2, 3));
                 if (ncomp == 4) {
                     _mm_storeu_si128((__m128i *)(row8 + (size_t)ox * 4), packed);
                 } else {
@@ -262,20 +302,35 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
         if (direct) {
             uint32_t qr[4], qg[4], qb[4], qa[4];
             for (; ox + 4 <= ow; ox += 4) {
-                uint32_t j;
-                quantize4(pr + ox, maxval, qr);
-                if (!gray) {
-                    quantize4(pg + ox, maxval, qg);
-                    quantize4(pb + ox, maxval, qb);
+                uint32_t j, qx = reverse_x ? ow - ox - 4 : ox;
+                if (transposed) {
+                    quantize4_stride_store(pr + (ptrdiff_t)ox * sr, sr,
+                                           maxval, qr);
+                    if (!gray) {
+                        quantize4_stride_store(pg + (ptrdiff_t)ox * sg, sg,
+                                               maxval, qg);
+                        quantize4_stride_store(pb + (ptrdiff_t)ox * sb, sb,
+                                               maxval, qb);
+                    }
+                    if (pa)
+                        quantize4_stride_store(pa + (ptrdiff_t)ox * sa, sa,
+                                               maxval, qa);
+                } else {
+                    quantize4(pr + qx, maxval, qr);
+                    if (!gray) {
+                        quantize4(pg + qx, maxval, qg);
+                        quantize4(pb + qx, maxval, qb);
+                    }
+                    if (pa) quantize4(pa + qx, maxval, qa);
                 }
-                if (pa) quantize4(pa + ox, maxval, qa);
                 for (j = 0; j < 4; j++) {
                     uint32_t comps[4];
                     uint32_t px = ox + j;
-                    uint32_t r = qr[j];
-                    uint32_t g = gray ? r : qg[j];
-                    uint32_t b = gray ? r : qb[j];
-                    uint32_t a = pa ? qa[j] : maxval;
+                    uint32_t qj = (!transposed && reverse_x) ? 3 - j : j;
+                    uint32_t r = qr[qj];
+                    uint32_t g = gray ? r : qg[qj];
+                    uint32_t b = gray ? r : qb[qj];
+                    uint32_t a = pa ? qa[qj] : maxval;
                     if (gray) {
                         comps[0] = r;
                         if (has_alpha) comps[1] = a;
@@ -309,14 +364,27 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
             uint32_t comps[4];
 
             if (direct) {
-                rv = pr[ox];
-                if (gray) {
-                    gv = bv = rv;
+                if (transposed) {
+                    ptrdiff_t px = (ptrdiff_t)ox;
+                    rv = pr[px * sr];
+                    if (gray) {
+                        gv = bv = rv;
+                    } else {
+                        gv = pg[px * sg];
+                        bv = pb[px * sb];
+                    }
+                    if (pa) av = pa[px * sa];
                 } else {
-                    gv = pg[ox];
-                    bv = pb[ox];
+                    uint32_t px = reverse_x ? ow - 1 - ox : ox;
+                    rv = pr[px];
+                    if (gray) {
+                        gv = bv = rv;
+                    } else {
+                        gv = pg[px];
+                        bv = pb[px];
+                    }
+                    if (pa) av = pa[px];
                 }
-                if (pa) av = pa[ox];
             } else {
                 unapply_orientation(orientation, sw, sh, ox, oy, &sx, &sy);
                 rv = plane_sample(op.r, sx, sy, sw, sh);
