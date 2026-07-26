@@ -62,7 +62,7 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **2.02x libjxl** (2.74x before the SSE2 work below;
+1245-file corpus we are **1.99x libjxl** (2.74x before the SSE2 work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
 average up). libjxl is AVX2 throughout; we are scalar C apart from the SSE2
@@ -143,6 +143,29 @@ What is left is qualitatively different from the rounds above:
   window would halve the SAD work. The `sigma < 0.3` early-out complicates
   it: a skipped sample's neighbours still want its cached values.
 - **Multithreading**, which is not implemented at all and would dwarf both.
+
+### Unrolling the predictor's four-lane steps
+`sc_predict` is the biggest single item at 25% self, so the line-level
+profile is worth reading rather than guessing at: summing four `uint32`s
+(`for (i = 0; i < 4; i++) sum_weights += weight[i];`) was **6.7% of the whole
+decode** on its own. Three adds cannot cost that unless each one is a reload,
+so `err_sum[]`, `weight[]` and `wn[]` became named locals and every
+constant-trip loop over them was unrolled.
+
+It is worth about 1% (`m_e3` 1.63x -> 1.61x), not the 6.7% the line suggested
+-- so that line was mostly where the latency chain surfaces, not a memory
+stall. Kept anyway: it is no less readable, and the profile no longer points
+at a phantom.
+
+The vector approaches were considered and rejected on inspection rather than
+tried. The weight lane needs a per-lane variable shift and a 65-entry table
+lookup: SSE2 has neither, and while AVX2 has `_mm_srlv_epi32` and
+`_mm_i32gather_epi32`, a four-element gather costs more than four pipelined
+scalar loads on every microarchitecture this would run on. The horizontal
+sums are four elements -- an SSE2 reduction is more instructions and more
+latency than three adds.
+
+Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 

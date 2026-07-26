@@ -481,6 +481,17 @@ static int32_t pred_ww(const jxl_pred_state *ps) {
     return ps->w;
 }
 
+/* One lane of the weight computation. Same arithmetic as before; separate
+   only so the four unrolled uses stay readable. */
+static JXL_INLINE_HINT uint32_t sc_weight_one(uint32_t err_sum, uint32_t wn,
+                                              const uint32_t *dl) {
+    uint64_t v = ((uint64_t)err_sum + 1) >> 5;
+    uint32_t shift = v > 1 ? jxl_floor_log2_u64(v) : 0;
+    uint32_t idx = (err_sum >> shift) + 1;
+    if (idx > 64) idx = 64;
+    return 4 + ((wn * dl[idx]) >> shift);
+}
+
 static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
                        int32_t w, int32_t nn, jxl_sc_result *out) {
     const uint32_t *dl = jxl_div_lookup;
@@ -489,11 +500,16 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
     int64_t n3 = (int64_t)n << 3, nw3 = (int64_t)nw << 3;
     int64_t ne3 = (int64_t)ne << 3, w3 = (int64_t)w << 3;
     int64_t nn3 = (int64_t)nn << 3;
-    uint32_t err_sum[4], weight[4], wn[4];
-    uint32_t sum_weights = 0;
+    /* Scalars, not arrays. The four-lane steps below are all constant-trip
+       loops, but keeping them as arrays left the values in memory: summing
+       four uint32s was 6.7% of the whole decode on its own, which is only
+       possible if each one is a reload. Unrolled into named locals they stay
+       in registers and the two reductions become three adds each. */
+    uint32_t es0, es1, es2, es3;
+    uint32_t wt0, wt1, wt2, wt3;
+    uint32_t sum_weights;
     int log_weight = 0;
     int64_t s;
-    int i;
 
     out->subpred[0] = w3 + ne3 - n3;
     out->subpred[1] = n3 - (((te_w + te_n + te_ne) * (int64_t)sc->wp.p1) >> 5);
@@ -504,30 +520,33 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
                              (nn3 - n3) * (int64_t)sc->wp.p3d +
                              (nw3 - w3) * (int64_t)sc->wp.p3e) >> 5);
 
-    for (i = 0; i < 4; i++) {
-        err_sum[i] = sc->subpred_err_nw_ww[i] + sc->subpred_err_n_w[i] +
-                     sc->subpred_err_ne[i];
-    }
-    wn[0] = sc->wp.w0; wn[1] = sc->wp.w1; wn[2] = sc->wp.w2; wn[3] = sc->wp.w3;
-    for (i = 0; i < 4; i++) {
-        uint64_t v = ((uint64_t)err_sum[i] + 1) >> 5;
-        uint32_t shift = v > 1 ? jxl_floor_log2_u64(v) : 0;
-        uint32_t idx;
-        idx = (err_sum[i] >> shift) + 1;
-        if (idx > 64) idx = 64;
-        weight[i] = 4 + ((wn[i] * dl[idx]) >> shift);
-    }
-    for (i = 0; i < 4; i++) sum_weights += weight[i];
+    es0 = sc->subpred_err_nw_ww[0] + sc->subpred_err_n_w[0] + sc->subpred_err_ne[0];
+    es1 = sc->subpred_err_nw_ww[1] + sc->subpred_err_n_w[1] + sc->subpred_err_ne[1];
+    es2 = sc->subpred_err_nw_ww[2] + sc->subpred_err_n_w[2] + sc->subpred_err_ne[2];
+    es3 = sc->subpred_err_nw_ww[3] + sc->subpred_err_n_w[3] + sc->subpred_err_ne[3];
+
+#define JXL_SC_WEIGHT(es, wn) (                                                   sc_weight_one((es), (wn), dl))
+
+    wt0 = JXL_SC_WEIGHT(es0, sc->wp.w0);
+    wt1 = JXL_SC_WEIGHT(es1, sc->wp.w1);
+    wt2 = JXL_SC_WEIGHT(es2, sc->wp.w2);
+    wt3 = JXL_SC_WEIGHT(es3, sc->wp.w3);
+#undef JXL_SC_WEIGHT
+
+    sum_weights = wt0 + wt1 + wt2 + wt3;
     {
         uint32_t v = sum_weights >> 4;
         if (v > 1) log_weight = (int)jxl_floor_log2_u64(v);
     }
-    for (i = 0; i < 4; i++) weight[i] >>= log_weight;
-    sum_weights = 0;
-    for (i = 0; i < 4; i++) sum_weights += weight[i];
+    wt0 >>= log_weight; wt1 >>= log_weight;
+    wt2 >>= log_weight; wt3 >>= log_weight;
+    sum_weights = wt0 + wt1 + wt2 + wt3;
 
     s = ((int64_t)sum_weights >> 1) - 1;
-    for (i = 0; i < 4; i++) s += out->subpred[i] * (int64_t)weight[i];
+    s += out->subpred[0] * (int64_t)wt0;
+    s += out->subpred[1] * (int64_t)wt1;
+    s += out->subpred[2] * (int64_t)wt2;
+    s += out->subpred[3] * (int64_t)wt3;
     out->prediction = (s * (int64_t)dl[sum_weights > 64 ? 64 : sum_weights]) >> 24;
 
     if (((te_n ^ te_w) | (te_n ^ te_nw)) <= 0) {
@@ -540,13 +559,15 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
     }
 
     {
+        /* Unrolled for the same reason as the weight lanes above: three
+           elements out of a stack array, compared against a running max. */
         int64_t max_error = te_w;
-        int64_t errs[3];
-        errs[0] = te_n; errs[1] = te_nw; errs[2] = te_ne;
+        int64_t i;
         for (i = 0; i < 3; i++) {
-            int64_t a = errs[i] < 0 ? -errs[i] : errs[i];
+            int64_t e = i == 0 ? te_n : (i == 1 ? te_nw : te_ne);
+            int64_t a = e < 0 ? -e : e;
             int64_t b = max_error < 0 ? -max_error : max_error;
-            if (a > b) max_error = errs[i];
+            if (a > b) max_error = e;
         }
         out->max_error = (int32_t)max_error;
     }

@@ -108,6 +108,14 @@ void jxl_br_seek_byte(jxl_br *br, size_t byte_off);
 #include <intrin.h>
 #endif
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#define JXL_INLINE_HINT __forceinline
+#elif defined(__clang__) || defined(__GNUC__)
+#define JXL_INLINE_HINT inline __attribute__((always_inline))
+#else
+#define JXL_INLINE_HINT
+#endif
+
 static inline uint32_t jxl_floor_log2_u64(uint64_t v) {
 #if defined(_MSC_VER) && !defined(__clang__)
     unsigned long idx;
