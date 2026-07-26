@@ -171,6 +171,43 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Making the weighted predictor's bit-scans branchless: measured, reverted
+`sc_predict` is still the single biggest item in a VarDCT-with-alpha decode
+(13.5% on `flower_alpha.v_e3` -- the alpha channel is Modular-coded, and its
+streams already take the WP lookup-table track, so the predictor itself is
+the irreducible part). Its hottest line is the four `sc_weight_one` calls at
+2.9%, and each contains a branch around a bit-scan:
+
+```c
+uint32_t shift = v > 1 ? jxl_floor_log2_u64(v) : 0;
+```
+
+`floor_log2(v | 1)` produces exactly the same value for every input -- 0 for
+both 0 and 1 -- and removes the branch. Same trick applies to the `log_weight`
+computation a few lines down. Four of these run per sample.
+
+It does not pay. Interleaved, five runs, two passes, with libjxl's column flat
+at 550-554ms throughout:
+
+| preset | branch p1 / p2 | branchless p1 / p2 |
+|---|---|---|
+| `v_e3` | 1.849x / 1.843x | **1.900x / 1.891x** (worse) |
+| `v_prog` | 1.905x / 1.934x | 1.925x / 1.947x (worse) |
+| `m_e3` | 1.349x / 1.342x | 1.341x / 1.337x (better) |
+| `m_e9` | 1.198x / 1.196x | 1.188x / 1.192x (better) |
+| `m_e7` | 1.215x / 1.210x | 1.212x / 1.210x |
+
+Small gain on the Modular presets, a real 2.3% loss on `v_e3` -- ours went
+1024ms -> 1045ms while libjxl did not move, so it is the change and not the
+machine. Reverted.
+
+The explanation is that the branch was *predictable*. Error sums are usually
+small, so `v <= 1` most of the time and the branch skipped the bit-scan
+entirely; forcing `BSR` to run always puts its latency on the dependency
+chain into `shift`, which then feeds both the table index and the final shift.
+A well-predicted branch that skips a latency chain beats a branchless form
+that cannot. Worth remembering before reaching for the next `| 1`.
+
 ### The weighted predictor was round-tripping through memory
 With `m_e1`'s prefix decoding fixed, the biggest remaining losses were `m_e3`
 (807ms) and `m_resp` (716ms), both ANS-coded. A `-vs` profile of
