@@ -10,6 +10,21 @@
 
 #include <math.h>
 
+/* SSE2 is baseline on x64. -DJXL_SPLINE_FORCE_SCALAR builds the scalar path
+   alone so the bit-identical claim can be diffed rather than asserted. The
+   splat loop below is pure arithmetic over x with no cross-lane dependency,
+   so four lanes run the identical sequence of operations in the identical
+   order and round the same way. Nothing here is approximated that the scalar
+   path does not already approximate: the reciprocal is a real divide and the
+   distance a real square root, not their fast approximations. */
+#if !defined(JXL_SPLINE_FORCE_SCALAR) && \
+    (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
+     (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#define JXL_SPLINE_SSE2 1
+#include <emmintrin.h>
+#include <immintrin.h>
+#endif
+
 #define SPLINE_MAX_POINTS (1u << 20)
 
 void jxl_splines_free(jxl_ctx *ctx, jxl_splines *sp) {
@@ -152,6 +167,93 @@ static float continuous_idct(const float dct[32], float t) {
 }
 
 /* libjxl's error-function approximation (L1 error 7e-4). */
+#ifdef JXL_SPLINE_SSE2
+/* Four lanes of spline_erf, operation for operation. The sign is restored by
+   selecting on `x < 0` rather than by copying x's sign bit, so that an x of
+   -0.0f takes the same branch as the scalar `x < 0.0f ? -result : result`
+   does -- which is the positive one. */
+static JXL_INLINE_HINT __m128 spline_erf4(__m128 x) {
+    const __m128 sign = _mm_set1_ps(-0.0f);
+    const __m128 one = _mm_set1_ps(1.0f);
+    __m128 ax = _mm_andnot_ps(sign, x);
+    __m128 d = _mm_add_ps(_mm_mul_ps(ax, _mm_set1_ps(7.77394369e-02f)),
+                          _mm_set1_ps(2.05260015e-04f));
+    __m128 inv, res, neg, lt;
+    d = _mm_add_ps(_mm_mul_ps(d, ax), _mm_set1_ps(2.32120216e-01f));
+    d = _mm_add_ps(_mm_mul_ps(d, ax), _mm_set1_ps(2.77820801e-01f));
+    d = _mm_add_ps(_mm_mul_ps(d, ax), one);
+    d = _mm_mul_ps(d, d);
+    inv = _mm_div_ps(one, d);
+    res = _mm_add_ps(_mm_xor_ps(_mm_mul_ps(inv, inv), sign), one);
+    neg = _mm_xor_ps(res, sign);
+    lt = _mm_cmplt_ps(x, _mm_setzero_ps());
+    return _mm_or_ps(_mm_and_ps(lt, neg), _mm_andnot_ps(lt, res));
+}
+
+/* Eight lanes of the same, for the wide splat below. Deliberately no FMA:
+   fusing the multiply and add would round once where the scalar rounds
+   twice, and the point of this path is to agree with it bit for bit. */
+JXL_TARGET_AVX2
+static __m256 spline_erf8(__m256 x) {
+    const __m256 sign = _mm256_set1_ps(-0.0f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    __m256 ax = _mm256_andnot_ps(sign, x);
+    __m256 d = _mm256_add_ps(_mm256_mul_ps(ax, _mm256_set1_ps(7.77394369e-02f)),
+                             _mm256_set1_ps(2.05260015e-04f));
+    __m256 inv, res, neg, lt;
+    d = _mm256_add_ps(_mm256_mul_ps(d, ax), _mm256_set1_ps(2.32120216e-01f));
+    d = _mm256_add_ps(_mm256_mul_ps(d, ax), _mm256_set1_ps(2.77820801e-01f));
+    d = _mm256_add_ps(_mm256_mul_ps(d, ax), one);
+    d = _mm256_mul_ps(d, d);
+    inv = _mm256_div_ps(one, d);
+    res = _mm256_add_ps(_mm256_xor_ps(_mm256_mul_ps(inv, inv), sign), one);
+    neg = _mm256_xor_ps(res, sign);
+    lt = _mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_LT_OQ);
+    return _mm256_or_ps(_mm256_and_ps(lt, neg), _mm256_andnot_ps(lt, res));
+}
+
+/* One row of the splat, eight x at a time. Kept in its own function because
+   the target attribute is per-function: the caller stays SSE2-only code and
+   reaches this solely after jxl_has_avx2 has said so. */
+JXL_TARGET_AVX2
+static int32_t spline_row_avx2(float *const rows[3], int32_t x, int32_t xe,
+                               float px, float dy2, float inv_sigma,
+                               const float vs[3]) {
+    const __m256 vpx = _mm256_set1_ps(px);
+    const __m256 vdy2 = _mm256_set1_ps(dy2);
+    const __m256 vinv = _mm256_set1_ps(inv_sigma);
+    const __m256 vk = _mm256_set1_ps(0.35355338f);
+    const __m256 vhalf = _mm256_set1_ps(0.5f);
+    const __m256 vs0 = _mm256_set1_ps(vs[0]);
+    const __m256 vs1 = _mm256_set1_ps(vs[1]);
+    const __m256 vs2 = _mm256_set1_ps(vs[2]);
+    __m256i xi = _mm256_setr_epi32(x, x + 1, x + 2, x + 3,
+                                   x + 4, x + 5, x + 6, x + 7);
+    for (; x + 8 <= xe; x += 8) {
+        __m256 dxv = _mm256_sub_ps(_mm256_cvtepi32_ps(xi), vpx);
+        __m256 dist = _mm256_sqrt_ps(
+            _mm256_add_ps(_mm256_mul_ps(dxv, dxv), vdy2));
+        __m256 h = _mm256_mul_ps(vhalf, dist);
+        __m256 f = _mm256_sub_ps(
+            spline_erf8(_mm256_mul_ps(_mm256_add_ps(h, vk), vinv)),
+            spline_erf8(_mm256_mul_ps(_mm256_sub_ps(h, vk), vinv)));
+        __m256 ffv = _mm256_mul_ps(f, f);
+        _mm256_storeu_ps(rows[0] + x,
+            _mm256_add_ps(_mm256_loadu_ps(rows[0] + x),
+                          _mm256_mul_ps(vs0, ffv)));
+        _mm256_storeu_ps(rows[1] + x,
+            _mm256_add_ps(_mm256_loadu_ps(rows[1] + x),
+                          _mm256_mul_ps(vs1, ffv)));
+        _mm256_storeu_ps(rows[2] + x,
+            _mm256_add_ps(_mm256_loadu_ps(rows[2] + x),
+                          _mm256_mul_ps(vs2, ffv)));
+        xi = _mm256_add_epi32(xi, _mm256_set1_epi32(8));
+    }
+    _mm256_zeroupper();
+    return x;
+}
+#endif
+
 static float spline_erf(float x) {
     float ax = fabsf(x);
     float d1 = ax * 7.77394369e-02f + 2.05260015e-04f;
@@ -242,6 +344,9 @@ int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,
     jxl_pt *up = NULL;
     jxl_pt *arc_pt = NULL;
     float *arc_len = NULL;
+#ifdef JXL_SPLINE_SSE2
+    const int use_avx2 = jxl_has_avx2();
+#endif
 
     if (img->ncolor < 3) return 0;
 
@@ -389,7 +494,47 @@ int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,
                     rows[c] = img->plane[c].data +
                               (size_t)y * img->plane[c].stride;
                 }
-                for (x = xb; x < xe; x++) {
+                x = xb;
+#ifdef JXL_SPLINE_SSE2
+                if (use_avx2) {
+                    x = spline_row_avx2(rows, x, xe, px, dy2, inv_sigma, vs);
+                }
+                {
+                    /* Four x at a time. The x values are carried as integers
+                       and converted per step rather than advanced by adding
+                       4.0f, so the conversion rounds exactly as the scalar
+                       (float)x does at any magnitude. */
+                    const __m128 vpx = _mm_set1_ps(px);
+                    const __m128 vdy2 = _mm_set1_ps(dy2);
+                    const __m128 vinv = _mm_set1_ps(inv_sigma);
+                    const __m128 vk = _mm_set1_ps(0.35355338f);
+                    const __m128 vs0 = _mm_set1_ps(vs[0]);
+                    const __m128 vs1 = _mm_set1_ps(vs[1]);
+                    const __m128 vs2 = _mm_set1_ps(vs[2]);
+                    __m128i xi = _mm_setr_epi32(x, x + 1, x + 2, x + 3);
+                    for (; x + 4 <= xe; x += 4) {
+                        __m128 dxv = _mm_sub_ps(_mm_cvtepi32_ps(xi), vpx);
+                        __m128 dist = _mm_sqrt_ps(
+                            _mm_add_ps(_mm_mul_ps(dxv, dxv), vdy2));
+                        __m128 h = _mm_mul_ps(_mm_set1_ps(0.5f), dist);
+                        __m128 f = _mm_sub_ps(
+                            spline_erf4(_mm_mul_ps(_mm_add_ps(h, vk), vinv)),
+                            spline_erf4(_mm_mul_ps(_mm_sub_ps(h, vk), vinv)));
+                        __m128 ffv = _mm_mul_ps(f, f);
+                        _mm_storeu_ps(rows[0] + x,
+                            _mm_add_ps(_mm_loadu_ps(rows[0] + x),
+                                       _mm_mul_ps(vs0, ffv)));
+                        _mm_storeu_ps(rows[1] + x,
+                            _mm_add_ps(_mm_loadu_ps(rows[1] + x),
+                                       _mm_mul_ps(vs1, ffv)));
+                        _mm_storeu_ps(rows[2] + x,
+                            _mm_add_ps(_mm_loadu_ps(rows[2] + x),
+                                       _mm_mul_ps(vs2, ffv)));
+                        xi = _mm_add_epi32(xi, _mm_set1_epi32(4));
+                    }
+                }
+#endif
+                for (; x < xe; x++) {
                     float dx = (float)x - px;
                     float distance = sqrtf(dx * dx + dy2);
                     float half = 0.5f * distance;

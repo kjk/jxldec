@@ -169,6 +169,45 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### The spline splat, four and eight lanes wide
+With the Modular work done, the single worst file in the corpus was
+`splines.jxl`: 743ms lost at 4.30x, 2.5% of the whole corpus in one 81-byte
+file. The profile was unambiguous -- `jxl_render_splines` was **87.6%** of
+all samples, 84% of it on two source lines:
+
+```
+   45.8%  factor = spline_erf((half + 0.354f) * inv_sigma) -
+                   spline_erf((half - 0.354f) * inv_sigma);
+   38.5%  rows[c][x] += vs[c] * ff;
+```
+
+Per pixel that is a `sqrtf`, two rational-approximation `erf`s (a divide
+each), and three read-modify-writes. Pure arithmetic over x with no
+cross-lane dependency, which is the case where vectorising is bit-identical
+rather than merely close: each lane runs the identical operations in the
+identical order and rounds the same way. So `spline_erf` gained a 4-lane and
+an 8-lane twin and the splat loop runs AVX2, then SSE2, then a scalar tail.
+
+Two details worth keeping. The sign restore selects on `x < 0` rather than
+copying x's sign bit, because `-0.0f` has the sign bit set but must take the
+*positive* branch to match the scalar `x < 0.0f ? -result : result`. And no
+FMA anywhere: fusing would round once where the scalar rounds twice.
+
+Unlike the element-wise kernels -- where AVX2 measured a net negative and was
+removed -- this loop is divide- and sqrt-bound, so the wider lanes pay:
+421ms -> 306ms and 422ms -> 300ms, interleaved, two passes.
+
+| | `splines.jxl` |
+|---|---|
+| before | 969ms, 4.30x |
+| SSE2 | 370ms, 1.68x |
+| AVX2 | **256ms, 1.15x** |
+
+Corpus **1.80x -> 1.76x**. All three paths -- scalar, SSE2-only and AVX2 --
+were diffed against each other over all 1242 corpus files and produce
+byte-identical output; that is what `-DJXL_SPLINE_FORCE_SCALAR` and
+`-DJXL_NO_AVX2` exist for. 1245/1245, ASan clean, 115 reproducers clean.
+
 ### Folding the constant tests out of the tree, per channel
 Properties 0 and 1 are the channel and the stream index. Neither changes
 while a channel is being decoded, so every test on them has an answer before
