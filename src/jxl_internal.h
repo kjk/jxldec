@@ -81,9 +81,9 @@ typedef struct {
 
 void jxl_br_init(jxl_br *br, const uint8_t *data, size_t len);
 void jxl_br_refill(jxl_br *br);
-uint32_t jxl_br_read(jxl_br *br, int n);          /* n <= 32              */
-uint32_t jxl_br_peek(jxl_br *br, int n);
-void jxl_br_consume(jxl_br *br, int n);
+/* peek / consume / read are defined inline further down, after the inline
+   macro -- they are the hot three and need to inline into the entropy
+   decoders. */
 void jxl_br_skip(jxl_br *br, size_t n);
 int jxl_br_bool(jxl_br *br);
 uint32_t jxl_br_u32(jxl_br *br, uint32_t c0, int n0, uint32_t c1, int n1,
@@ -115,6 +115,48 @@ void jxl_br_seek_byte(jxl_br *br, size_t byte_off);
 #else
 #define JXL_INLINE_HINT
 #endif
+
+/* The bit reader's hot three. Every entropy-decoded symbol goes through peek
+   and consume, so they live here rather than in bitread.c: a -vs profile of a
+   prefix-coded Modular file had jxl_br_peek showing up as its own 4.4% call
+   next to pfx_read's 22.3%, against libjxl doing its entire Modular decode in
+   25.6%.
+
+   The refill is also conditional now. It used to run on every peek, loading
+   eight bytes and OR-ing them in even when the buffer already held 56 bits --
+   which cost a load and a shift per symbol and bought nothing. Peeking n bits
+   reads only the low n of the buffer, and a refill only ever adds bits above
+   position nbits, so skipping it while nbits >= n returns the identical
+   value. When the stream really is short the refill still runs and consume
+   still sets the sticky error, exactly as before. */
+static JXL_INLINE_HINT uint32_t jxl_br_peek(jxl_br *br, int n) {
+    if (br->nbits < n) jxl_br_refill(br);
+    if (n == 0) return 0;
+    return (uint32_t)(br->buf & ((n == 64) ? ~(uint64_t)0
+                                           : (((uint64_t)1 << n) - 1)));
+}
+
+static JXL_INLINE_HINT void jxl_br_consume(jxl_br *br, int n) {
+    if (br->nbits < n) {
+        /* Ran off the end: report the failure and stop advancing. */
+        br->err = 1;
+        br->bits_read += (size_t)br->nbits;
+        br->buf = 0;
+        br->nbits = 0;
+        return;
+    }
+    br->nbits -= n;
+    br->bits_read += (size_t)n;
+    br->buf >>= n;
+}
+
+static JXL_INLINE_HINT uint32_t jxl_br_read(jxl_br *br, int n) {  /* n <= 32 */
+    uint32_t v;
+    if (n <= 0) return 0;
+    v = jxl_br_peek(br, n);
+    jxl_br_consume(br, n);
+    return br->err ? 0 : v;
+}
 
 static inline uint32_t jxl_floor_log2_u64(uint64_t v) {
 #if defined(_MSC_VER) && !defined(__clang__)

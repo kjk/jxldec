@@ -171,6 +171,50 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### The bit reader was refilling on every peek
+`m_e1` was the worst ratio among the files that lose real time -- 2.24x, 590ms
+across the preset -- which is odd, because it takes the *cheapest* Modular
+track there is: its tree is five nodes, folds to a single leaf, and skips the
+property fill entirely. So the cost had to be in the entropy decode, and a
+`-vs` profile (ours and libjxl in one process, both symbolized) said exactly
+that:
+
+| | |
+|---|---|
+| libjxl `DecodeModularChannelMAANS<1>` | **25.6%** -- the whole Modular decode |
+| ours `pfx_read` | 22.3% |
+| ours `read_uint` | 12.6% |
+| ours `jxl_br_peek` | 4.4% |
+
+`jxl_br_peek` appearing as its own entry is the tell: it was an out-of-line
+call per decoded symbol. And it called `jxl_br_refill` *unconditionally* --
+loading eight bytes, shifting and OR-ing them into the buffer even when the
+buffer already held 56 bits and the refill would add nothing.
+
+Both fixed together: `peek`, `consume` and `read` moved into the header as
+inline functions, and the refill happens only when `nbits < n`. That is safe
+for the obvious reason -- peeking n bits reads only the low n of the buffer,
+and a refill only ever adds bits *above* position `nbits`, so skipping it
+while `nbits >= n` returns the identical value. A short stream still refills
+and still sets the sticky error.
+
+| preset | out-of-line p1 / p2 | inlined p1 / p2 |
+|---|---|---|
+| `m_e1` | 2.243x / 2.248x | **1.904x / 1.905x** |
+| `m_e3` | 1.388x / 1.398x | 1.385x / 1.400x |
+| `m_e7` | 1.243x / 1.253x | 1.245x / 1.247x |
+| `m_resp` | 1.399x / 1.392x | 1.389x / 1.387x |
+| `lm_d1` | 1.506x / 1.508x | 1.500x / 1.498x |
+
+Only `m_e1` moves, and that is the point rather than a disappointment: it is
+the preset that codes with **prefix** (Huffman) codes, where `pfx_read` calls
+peek and consume per symbol. The others use ANS, whose inner loop does its own
+bit handling and never went through `jxl_br_peek`. Which says where to look
+next.
+
+Corpus **1.54x -> 1.52x**. Verdicts unchanged, ASan clean, 115 reproducers
+clean, amalgamation still compiles.
+
 ### Packing output pixels without shuffling
 `write_pixels` was 8.0% of a VarDCT decode -- about 12 cycles a pixel for
 what is a quantise and a store. The quantise was already vectorised; the

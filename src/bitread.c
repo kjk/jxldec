@@ -43,33 +43,9 @@ void jxl_br_refill(jxl_br *br) {
     }
 }
 
-uint32_t jxl_br_peek(jxl_br *br, int n) {
-    jxl_br_refill(br);
-    if (n == 0) return 0;
-    return (uint32_t)(br->buf & ((n == 64) ? ~(uint64_t)0 : (((uint64_t)1 << n) - 1)));
-}
-
-void jxl_br_consume(jxl_br *br, int n) {
-    if (br->nbits < n) {
-        /* Ran off the end: report the failure and stop advancing. */
-        br->err = 1;
-        br->bits_read += (size_t)br->nbits;
-        br->buf = 0;
-        br->nbits = 0;
-        return;
-    }
-    br->nbits -= n;
-    br->bits_read += (size_t)n;
-    br->buf >>= n;
-}
-
-uint32_t jxl_br_read(jxl_br *br, int n) {
-    uint32_t v;
-    if (n <= 0) return 0;
-    v = jxl_br_peek(br, n);
-    jxl_br_consume(br, n);
-    return br->err ? 0 : v;
-}
+/* jxl_br_peek, jxl_br_consume and jxl_br_read are defined inline in
+   jxl_internal.h -- they are on the per-symbol path and have to inline into
+   the entropy decoders. */
 
 void jxl_br_skip(jxl_br *br, size_t n) {
     if ((size_t)br->nbits >= n) {
