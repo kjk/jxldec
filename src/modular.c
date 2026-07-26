@@ -1760,6 +1760,18 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                                                   sizeof(*wp_lut));
         if (!wp_lut) goto done;
     }
+    /* Which specialisation a stream lands on, and how big its tree is. The
+       two tracks below only pay when they trigger, and whether they trigger
+       is a property of the encoder settings, not of the image -- so when a
+       preset turns out slow this is the first thing worth knowing. Sibling
+       of JXL_DEBUG_TREE above. */
+    if (getenv("JXL_DEBUG_TRACK")) {
+        fprintf(stderr, "stream %u: mask=0x%x need_sc=%d fixed=%d wplut=%d "
+                "nflat=%u nchan=%u\n", (unsigned)stream_idx,
+                (unsigned)props_mask, need_sc,
+                (!need_sc && (props_mask & ~3u) == 0), wp_lut_usable,
+                (unsigned)ma->nflat, (unsigned)cl->n);
+    }
     max_prev = ma_max_prev_channels(ma);
     if (max_prev) {
         prev = (const jxl_mchan **)jxl_calloc(ctx, cl->n, sizeof(jxl_mchan *));

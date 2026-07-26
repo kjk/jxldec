@@ -169,6 +169,45 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### The property mask for `lm_d1`: measured, did not pay, reverted
+The two specialised tracks each require the tree to test almost nothing, so
+the obvious generalisation was to compute *only* the properties the tree
+actually tests, whatever they are. `ma_props_mask` already reports that set.
+Of the sixteen properties only three cost more than a couple of ALU ops --
+12, 13 and 14 read a neighbour out of the previous or current row behind an
+edge test -- so those were the ones to skip. `JXL_DEBUG_TRACK`, added here,
+says which streams could benefit:
+
+| preset | mask | tree | track |
+|---|---|---|---|
+| `m_e1` | `0x1` | 5 | fixed leaf |
+| `m_e3` | `0x8001` | 85 | WP lookup table |
+| `m_e7` | `0xbe01` | 541 | general, tests 12 and 13 |
+| `m_e9` | `0xffff` | 853 | general, tests everything |
+| `m_resp` | `0x1f1` | 57 / 489 | general, **skips 12-14** |
+| `lm_d1` | `0x1f3` | 289 | general, **skips 12-14** |
+| `v_d1` | `0x80c7` | 77 | general, **skips 12-14** |
+
+So `lm_d1` should have skipped all three. It gained nothing: **2.811x ->
+2.803x**, with `m_resp` 1.624x -> 1.619x and `v_d1` unchanged. Interleaved
+A/B, 5 runs, libjxl column flat throughout.
+
+Written first as three `mask & bit ? load : 0` expressions it was *slower*
+(2.842x): the compiler picks cmov, which performs the load anyway and adds
+the mask arithmetic on top. Rewriting it as one branch on a flag that is
+constant for the whole channel -- which does genuinely skip the loads --
+recovered that and no more. Both forms reverted.
+
+The lesson is about where the time is, not about the mask. Those three reads
+hit rows that are already in L1 with branches that predict perfectly, so they
+were never costing anything. What `lm_d1` actually spends its time on is
+walking a **289-node tree** per sample, and the way to make that cheaper is
+to make the walk shorter, not the property fill thinner. Property 0 is in
+every mask in the table above and properties 0 and 1 -- channel and stream
+index -- are constant for a whole channel, so the nodes testing them could be
+partial-evaluated away per channel, pruning whole subtrees off the top. That
+is the generalisation of the fixed-leaf track worth trying; this one was not.
+
 ### Specialising the Modular inner loop on the tree's shape
 On branch `modular-fused-loop`. The `-vs` profile said libjxl does the whole
 per-sample Modular pipeline in one function at 35.5% where ours takes five at
