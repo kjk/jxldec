@@ -171,6 +171,46 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### The weighted predictor was round-tripping through memory
+With `m_e1`'s prefix decoding fixed, the biggest remaining losses were `m_e3`
+(807ms) and `m_resp` (716ms), both ANS-coded. A `-vs` profile of
+`flower_alpha.m_e3` put the whole thing in one place:
+
+| | |
+|---|---|
+| libjxl `DecodeModularChannelMAANS<0>` | 41.9% -- the whole Modular decode |
+| ours `sc_predict` | **21.7%** |
+| ours `dec_read_symbol` | 8.2% |
+| ours `ma_get_leaf` | 6.1% |
+| ours `sc_record` | 5.7% |
+
+`sc_predict` plus `sc_record` is 27.4% -- the weighted predictor is more than
+half of our Modular time.
+
+`sc_predict` computes four sub-predictions and a prediction, writes each
+straight into the caller's `jxl_sc_result`, and then reads them back a few
+lines later for the weighted sum and the clamp. Because they go out through a
+pointer the compiler has to assume they might alias the `jxl_sc_pred` input,
+so every one of those stores came straight back as a reload -- once per
+sample. Keeping them in locals and storing once at the end is the same fix
+the weight lanes in this function already had (they were unrolled out of
+stack arrays for exactly this reason, and that was worth 6.7% at the time).
+
+| preset | via `out` p1 / p2 | locals p1 / p2 |
+|---|---|---|
+| `m_e3` | 1.419x / 1.390x | **1.353x / 1.343x** |
+| `m_e7` | 1.276x / 1.243x | **1.216x / 1.217x** |
+| `m_e9` | 1.247x / 1.225x | **1.197x / 1.200x** |
+| `m_resp` | 1.423x / 1.391x | 1.397x / 1.400x |
+| `lm_d1` | 1.546x / 1.476x | 1.509x / 1.533x (noise) |
+
+The three that move are the ones that lean hardest on the weighted
+predictor; `lm_d1` barely uses it and its numbers are inside the run-to-run
+spread. The arithmetic is untouched, so output is byte-identical to the
+previous commit across all 1242 corpus files.
+
+Corpus **1.52x -> 1.51x**. ASan clean, 115 reproducers clean.
+
 ### The bit reader was refilling on every peek
 `m_e1` was the worst ratio among the files that lose real time -- 2.24x, 590ms
 across the preset -- which is odd, because it takes the *cheapest* Modular

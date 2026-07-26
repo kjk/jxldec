@@ -558,15 +558,22 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
     uint32_t sum_weights;
     int log_weight = 0;
     int64_t s;
+    /* The four sub-predictions and the prediction stay in locals until the
+       end. They are read back a few lines below, and written through `out`
+       the compiler has to assume they might alias `sc` -- so each store came
+       straight back as a reload on a path that runs once per sample. Same
+       reasoning as the weight lanes below, which were unrolled out of arrays
+       for exactly this. */
+    int64_t sp0, sp1, sp2, sp3, pred;
 
-    out->subpred[0] = w3 + ne3 - n3;
-    out->subpred[1] = n3 - (((te_w + te_n + te_ne) * (int64_t)sc->wp.p1) >> 5);
-    out->subpred[2] = w3 - (((te_w + te_n + te_nw) * (int64_t)sc->wp.p2) >> 5);
-    out->subpred[3] = n3 - ((te_nw * (int64_t)sc->wp.p3a +
-                             te_n * (int64_t)sc->wp.p3b +
-                             te_ne * (int64_t)sc->wp.p3c +
-                             (nn3 - n3) * (int64_t)sc->wp.p3d +
-                             (nw3 - w3) * (int64_t)sc->wp.p3e) >> 5);
+    sp0 = w3 + ne3 - n3;
+    sp1 = n3 - (((te_w + te_n + te_ne) * (int64_t)sc->wp.p1) >> 5);
+    sp2 = w3 - (((te_w + te_n + te_nw) * (int64_t)sc->wp.p2) >> 5);
+    sp3 = n3 - ((te_nw * (int64_t)sc->wp.p3a +
+                 te_n * (int64_t)sc->wp.p3b +
+                 te_ne * (int64_t)sc->wp.p3c +
+                 (nn3 - n3) * (int64_t)sc->wp.p3d +
+                 (nw3 - w3) * (int64_t)sc->wp.p3e) >> 5);
 
     es0 = sc->subpred_err_nw_ww[0] + sc->subpred_err_n_w[0] + sc->subpred_err_ne[0];
     es1 = sc->subpred_err_nw_ww[1] + sc->subpred_err_n_w[1] + sc->subpred_err_ne[1];
@@ -591,20 +598,26 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
     sum_weights = wt0 + wt1 + wt2 + wt3;
 
     s = ((int64_t)sum_weights >> 1) - 1;
-    s += out->subpred[0] * (int64_t)wt0;
-    s += out->subpred[1] * (int64_t)wt1;
-    s += out->subpred[2] * (int64_t)wt2;
-    s += out->subpred[3] * (int64_t)wt3;
-    out->prediction = (s * (int64_t)dl[sum_weights > 64 ? 64 : sum_weights]) >> 24;
+    s += sp0 * (int64_t)wt0;
+    s += sp1 * (int64_t)wt1;
+    s += sp2 * (int64_t)wt2;
+    s += sp3 * (int64_t)wt3;
+    pred = (s * (int64_t)dl[sum_weights > 64 ? 64 : sum_weights]) >> 24;
 
     if (((te_n ^ te_w) | (te_n ^ te_nw)) <= 0) {
         int64_t lo = n3 < w3 ? n3 : w3;
         int64_t hi = n3 > w3 ? n3 : w3;
         if (ne3 < lo) lo = ne3;
         if (ne3 > hi) hi = ne3;
-        if (out->prediction < lo) out->prediction = lo;
-        if (out->prediction > hi) out->prediction = hi;
+        if (pred < lo) pred = lo;
+        if (pred > hi) pred = hi;
     }
+
+    out->subpred[0] = sp0;
+    out->subpred[1] = sp1;
+    out->subpred[2] = sp2;
+    out->subpred[3] = sp3;
+    out->prediction = pred;
 
     {
         /* Unrolled for the same reason as the weight lanes above: three
