@@ -397,7 +397,9 @@ typedef enum {
     JXL_PRED_AVG_ALL
 } jxl_predictor;
 
-/* The binary MA tree as decoded, used only while building the flat form.
+/* The binary MA tree as decoded. It is kept after the flat form is built so
+   that the flat form can be rebuilt per channel with the tests on properties
+   0 and 1 folded away -- see ma_specialize.
    Only one child index is stored: the rebuild in jxl_ma_config_read feeds a
    FIFO with strictly decreasing indices and pops two per decision node, so
    the children are always neighbours with the right one second. `child` is
@@ -450,6 +452,11 @@ typedef struct {
 typedef struct {
     jxl_ma_flat *flat;
     uint32_t nflat;
+    /* The binary tree the flat form was built from, retained so a channel can
+       rebuild it with the constant tests folded out. */
+    jxl_ma_node *raw;
+    uint32_t nraw, root;
+    jxl_ma_leaf *leaves;
     jxl_dec dec;          /* histograms for the sample stream */
     int valid;
 } jxl_ma_config;

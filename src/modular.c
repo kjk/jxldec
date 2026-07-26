@@ -106,6 +106,27 @@ static int ma_flat_grow(jxl_ctx *ctx, jxl_ma_flat **flat, uint32_t **bnode,
     return 0;
 }
 
+/* Properties 0 and 1 are the channel and stream index, which do not vary
+   within one channel of one stream, so a test on either has an answer that is
+   fixed before the first sample is decoded. `fold` says to take that answer
+   now and descend past the node. Chains of them collapse in one go. This
+   terminates for the same reason the walk does: jxl_ma_config_read has
+   already checked that every child index is strictly greater than its
+   parent's, so each step moves forward in the array.
+
+   Left is child + 0 and right is child + 1, and ma_flatten below pairs side 0
+   with the o0 == 0 slots -- where o0 is `v > split ? 0 : 1`. So `v > value`
+   picks the left child, matching the walk exactly. */
+static uint32_t ma_fold(const jxl_ma_node *raw, uint32_t i, int fold,
+                        int32_t channel, int32_t stream_idx) {
+    if (!fold) return i;
+    while (raw[i].property == 0 || raw[i].property == 1) {
+        int32_t v = raw[i].property == 0 ? channel : stream_idx;
+        i = raw[i].child + (v > raw[i].value ? 0u : 1u);
+    }
+    return i;
+}
+
 /* Rewrite the binary tree into the two-levels-per-entry form that
    ma_get_leaf walks. Slots are filled breadth-first: by the time the loop
    reaches slot fi, bnode[fi] names the binary node it stands for, and filling
@@ -113,17 +134,25 @@ static int ma_flat_grow(jxl_ctx *ctx, jxl_ma_flat **flat, uint32_t **bnode,
    so a finished walk needs no further indirection; a child that is a leaf has
    no test to contribute, so its slot in the parent gets property 0 with a
    split no property value can exceed and both its grandchild slots hold that
-   same leaf. */
-static int ma_flatten(jxl_ctx *ctx, jxl_ma_config *ma, const jxl_ma_node *raw,
+   same leaf.
+
+   With `fold` set, every node reached is first pushed past any run of tests
+   on properties 0 and 1. Folding has to happen here rather than as a separate
+   pass over the binary tree because an entry packs two levels: which node
+   lands at which level shifts as constant tests disappear, and only the
+   flattening knows that. */
+static int ma_flatten(jxl_ctx *ctx, const jxl_ma_node *raw,
                       uint32_t count, uint32_t root,
-                      const jxl_ma_leaf *leaves) {
+                      const jxl_ma_leaf *leaves, int fold,
+                      int32_t channel, int32_t stream_idx,
+                      jxl_ma_flat **out_flat, uint32_t *out_n) {
     jxl_ma_flat *flat = NULL;
     uint32_t *bnode = NULL;
     uint32_t cap = 0, n = 0, fi;
     int rc = -1;
 
     if (ma_flat_grow(ctx, &flat, &bnode, &cap, 1) != 0) goto done;
-    bnode[0] = root;
+    bnode[0] = ma_fold(raw, root, fold, channel, stream_idx);
     n = 1;
 
     for (fi = 0; fi < n; fi++) {
@@ -149,7 +178,8 @@ static int ma_flatten(jxl_ctx *ctx, jxl_ma_config *ma, const jxl_ma_node *raw,
         flat[fi].u.dec.child = base;
 
         for (side = 0; side < 2; side++) {
-            uint32_t c = raw[b].child + side;   /* left, then right */
+            uint32_t c = ma_fold(raw, raw[b].child + side, fold,
+                                 channel, stream_idx);   /* left, then right */
             uint32_t slot = base + 2 * side;
             int32_t p, s;
 
@@ -161,8 +191,10 @@ static int ma_flatten(jxl_ctx *ctx, jxl_ma_config *ma, const jxl_ma_node *raw,
             } else {
                 p = raw[c].property;
                 s = raw[c].value;
-                bnode[slot] = raw[c].child;
-                bnode[slot + 1] = raw[c].child + 1;
+                bnode[slot] = ma_fold(raw, raw[c].child, fold,
+                                      channel, stream_idx);
+                bnode[slot + 1] = ma_fold(raw, raw[c].child + 1, fold,
+                                          channel, stream_idx);
             }
             if (side == 0) {
                 flat[fi].u.dec.prop1 = p;
@@ -174,8 +206,8 @@ static int ma_flatten(jxl_ctx *ctx, jxl_ma_config *ma, const jxl_ma_node *raw,
         }
     }
 
-    ma->flat = flat;
-    ma->nflat = n;
+    *out_flat = flat;
+    *out_n = n;
     flat = NULL;
     rc = 0;
 
@@ -358,7 +390,17 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
             goto done;
         }
     }
-    if (ma_flatten(ctx, ma, raw, count, dq[dq_head], leaves) != 0) goto done;
+    if (ma_flatten(ctx, raw, count, dq[dq_head], leaves, 0, 0, 0,
+                   &ma->flat, &ma->nflat) != 0)
+        goto done;
+    /* Handed over, not copied: a channel rebuilds the flat form from these
+       with its constant tests folded out. */
+    ma->raw = raw;
+    ma->nraw = count;
+    ma->root = dq[dq_head];
+    ma->leaves = leaves;
+    raw = NULL;
+    leaves = NULL;
     ma->valid = 1;
     rc = 0;
 
@@ -376,6 +418,12 @@ void jxl_ma_config_free(jxl_ctx *ctx, jxl_ma_config *ma) {
     jxl_free(ctx, ma->flat);
     ma->flat = NULL;
     ma->nflat = 0;
+    jxl_free(ctx, ma->raw);
+    ma->raw = NULL;
+    jxl_free(ctx, ma->leaves);
+    ma->leaves = NULL;
+    ma->nraw = 0;
+    ma->root = 0;
     jxl_dec_free(&ma->dec);
     ma->valid = 0;
 }
@@ -1654,6 +1702,21 @@ static uint32_t ma_props_mask(const jxl_ma_config *ma) {
     return mask;
 }
 
+/* Whether any real decision node tests the channel or the stream index --
+   the two properties a single channel already knows the answer to. This asks
+   the binary tree rather than ma_props_mask because the flat form pads the
+   slot of a child that is a leaf with property 0 and an unreachable split, so
+   bit 0 of that mask is set on almost every tree whether or not anything
+   tests the channel. Folding nothing would still cost a rebuild per channel,
+   so the distinction matters. */
+static int ma_tests_const_props(const jxl_ma_config *ma) {
+    uint32_t i;
+    for (i = 0; i < ma->nraw; i++) {
+        if (ma->raw[i].property == 0 || ma->raw[i].property == 1) return 1;
+    }
+    return 0;
+}
+
 /* The weighted-predictor error (property 15) is unbounded in principle, so a
    lookup table over it is only valid if clamping the index cannot change any
    decision. The walk tests `v > split`, so for a value above the range,
@@ -1733,8 +1796,13 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
     int need_sc;
     uint32_t props_mask;
     int wp_lut_usable = 0;
+    int can_fold;
     const jxl_ma_leaf **wp_lut = NULL;
+    jxl_ma_config spec;
+    int spec_ok = 0;
     int rc = -1;
+
+    memset(&spec, 0, sizeof(spec));
 
     if (!ma || !ma->valid) {
         JXL_ERR(ctx, "modular: no MA tree");
@@ -1772,6 +1840,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                 (!need_sc && (props_mask & ~3u) == 0), wp_lut_usable,
                 (unsigned)ma->nflat, (unsigned)cl->n);
     }
+    can_fold = ma->raw && ma_tests_const_props(ma);
     max_prev = ma_max_prev_channels(ma);
     if (max_prev) {
         prev = (const jxl_mchan **)jxl_calloc(ctx, cl->n, sizeof(jxl_mchan *));
@@ -1780,10 +1849,36 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
 
     for (ci = 0; ci < cl->n; ci++) {
         jxl_mchan *ch = &cl->chans[ci];
+        const jxl_ma_config *cma;
         uint32_t nprev = 0;
         uint32_t x, y;
 
+        /* Last channel's specialised tree. Freeing here rather than at the
+           end of the body means the tracks below can keep `continue`-ing out
+           without each having to remember to do it. */
+        jxl_free(ctx, spec.flat);
+        spec.flat = NULL;
+        spec.nflat = 0;
+        spec_ok = 0;
+
         if (ch->w == 0 || ch->h == 0) continue;
+
+        /* Properties 0 and 1 are fixed for the whole of this channel, so
+           every test on them has an answer already. Rebuilding the flat tree
+           with those folded out shortens every walk this channel will make.
+           On lm_d1 that is most of the tree: its main stream averages 12
+           entries per walk, 20 of whose ~24 tests are on the channel index.
+           The rebuild is O(tree), paid once per channel against a walk per
+           sample, so it only wants a channel with more samples than the tree
+           has entries. A rebuild that fails to allocate is not an error --
+           the general tree is still there to walk. */
+        if (can_fold && (uint64_t)ch->w * ch->h >= ma->nflat &&
+            ma_flatten(ctx, ma->raw, ma->nraw, ma->root, ma->leaves, 1,
+                       (int32_t)ci, (int32_t)stream_idx,
+                       &spec.flat, &spec.nflat) == 0) {
+            spec_ok = 1;
+        }
+        cma = spec_ok ? &spec : ma;
 
         if (max_prev) {
             /* Previously decoded channels with identical geometry, newest
@@ -1816,7 +1911,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
             pr.cache[1] = (int32_t)stream_idx;
             for (v = 0; v < JXL_WP_LUT_N; v++) {
                 pr.cache[15] = JXL_WP_LUT_LO + (int32_t)v;
-                wp_lut[v] = ma_get_leaf(ma, &ps, &pr);
+                wp_lut[v] = ma_get_leaf(cma, &ps, &pr);
             }
             pr.has_sc = 1;
             for (y = 0; y < ch->h; y++) {
@@ -1850,20 +1945,29 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
             continue;
         }
 
-        /* Fast track: the tree only tests channel and stream index, both
-           fixed for this channel, so the leaf is fixed too -- resolve it once
-           here instead of walking the tree a million times. predict_sample
-           only reads the property struct for the self-correcting predictor,
-           so with no weighted predictor in play the whole per-sample property
-           fill goes as well. libjxl specialises the same way. */
+        /* Fast track: the leaf is the same for every sample in the channel,
+           so resolve it once here instead of walking the tree a million
+           times. predict_sample only reads the property struct for the
+           self-correcting predictor, so with no weighted predictor in play
+           the whole per-sample property fill goes as well. libjxl
+           specialises the same way.
+
+           Once the constant tests have been folded out, "the tree only tests
+           channel and stream index" is just "what is left is a single leaf",
+           and that catches strictly more: a tree that tests real properties
+           somewhere can still collapse to a leaf down the branch this
+           particular channel takes. Most of lm_d1's channels do exactly that.
+           The unspecialised condition stays for the channels too small to
+           have been rebuilt. */
         {
             jxl_props pr0;
             const jxl_ma_leaf *fixed = NULL;
-            if (!need_sc && (props_mask & ~3u) == 0) {
+            if (!need_sc && (spec_ok ? cma->flat[0].property < 0
+                                     : (props_mask & ~3u) == 0)) {
                 memset(&pr0, 0, sizeof(pr0));
                 pr0.cache[0] = (int32_t)ci;
                 pr0.cache[1] = (int32_t)stream_idx;
-                fixed = ma_get_leaf(ma, &ps, &pr0);
+                fixed = ma_get_leaf(cma, &ps, &pr0);
                 if (fixed->predictor == JXL_PRED_SELF_CORRECTING) fixed = NULL;
             }
             if (fixed) {
@@ -1903,7 +2007,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                 int32_t diff, value;
 
                 props_compute(&ps, &pr, (int32_t)ci, (int32_t)stream_idx);
-                leaf = ma_get_leaf(ma, &ps, &pr);
+                leaf = ma_get_leaf(cma, &ps, &pr);
                 token = jxl_dec_read_clustered(dec, br, leaf->cluster, dist_multiplier);
                 diff = jxl_unpack_signed(token);
                 diff = (int32_t)((uint32_t)diff * leaf->multiplier +
@@ -1928,6 +2032,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
     rc = 0;
 
 done:
+    jxl_free(ctx, spec.flat);
     jxl_free(ctx, wp_lut);
     pred_state_free(ctx, &ps);
     jxl_free(ctx, prev);

@@ -169,6 +169,65 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Folding the constant tests out of the tree, per channel
+Properties 0 and 1 are the channel and the stream index. Neither changes
+while a channel is being decoded, so every test on them has an answer before
+the first sample is read -- and `lm_d1` turned out to be almost nothing but
+those tests. Instrumenting the walk:
+
+| stream | entries/walk | of which constant |
+|---|---|---|
+| `lm_d1` main | 11.96 (~24 tests) | **20.52** |
+| `lm_d1` others | 3.13 | 4.94 |
+| `m_resp` | 4.51 | 1.52 |
+| `m_e7` | 4.85 | 0.51 |
+| `m_e9` | 5.07 | 0.76 |
+
+85% of `lm_d1`'s longest walk was re-deciding, per sample, a question fixed
+for the whole channel. So each channel now rebuilds the flat tree with those
+folded away, and walks that instead. Afterwards:
+
+| | entries/walk |
+|---|---|
+| `lm_d1` main | 11.96 -> **1.60** |
+| `lm_d1` others | 3.13 -> 0.46 |
+| `m_resp` | 4.51 -> 3.73 |
+
+The folding has to happen *inside* the flattening, not as a pass over the
+binary tree first. An entry packs two levels, so removing a node shifts which
+node lands at which level, and only the flattening knows that. `ma_flatten`
+therefore grew a `fold` flag and calls `ma_fold` on each node it is about to
+place; `ma_fold` walks past runs of constant tests, terminating for the same
+reason the sample walk does -- child indices are already known to increase.
+The binary tree and the leaf array are kept in `jxl_ma_config` for this,
+where before they were freed once the flat form existed.
+
+Entries/walk under 1 is the interesting part of that table: it means most
+walks now end at the root because the whole tree collapsed to a leaf for that
+channel. That is the existing fixed-leaf track, so its test changed from "the
+tree only tests properties 0 and 1" to "what is left after folding is a
+single leaf" -- strictly more cases, since a tree that tests real properties
+elsewhere can still collapse down the branch one channel takes. Worth 1.65x
+-> 1.53x on `lm_d1` by itself, on top of the folding.
+
+Two guards. The rebuild is O(tree) against one walk per sample, so a channel
+needs more samples than the tree has entries to be worth it. And a tree that
+never tests properties 0 or 1 must skip the rebuild entirely -- which cannot
+be asked of `ma_props_mask`, because flattening pads the slot of a child that
+is a leaf with property 0 and an unreachable split, setting bit 0 on nearly
+every tree. `ma_tests_const_props` asks the binary tree instead, where every
+node is a real test. (An earlier note here read "property 0 is in every mask"
+as if that meant something; it was this padding.)
+
+| preset | before | after |
+|---|---|---|
+| `lm_d1` | 2.81x | **1.55x** |
+| `m_resp` | 1.62x | **1.44x** |
+| `v_d1` | 2.14x | 2.15x (tests neither, unchanged) |
+
+Corpus **1.92x -> 1.80x**. 1245/1245 with per-file verdicts unchanged,
+ASan clean, 115 reproducers clean, and a bounded fuzz run that found nothing.
+
 ### The property mask for `lm_d1`: measured, did not pay, reverted
 The two specialised tracks each require the tree to test almost nothing, so
 the obvious generalisation was to compute *only* the properties the tree
