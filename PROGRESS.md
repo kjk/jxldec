@@ -171,6 +171,58 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### The fused-loop rewrite: the shadow rows are not redundant
+libjxl decodes a Modular channel in one function with the neighbour tracking,
+the property fill, the tree walk and the ANS read all inlined together. Ours
+splits that across `props_compute`, `ma_get_leaf`, `jxl_dec_read_clustered`,
+`predict_sample` and `pred_record`. Fusing them is the obvious remaining
+structural idea, and the row-indexed rewrite of the *fixed-leaf* track earlier
+had already won 11% on `m_e1` doing exactly this.
+
+The part worth attacking is `pred_record`'s scratch. It keeps two width-sized
+rows and copies every decoded sample into one of them -- a second store per
+sample, plus a pointer swap per row -- to hold values the channel already
+has. Reading the code, the two buffers are cleverer than they look: within a
+row, `curr_row[x-2]` is the current row's already-written west-west sample
+while `curr_row[x]` is still row *y-2*, so one buffer serves both `pred_ww`
+and `pred_nn`. Both are nevertheless in the channel, at `[y][x-2]` and
+`[y-2][x]`, so the buffers can be dropped and every neighbour indexed
+directly.
+
+Done, byte-identical over all 1242 corpus files -- and **3-4% slower**,
+everywhere:
+
+| preset | shadow rows p1 / p2 | channel-indexed p1 / p2 |
+|---|---|---|
+| `m_resp` | 1.337x / 1.330x | 1.389x / 1.386x |
+| `lm_d1` | 1.335x / 1.331x | 1.390x / 1.394x |
+| `m_e9` | 1.209x / 1.205x | 1.252x / 1.245x |
+| `m_e7` | 1.234x / 1.221x | 1.272x / 1.270x |
+| `v_prog` | 1.880x / 1.907x | 1.948x / 1.972x |
+| `m_e3` | 1.326x / 1.321x | 1.356x / 1.345x |
+
+(The absolute times overlap here because libjxl's own column drifted 6.7%
+between runs; the ratio is what to read, since both decoders run interleaved
+in the same process. Six presets, two passes, no overlap in any of them.)
+
+The scratch rows were buying **locality**, not just bookkeeping. Two
+width-sized buffers stay in L1 together; the channel's rows y, y-1 and y-2
+are a stride apart, so on a wide channel each is a different set of lines,
+and the index needs a multiply where the buffer needed a pointer add. The
+extra store per sample is cheaper than the three scattered loads it saves.
+
+Which also explains why the same transformation *did* pay on the fixed-leaf
+track: there the predictors only reach n/w/nw, so it touches rows y and y-1 --
+adjacent and hot -- and it removed a per-sample switch and the whole state
+machine along with them. Here row y-2 is needed too and nothing else got
+simpler.
+
+Taken with force-inlining the Modular chain having measured 8.7% slower
+earlier, the conclusion is that our split into separate functions is not what
+costs us against libjxl. `ma_get_leaf` at ~4 dependent loads per sample,
+`sc_predict`, and the ANS read are each near their own local optimum, and
+fusing them does not make any of them do less work.
+
 ### v_prog: no v_prog-specific problem, and the MA walk is already short
 `v_prog` at 1.93x was the worst remaining ratio and the one preset never
 profiled. It turns out to have nothing of its own wrong with it. The `-vs`
