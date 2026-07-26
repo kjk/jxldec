@@ -86,7 +86,7 @@ verified against `djxl` yet.
 ## Performance
 `bun cmd/bench.ts -all` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both single-threaded, best of N. Over the
-1245-file corpus this decoder takes **2.18x** libjxl's decode time. libjxl is
+1245-file corpus this decoder takes **2.02x** libjxl's decode time. libjxl is
 AVX2 throughout; this is scalar C apart from the SSE2 hot loops (noise,
 upsampling, EPF, gaborish, both DCT passes and the colour conversion), so a
 constant factor is

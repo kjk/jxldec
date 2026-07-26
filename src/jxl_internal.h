@@ -100,6 +100,28 @@ void jxl_br_seek_byte(jxl_br *br, size_t byte_off);
 /* jxl_br_u32 takes four (offset, nbits) alternatives; the value is
    offset + u(nbits), and nbits == 0 means the alternative is the constant. */
 
+/* floor(log2(v)) for v >= 1. The Modular weighted predictor needs five of
+   these per sample, and doing them as `while (v > 1) { v >>= 1; n++; }` was
+   37% of a Modular decode -- a loop of up to 27 iterations where the machine
+   has an instruction. Same value, so the output is unchanged. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
+
+static inline uint32_t jxl_floor_log2_u64(uint64_t v) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    unsigned long idx;
+    _BitScanReverse64(&idx, v);
+    return (uint32_t)idx;
+#elif defined(__clang__) || defined(__GNUC__)
+    return 63u - (uint32_t)__builtin_clzll(v);
+#else
+    uint32_t n = 0;
+    while (v > 1) { v >>= 1; n++; }
+    return n;
+#endif
+}
+
 static inline int32_t jxl_unpack_signed(uint32_t u) {
     return (int32_t)((u >> 1) ^ (~(u & 1) + 1));
 }

@@ -508,9 +508,8 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
     wn[0] = sc->wp.w0; wn[1] = sc->wp.w1; wn[2] = sc->wp.w2; wn[3] = sc->wp.w3;
     for (i = 0; i < 4; i++) {
         uint64_t v = ((uint64_t)err_sum[i] + 1) >> 5;
-        uint32_t shift = 0;
+        uint32_t shift = v > 1 ? jxl_floor_log2_u64(v) : 0;
         uint32_t idx;
-        while (v > 1) { v >>= 1; shift++; }
         idx = (err_sum[i] >> shift) + 1;
         if (idx > 64) idx = 64;
         weight[i] = 4 + ((wn[i] * dl[idx]) >> shift);
@@ -518,7 +517,7 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
     for (i = 0; i < 4; i++) sum_weights += weight[i];
     {
         uint32_t v = sum_weights >> 4;
-        while (v > 1) { v >>= 1; log_weight++; }
+        if (v > 1) log_weight = (int)jxl_floor_log2_u64(v);
     }
     for (i = 0; i < 4; i++) weight[i] >>= log_weight;
     sum_weights = 0;

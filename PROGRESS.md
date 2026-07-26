@@ -62,7 +62,7 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **2.18x libjxl** (2.74x before the SSE2 work below;
+1245-file corpus we are **2.02x libjxl** (2.74x before the SSE2 work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
 average up). libjxl is AVX2 throughout; we are scalar C apart from the SSE2
@@ -76,9 +76,10 @@ keeps a scalar twin and is checked bit-identical against it -- see the log.
 functions, hot source lines, heaviest call path). That is how the numbers
 below were found.
 
-The worst ratios among files that take libjxl more than 5ms are now the
-`v_rs2` set at 5.8-6.1x, whose upsampling filter is genuinely 25 taps per
-output sample. Files below ~1ms sit at up to 9x purely on fixed setup cost.
+The worst ratios among files that take libjxl more than 5ms are the `v_rs2`
+set, whose upsampling filter is genuinely 25 taps per output sample. Modular
+is the strongest area -- `m_e9` is 1.25x and `m_e3` 1.65x. Files below ~1ms
+sit at up to 9x purely on fixed setup cost.
 
 ### The EPF and spline rewrites
 Three hot loops were doing the same work three or more times over.
@@ -144,6 +145,43 @@ What is left is qualitatively different from the rounds above:
 - **Multithreading**, which is not implemented at all and would dwarf both.
 
 ## Log
+
+### A software bit-scan was 37% of a Modular decode
+Every profile so far had been taken on a VarDCT file, so all the SIMD work
+went there -- while Modular is about 60% of the corpus by time. Profiling
+`flower.m_e3` instead put `sc_predict` at **37.2% self**, `ma_get_leaf` at
+22.6% and `sc_record` at 8.0%: the weighted predictor, not anything that had
+been touched.
+
+Inside `sc_predict`:
+
+    uint64_t v = ((uint64_t)err_sum[i] + 1) >> 5;
+    uint32_t shift = 0;
+    while (v > 1) { v >>= 1; shift++; }
+
+That is `floor(log2(v))` written as a loop, and it runs **five times per
+sample** -- four in the weight loop, once for `log_weight`. `err_sum` is a
+sum of accumulated prediction errors, so the loop can run twenty-odd
+iterations. On a 3.4MP three-channel image that is on the order of a billion
+iterations to compute something the machine does in one instruction.
+
+`jxl_floor_log2_u64` uses `_BitScanReverse64` on MSVC and `__builtin_clzll`
+elsewhere, with the loop kept as a portable fallback. It computes the same
+value, so nothing about the output changes -- and Modular is byte-exact
+against libjxl, so the corpus would have caught it instantly if it did.
+
+    flower.m_e3    556.3ms  1.94x -> 453.3ms  1.65x   (-18%)
+    flower.m_e9                      575.0ms  1.25x
+    flower.lm_d1                     377.5ms  2.42x
+
+Corpus **2.18x -> 2.02x**, 39.0s -> 33.3s. The single biggest step of the
+whole effort, and it was neither SIMD nor an algorithm change -- just a loop
+that should never have been a loop. The same shape as `noise_mirror`,
+`sample_clamped` and the per-tap mirroring in `epf_pass`: the recurring bug
+in this codebase is computing something per sample that the hardware or a
+hoist could do once.
+
+1245/1245 ok, ASan clean, 115 fuzz reproducers clean.
 
 ### AVX2 with runtime dispatch -- and why only one kernel kept it
 `jxl_has_avx2()` in `core.c` does the detection: CPUID for the feature bit,
