@@ -13,6 +13,17 @@
 
 #include <math.h>
 
+/* SSE2 is baseline on x64. -DJXL_VARDCT_FORCE_SCALAR builds the scalar path
+   alone so the two can be diffed. Both loops vectorised here run across x
+   with no cross-lane dependency, so each lane performs the same operations
+   in the same order as the scalar code and rounds identically. */
+#if !defined(JXL_VARDCT_FORCE_SCALAR) && \
+    (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
+     (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#define JXL_VARDCT_SSE2 1
+#include <emmintrin.h>
+#endif
+
 /* ===================================================================== */
 /* transform type tables                                                  */
 /* ===================================================================== */
@@ -1365,7 +1376,34 @@ void jxl_dequant_varblock(float *coeff, size_t stride, int tr, int32_t hf_mul,
     for (y = 0; y < h; y++) {
         float *row = coeff + (size_t)y * stride;
         const float *mrow = matrix + (size_t)y * w;
-        for (x = 0; x < w; x++) {
+        x = 0;
+#ifdef JXL_VARDCT_SSE2
+        {
+            const __m128 vbias = _mm_set1_ps(quant_bias);
+            const __m128 vnum = _mm_set1_ps(quant_bias_numerator);
+            const __m128 vmul = _mm_set1_ps(mul);
+            const __m128 one = _mm_set1_ps(1.0f);
+            const __m128 absmask =
+                _mm_castsi128_ps(_mm_set1_epi32(0x7fffffff));
+            for (; x + 4 <= w; x += 4) {
+                /* The coefficients arrive as integers in the float plane's
+                   bit pattern, so this converts rather than loads. */
+                __m128 v = _mm_cvtepi32_ps(
+                    _mm_loadu_si128((const __m128i *)(row + x)));
+                __m128 small = _mm_mul_ps(v, vbias);
+                /* The large leg divides by v, which is zero exactly when the
+                   small leg is taken; the select is bitwise, so the infinity
+                   in a discarded lane cannot reach the result. */
+                __m128 large = _mm_sub_ps(v, _mm_div_ps(vnum, v));
+                __m128 m = _mm_cmple_ps(_mm_and_ps(absmask, v), one);
+                v = _mm_or_ps(_mm_and_ps(m, small), _mm_andnot_ps(m, large));
+                v = _mm_mul_ps(v, _mm_loadu_ps(mrow + x));
+                v = _mm_mul_ps(v, vmul);
+                _mm_storeu_ps(row + x, v);
+            }
+        }
+#endif
+        for (; x < w; x++) {
             int32_t qn = *(int32_t *)&row[x];
             float v = (float)qn;
             if (fabsf(v) <= 1.0f) v *= quant_bias;
@@ -1380,20 +1418,42 @@ void jxl_dequant_varblock(float *coeff, size_t stride, int tr, int32_t hf_mul,
 void jxl_cfl_hf(float *cx, float *cy, float *cb, size_t stride, uint32_t gw,
                 uint32_t gh, const int32_t *x_from_y, const int32_t *b_from_y,
                 uint32_t cfl_stride, const jxl_lf_chan_corr *corr) {
-    uint32_t x, y;
+    uint32_t x, y, x0;
+    /* The two correlation factors are indexed by x / 64, so they are constant
+       over each run of 64 columns -- but the loop was recomputing them per
+       sample, an int-to-float and a divide each. Walking the row in runs of
+       64 hoists both out, and what is left is two multiply-accumulates that
+       vectorise directly. */
     for (y = 0; y < gh; y++) {
         const int32_t *xr = x_from_y + (size_t)(y / 64) * cfl_stride;
         const int32_t *br_ = b_from_y + (size_t)(y / 64) * cfl_stride;
         float *rx = cx + (size_t)y * stride;
         const float *ry = cy + (size_t)y * stride;
         float *rb = cb + (size_t)y * stride;
-        for (x = 0; x < gw; x++) {
+        for (x0 = 0; x0 < gw; x0 += 64) {
+            uint32_t xe = x0 + 64 < gw ? x0 + 64 : gw;
             float kx = corr->base_correlation_x +
-                       ((float)xr[x / 64] / (float)corr->colour_factor);
+                       ((float)xr[x0 / 64] / (float)corr->colour_factor);
             float kb = corr->base_correlation_b +
-                       ((float)br_[x / 64] / (float)corr->colour_factor);
-            rx[x] += kx * ry[x];
-            rb[x] += kb * ry[x];
+                       ((float)br_[x0 / 64] / (float)corr->colour_factor);
+            x = x0;
+#ifdef JXL_VARDCT_SSE2
+            {
+                const __m128 vkx = _mm_set1_ps(kx);
+                const __m128 vkb = _mm_set1_ps(kb);
+                for (; x + 4 <= xe; x += 4) {
+                    __m128 vy = _mm_loadu_ps(ry + x);
+                    _mm_storeu_ps(rx + x, _mm_add_ps(_mm_loadu_ps(rx + x),
+                                                     _mm_mul_ps(vkx, vy)));
+                    _mm_storeu_ps(rb + x, _mm_add_ps(_mm_loadu_ps(rb + x),
+                                                     _mm_mul_ps(vkb, vy)));
+                }
+            }
+#endif
+            for (; x < xe; x++) {
+                rx[x] += kx * ry[x];
+                rb[x] += kb * ry[x];
+            }
         }
     }
 }

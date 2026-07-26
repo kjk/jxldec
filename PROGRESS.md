@@ -169,6 +169,40 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Two VarDCT loops: a divide per sample, and a scalar dequantiser
+With the presets clustered around 2x and no single file standing out, the
+next targets came from the shared VarDCT core rather than any one preset.
+`jxl_dequant_varblock` was 7.6% of a decode and `jxl_cfl_hf` 4.1%.
+
+**Chroma-from-luma** was the sillier of the two. Its two correlation factors
+are indexed by `x / 64`, so they are constant across each run of 64 columns,
+but the loop recomputed both per sample -- an int-to-float and a **divide**
+each, to produce a value that had not changed in 63 iterations. Walking the
+row in runs of 64 hoists them out, and what remains is two multiply-
+accumulates over contiguous floats, which vectorise directly.
+
+**Dequantisation** is a per-coefficient convert-from-int, a biased rounding
+correction, and two multiplies. The correction picks between `v * bias` and
+`v - numerator / v` on `|v| <= 1`. Vectorised, both legs are computed and
+selected bitwise -- and the divide in the discarded leg is by zero exactly
+when the small leg is taken, so it is an infinity that the select throws
+away rather than anything that can reach the output.
+
+| preset | before | after |
+|---|---|---|
+| `jpeg` | 2.28x | **2.10x** |
+| `v_icc` | 2.09x | **2.01x** |
+| `v_d1` | 2.02x | **1.96x** |
+
+Corpus **1.66x -> 1.63x**, the first time under 1.65x. Scalar and SSE2 builds
+diffed byte-identical over all 1242 corpus files (`-DJXL_VARDCT_FORCE_SCALAR`),
+verdicts against libjxl unchanged, ASan clean, 115 reproducers clean.
+
+The 41MB of `memset` per frame that shows up alongside these is *not* a
+target: the HF coefficient scatter writes only the non-zero coefficients and
+accumulates them with `+=` across passes, so the plane genuinely has to start
+at zero.
+
 ### Handing the coefficient planes over instead of copying them out
 The VarDCT coefficient planes are padded out to whole 8x8 blocks, so they are
 wider than the image. Cropping them into the output planes was a row-by-row
