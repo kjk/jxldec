@@ -171,6 +171,52 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### v_prog: no v_prog-specific problem, and the MA walk is already short
+`v_prog` at 1.93x was the worst remaining ratio and the one preset never
+profiled. It turns out to have nothing of its own wrong with it. The `-vs`
+profile is the same shape as `m_resp`'s:
+
+| | |
+|---|---|
+| libjxl `DecodeModularChannelMAANS<0>` | 19.3% |
+| ours `ma_get_leaf` | **14.2%** |
+| ours `sc_predict` | 9.7% |
+| ours `dec_read_symbol` | 6.3% |
+| ours `jxl_modular_decode` (self) | 3.6% |
+| ours `sc_record` | 2.6% |
+
+36.4% against libjxl's 19.3% for the identical work. `v_prog` is simply a
+VarDCT file whose Modular part -- the LF image, decoded once per pass --
+dominates, so it inherits the Modular gap rather than having one of its own.
+There is no progressive-specific work being repeated.
+
+Three things checked, all negative:
+
+**The fold threshold, again.** `v_prog`'s global tree is 1693 entries and its
+channels go down to 32x64 = 2048 samples, so the rebuild looked nearly 1:1
+with the samples it serves -- a much worse ratio than the `m_resp` case that
+had already been swept. Sweeping it anyway: 1.932x at the current threshold,
+1.932x / 1.942x / 1.964x / 1.967x as it rises. Flat then worse, same as
+before. The earlier sweep not covering `v_prog` was a real gap in that test;
+covering it changes nothing.
+
+**Cache pressure from the big tree.** 1693 entries is 47KB, past L1, which
+would explain a slow walk. But folding already collapses it: **1693 -> 185
+for a 32x64 channel, 377 for 128x256**. The tree actually walked is 5-10KB.
+Not the mechanism.
+
+**Walk length.** Instrumenting `ma_get_leaf`: 4.20 entries per walk on
+`v_prog`, 2.95 on `m_resp`, 5.16 on `m_e9`. Each entry covers two tree
+levels, so that is 6-10 levels for trees of 185-377 entries -- about what a
+balanced tree of that size costs, and there is no anomaly to remove.
+
+So `ma_get_leaf` is at a local optimum given its shape: roughly four
+dependent loads per sample, already two levels per load, already walking a
+folded tree that fits L1. Closing the rest of this gap means what libjxl
+does -- one fully inlined per-sample loop specialised per tree shape, with
+the walk, the predictor and the ANS read fused -- which is a much larger
+change than any single optimisation left on the list.
+
 ### The vertical squeeze was walking the image a column at a time
 Two ideas came out of profiling `m_resp`, the biggest remaining loss. Only
 the second one was right.
