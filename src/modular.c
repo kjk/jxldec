@@ -33,6 +33,16 @@ static int32_t grad_clamped(int32_t n, int32_t w, int32_t nw) {
     return (int32_t)g;
 }
 
+/* The SELECT predictor, split out of predict_sample so the fixed-leaf loop
+   can use it without going through the runtime switch. Same expression,
+   including the unsigned differencing that keeps it well-defined at the
+   extremes of int32. */
+static int32_t sel_pred(int32_t n, int32_t w, int32_t nw) {
+    uint64_t dn = (uint64_t)(n > nw ? (int64_t)n - nw : (int64_t)nw - n);
+    uint64_t dw = (uint64_t)(w > nw ? (int64_t)w - nw : (int64_t)nw - w);
+    return dn < dw ? w : n;
+}
+
 /* ===================================================================== */
 /* channel lists                                                          */
 /* ===================================================================== */
@@ -1988,25 +1998,95 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                 uint32_t mult = fixed->multiplier;
                 int32_t off = fixed->offset;
                 uint8_t predictor = fixed->predictor;
-                for (y = 0; y < ch->h; y++) {
-                    int32_t *row = ch->data + (size_t)y * ch->stride;
-                    for (x = 0; x < ch->w; x++) {
-                        uint32_t token = jxl_dec_read_clustered(dec, br, cluster,
-                                                                dist_multiplier);
-                        int32_t diff = jxl_unpack_signed(token);
-                        int32_t value;
-                        diff = (int32_t)((uint32_t)diff * mult + (uint32_t)off);
-                        value = (int32_t)((uint32_t)diff +
-                                (uint32_t)predict_sample(&ps, &pr0, predictor));
-                        row[x] = value;
-                        pred_record(&ps, &pr0, value);
-                    }
-                    if (br->err || dec->err) {
-                        JXL_ERR(ctx, "modular: truncated stream %u",
-                                (unsigned)stream_idx);
-                        goto done;
-                    }
+
+/* With the leaf fixed, what is left per sample is one entropy read and one
+   predictor. Running that through predict_sample and pred_record costs a
+   switch on a runtime predictor plus a state machine that maintains n/w/nw
+   and a pair of scratch rows -- for values that are already sitting in the
+   channel. The scratch rows hold exactly what the channel rows hold (both are
+   written from the same `value`), and row y+1 is not touched until row y is
+   finished, so the neighbours can simply be indexed out of the channel.
+
+   Its edge cases have to be reproduced exactly. pred_record leaves n = w = nw
+   equal to the previous sample on row 0, and equal to prev_row[0] at the
+   start of every later row; that is the same convention libjxl's fast tracks
+   use, so `left` falls back to top, and `top`/`topleft` fall back to `left`.
+
+   Hoisting the predictor out of the loop is what libjxl does too -- its
+   "Gradient very fast track" is this loop with the guess spelled out.
+   Predictors reaching further than n/w/nw keep the general path below. */
+#define JXL_FIXED_LOOP(GUESS)                                                 \
+    for (y = 0; y < ch->h; y++) {                                             \
+        int32_t *row = ch->data + (size_t)y * ch->stride;                     \
+        const int32_t *rtop = y ? row - ch->stride : row;                     \
+        for (x = 0; x < ch->w; x++) {                                         \
+            int32_t left = x ? row[x - 1] : (y ? rtop[0] : 0);                \
+            int32_t top = y ? rtop[x] : left;                                 \
+            int32_t topleft = (x && y) ? rtop[x - 1] : left;                  \
+            uint32_t token = jxl_dec_read_clustered(dec, br, cluster,         \
+                                                    dist_multiplier);         \
+            int32_t diff = jxl_unpack_signed(token);                          \
+            (void)top; (void)topleft;                                         \
+            diff = (int32_t)((uint32_t)diff * mult + (uint32_t)off);          \
+            row[x] = (int32_t)((uint32_t)diff + (uint32_t)(GUESS));           \
+        }                                                                     \
+        if (br->err || dec->err) {                                            \
+            JXL_ERR(ctx, "modular: truncated stream %u",                      \
+                    (unsigned)stream_idx);                                    \
+            goto done;                                                        \
+        }                                                                     \
+    }
+
+                switch (predictor) {
+                    case JXL_PRED_ZERO:
+                        JXL_FIXED_LOOP(0) break;
+                    case JXL_PRED_WEST:
+                        JXL_FIXED_LOOP(left) break;
+                    case JXL_PRED_NORTH:
+                        JXL_FIXED_LOOP(top) break;
+                    case JXL_PRED_NORTH_WEST:
+                        JXL_FIXED_LOOP(topleft) break;
+                    case JXL_PRED_GRADIENT:
+                        JXL_FIXED_LOOP(grad_clamped(top, left, topleft)) break;
+                    case JXL_PRED_AVG_W_N:
+                        JXL_FIXED_LOOP((int32_t)(((int64_t)left + top) / 2))
+                        break;
+                    case JXL_PRED_AVG_W_NW:
+                        JXL_FIXED_LOOP((int32_t)(((int64_t)left + topleft) / 2))
+                        break;
+                    case JXL_PRED_AVG_N_NW:
+                        JXL_FIXED_LOOP((int32_t)(((int64_t)top + topleft) / 2))
+                        break;
+                    case JXL_PRED_SELECT:
+                        JXL_FIXED_LOOP(sel_pred(top, left, topleft)) break;
+                    default:
+                        /* Reaches past n/w/nw (north-east, west-west, the
+                           averaging predictors over them): the state machine
+                           knows how to find those, so keep it. */
+                        for (y = 0; y < ch->h; y++) {
+                            int32_t *row = ch->data + (size_t)y * ch->stride;
+                            for (x = 0; x < ch->w; x++) {
+                                uint32_t token = jxl_dec_read_clustered(
+                                    dec, br, cluster, dist_multiplier);
+                                int32_t diff = jxl_unpack_signed(token);
+                                int32_t value;
+                                diff = (int32_t)((uint32_t)diff * mult +
+                                                 (uint32_t)off);
+                                value = (int32_t)((uint32_t)diff +
+                                        (uint32_t)predict_sample(&ps, &pr0,
+                                                                 predictor));
+                                row[x] = value;
+                                pred_record(&ps, &pr0, value);
+                            }
+                            if (br->err || dec->err) {
+                                JXL_ERR(ctx, "modular: truncated stream %u",
+                                        (unsigned)stream_idx);
+                                goto done;
+                            }
+                        }
+                        break;
                 }
+#undef JXL_FIXED_LOOP
                 continue;
             }
         }

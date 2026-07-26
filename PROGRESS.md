@@ -171,6 +171,47 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Restructuring the fixed-leaf loop the way libjxl does
+Reading `encoding.cc` again for the shape rather than the tracks: libjxl does
+not just specialise on the *tree*, it specialises on the **predictor**, and
+its fast tracks index the channel's own rows. Its "Gradient very fast track"
+is a plain double loop with `left`, `top` and `topleft` read out of `r[x-1]`
+and the row above, and the guess spelled out inline.
+
+Ours resolved the leaf once and then still ran, per sample, a
+`predict_sample` switch on a runtime predictor plus `pred_record` -- a state
+machine maintaining n/w/nw and swapping a pair of scratch rows. All of that
+to produce values that were already sitting in the channel: the scratch rows
+hold exactly what the channel rows hold, both written from the same `value`,
+and row y+1 is untouched until row y is done.
+
+So the fixed-leaf track now switches on the predictor *outside* the loop and
+indexes the channel directly. The edge cases have to be reproduced exactly,
+and they turn out to be the same convention libjxl uses: `pred_record` leaves
+n = w = nw equal to the previous sample on row 0 and equal to `prev_row[0]` at
+the start of every later row, which is `left` falling back to `top` and
+`top`/`topleft` falling back to `left`. Predictors that reach further than
+n/w/nw -- north-east, west-west, the averages over them -- keep the state
+machine, which knows how to find those.
+
+| preset | state machine p1 / p2 | row-indexed p1 / p2 |
+|---|---|---|
+| `m_e1` | 1.921x / 1.937x | **1.724x / 1.722x** |
+| `lm_d1` | 1.507x / 1.522x | **1.458x / 1.451x** |
+| `m_e3` | 1.348x / 1.357x | 1.346x / 1.343x |
+| `m_resp` | 1.402x / 1.402x | 1.398x / 1.402x |
+| `v_e3` | 1.856x / 1.856x | 1.883x / 1.890x |
+
+`m_e1` is 11% faster -- 922/946ms down to 837/832ms. `v_e3` reads worse but
+is not: ours spans 1042-1070ms on *both* sides and libjxl's own column swings
+561-577ms across the same runs, so that column is inside the noise. Only the
+presets that actually take the fixed-leaf track move, which is the check that
+the gain is where it claims to be.
+
+The values computed are identical, only their source changed, so output is
+byte-identical to the previous commit across all 1242 corpus files. Corpus
+**1.51x -> 1.49x**. ASan clean, 115 reproducers clean, amalgamation compiles.
+
 ### Making the weighted predictor's bit-scans branchless: measured, reverted
 `sc_predict` is still the single biggest item in a VarDCT-with-alpha decode
 (13.5% on `flower_alpha.v_e3` -- the alpha channel is Modular-coded, and its
