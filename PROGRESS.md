@@ -169,6 +169,40 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### The 709 curve was paying for precision libjxl does not use
+`v_2020` sat at 2.61x while `v_p3` -- same kind of file, same pipeline --
+sat at 2.17x. The only difference is the transfer function: P3 files declare
+sRGB, and sRGB already had libjxl's polynomial-and-table fast path, while
+Rec.2020 files declare **709**, which was a `powf(v, 0.45f)` per sample.
+The profile put `powf` at **23.6%** of the whole decode, the hottest thing
+in the file by a factor of three, with `jxl_linear_to_tf` at 34.1% inclusive.
+
+libjxl does not call `powf` there either. Its own encode path evaluates the
+curve with two rational polynomials -- `FastLog2f` and `FastPow2f` in
+`base/fast_math-inl.h`, together about 3e-5 relative error -- so the exact
+`powf` was not buying accuracy against the reference, it was buying
+*disagreement* with it. Porting the same pair, scalar and four lanes wide,
+makes the output closer to libjxl rather than further away.
+
+Against an 8-bit output step of 1/255 there are four orders of magnitude to
+spare, and the corpus agrees: every `v_2020` file reports byte-for-byte the
+same error statistics against libjxl as before the change (`max 1, rms
+0.499` and so on), and no verdict anywhere in the corpus moved.
+
+| | before | after |
+|---|---|---|
+| `v_2020` | 2.61x | **2.14x** |
+| `v_p3` (control) | 2.17x | 2.17x |
+
+Which lands `v_2020` on top of `v_p3`, as it should be -- the transfer
+function was the whole gap.
+
+Only the 709 curve is switched. The gamma, DCI and PQ paths still call
+`powf`: nothing in the corpus exercises them, so the change could not have
+been measured or verified there, and an unverifiable change to numerics is
+not worth making. Corpus **1.72x -> 1.70x**; scalar and SSE2 builds diffed
+bit-identical, ASan clean, 115 reproducers clean.
+
 ### Upsampling: across x, not across the taps
 `v_rs2` at 3.82x and `v_rs4` at 3.23x were the worst remaining ratios, and
 `jxl_upsample_plane` was 36% of a resampled file's decode -- still 35.8%

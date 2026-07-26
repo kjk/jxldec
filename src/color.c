@@ -133,9 +133,56 @@ static float tf_srgb(float s) {
     return bits_to_float(float_to_bits(out) | sign);
 }
 
+/* pow(x, 0.45) for the BT.709 curve, as exp2(0.45 * log2(x)).
+ *
+ * The real powf was 23.6% of a Rec.2020 file's decode -- the single hottest
+ * thing in it -- and it is precision nobody asked for: libjxl's own encode
+ * path never calls powf here either, it evaluates the same curve with these
+ * two rational polynomials (base/fast_math-inl.h, FastLog2f and FastPow2f,
+ * combined error ~3e-5 relative). Against an 8-bit output step of 1/255 that
+ * is four orders of magnitude spare, and since it is what libjxl does, using
+ * it moves this decoder's output *towards* the reference rather than away.
+ *
+ * Only the 709 curve is switched over. The gamma, DCI and PQ paths below
+ * still call powf: no corpus file exercises them, so the change could not be
+ * measured or verified there.
+ *
+ * Undefined for x <= 0, as libjxl's is; both callers below test the
+ * threshold first, and the vector one selects the lane afterwards. */
+static float fast_log2f(float x) {
+    const float p0 = -1.8503833400518310E-06f, p1 = 1.4287160470083755E+00f;
+    const float p2 = 7.4245873327820566E-01f;
+    const float q0 = 9.9032814277590719E-01f, q1 = 1.0096718572241148E+00f;
+    const float q2 = 1.7409343003366853E-01f;
+    uint32_t xb = float_to_bits(x);
+    /* Range-reduce about 2/3 so the mantissa lands in [-1/3, 1/3]. */
+    int32_t es = (int32_t)(xb - 0x3f2aaaabu) >> 23;
+    float m = bits_to_float(xb - ((uint32_t)es << 23));
+    float t = m - 1.0f;
+    float yp = p2 * t + p1;
+    float yq = q2 * t + q1;
+    yp = yp * t + p0;
+    yq = yq * t + q0;
+    return yp / yq + (float)es;
+}
+
+static float fast_pow2f(float x) {
+    float fl = floorf(x);
+    float ex = bits_to_float((uint32_t)((int32_t)fl + 127) << 23);
+    float frac = x - fl;
+    float num = frac + 1.01749063e+01f;
+    float den = frac * 2.10242958e-01f - 2.22328856e-02f;
+    num = num * frac + 4.88687798e+01f;
+    den = den * frac - 1.94414990e+01f;
+    num = num * frac + 9.85506591e+01f;
+    den = den * frac + 9.85506633e+01f;
+    return num * ex / den;
+}
+
 static float tf_bt709(float v) {
     if (v <= 0.018053968510807f) return 4.5f * v;
-    return 1.09929682680944f * powf(v, 0.45f) - 0.09929682680944f;
+    return 1.09929682680944f * fast_pow2f(fast_log2f(v) * 0.45f) -
+           0.09929682680944f;
 }
 
 static float tf_pq(float v) {
@@ -213,6 +260,66 @@ static void tf_srgb_x4(float *v, size_t n, size_t *pos) {
     }
     *pos = i;
 }
+
+/* Four lanes of fast_log2f / fast_pow2f, operation for operation, so the
+   vector and scalar builds agree bit for bit. SSE2 has no floor, but the
+   exponent here stays well inside int32 range, so truncate-and-correct is
+   exact. */
+static __m128 fast_log2f_x4(__m128 x) {
+    const __m128 one = _mm_set1_ps(1.0f);
+    __m128i xb = _mm_castps_si128(x);
+    __m128i es = _mm_srai_epi32(_mm_sub_epi32(xb, _mm_set1_epi32(0x3f2aaaab)),
+                                23);
+    __m128 m = _mm_castsi128_ps(_mm_sub_epi32(xb, _mm_slli_epi32(es, 23)));
+    __m128 t = _mm_sub_ps(m, one);
+    __m128 yp = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(7.4245873327820566E-01f), t),
+                           _mm_set1_ps(1.4287160470083755E+00f));
+    __m128 yq = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(1.7409343003366853E-01f), t),
+                           _mm_set1_ps(1.0096718572241148E+00f));
+    yp = _mm_add_ps(_mm_mul_ps(yp, t), _mm_set1_ps(-1.8503833400518310E-06f));
+    yq = _mm_add_ps(_mm_mul_ps(yq, t), _mm_set1_ps(9.9032814277590719E-01f));
+    return _mm_add_ps(_mm_div_ps(yp, yq), _mm_cvtepi32_ps(es));
+}
+
+static __m128 fast_pow2f_x4(__m128 x) {
+    const __m128 one = _mm_set1_ps(1.0f);
+    __m128 tf = _mm_cvtepi32_ps(_mm_cvttps_epi32(x));
+    __m128 fl = _mm_sub_ps(tf, _mm_and_ps(_mm_cmplt_ps(x, tf), one));
+    __m128 ex = _mm_castsi128_ps(_mm_slli_epi32(
+        _mm_add_epi32(_mm_cvttps_epi32(fl), _mm_set1_epi32(127)), 23));
+    __m128 frac = _mm_sub_ps(x, fl);
+    __m128 num = _mm_add_ps(frac, _mm_set1_ps(1.01749063e+01f));
+    __m128 den = _mm_sub_ps(_mm_mul_ps(frac, _mm_set1_ps(2.10242958e-01f)),
+                            _mm_set1_ps(2.22328856e-02f));
+    num = _mm_add_ps(_mm_mul_ps(num, frac), _mm_set1_ps(4.88687798e+01f));
+    den = _mm_sub_ps(_mm_mul_ps(den, frac), _mm_set1_ps(1.94414990e+01f));
+    num = _mm_add_ps(_mm_mul_ps(num, frac), _mm_set1_ps(9.85506591e+01f));
+    den = _mm_add_ps(_mm_mul_ps(den, frac), _mm_set1_ps(9.85506633e+01f));
+    return _mm_div_ps(_mm_mul_ps(num, ex), den);
+}
+
+/* The lanes at or below the threshold take the linear leg, so the pow is
+   computed for them too and thrown away -- it is a bitwise select, so a
+   garbage or NaN lane cannot leak into the result. */
+static void tf_bt709_x4(float *v, size_t n, size_t *pos) {
+    const __m128 thresh = _mm_set1_ps(0.018053968510807f);
+    const __m128 mul_low = _mm_set1_ps(4.5f);
+    const __m128 mul_hi = _mm_set1_ps(1.09929682680944f);
+    const __m128 sub = _mm_set1_ps(0.09929682680944f);
+    const __m128 e = _mm_set1_ps(0.45f);
+    size_t i = *pos;
+    for (; i + 4 <= n; i += 4) {
+        __m128 x = _mm_loadu_ps(v + i);
+        __m128 low = _mm_mul_ps(mul_low, x);
+        __m128 hi = _mm_sub_ps(
+            _mm_mul_ps(mul_hi, fast_pow2f_x4(_mm_mul_ps(fast_log2f_x4(x), e))),
+            sub);
+        __m128 m = _mm_cmple_ps(x, thresh);
+        _mm_storeu_ps(v + i, _mm_or_ps(_mm_and_ps(m, low),
+                                       _mm_andnot_ps(m, hi)));
+    }
+    *pos = i;
+}
 #endif
 
 void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
@@ -232,7 +339,11 @@ void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
         case JXL_TF_LINEAR:
             break;
         case JXL_TF_709:
-            for (i = 0; i < n; i++) v[i] = tf_bt709(v[i]);
+            i = 0;
+#ifdef JXL_COLOR_SSE2
+            tf_bt709_x4(v, n, &i);
+#endif
+            for (; i < n; i++) v[i] = tf_bt709(v[i]);
             break;
         case JXL_TF_PQ:
             for (i = 0; i < n; i++) v[i] = tf_pq(v[i]);
