@@ -171,6 +171,55 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### The vertical squeeze was walking the image a column at a time
+Two ideas came out of profiling `m_resp`, the biggest remaining loss. Only
+the second one was right.
+
+**The specialisation guard, which was wrong.** `m_resp`'s streams carry 20
+channels of 32x64, so 2048 samples against a ~389-entry tree rebuild -- that
+looked like the per-channel folding paying for itself many times over on tiny
+channels, and the guard (`w*h >= nflat`) looked far too loose. Sweeping the
+multiplier says otherwise:
+
+| threshold | `lm_d1` | `m_resp` | `m_e3` |
+|---|---|---|---|
+| `x1` (current) | **1.480x** | 1.416x | 1.332x |
+| `x8` | 1.545x | 1.406x | 1.324x |
+| `x64` | 2.199x | 1.440x | 1.314x |
+| never fold | 2.879x | 1.597x | 1.316x |
+
+Raising it only makes things worse, and `lm_d1` collapses -- folding pays even
+on a 2048-sample channel, because it shortens *every* walk and the rebuild is
+one pass. The guard is already in the right place.
+
+**The vertical squeeze, which was.** `squeeze_inverse_v` was 4.4% of `m_resp`
+against libjxl's ~1.5%, and the reason is memory, not arithmetic. It walked
+one column at a time: for a 2268-wide channel that is a strided gather
+touching a separate cache line for all 1512 rows, then the next column comes
+back for the same lines once they have been evicted, and the stores go back
+out the same way.
+
+The lifting step down a column is genuinely serial -- `top` feeds the next
+row's tendency -- so this cannot be vectorised across y. But neighbouring
+columns are completely independent, so a strip of 16 of them runs in lockstep:
+64 bytes, so every cache line fetched is used in full, and the copy in, the
+tendency pass and the stores back all run sequentially. `squeeze_tendency`
+itself is left alone; it has int64 arithmetic and a divide by 12 that SSE2
+would not enjoy, and it did not need touching.
+
+| preset | per-column p1 / p2 | strip-16 p1 / p2 |
+|---|---|---|
+| `lm_d1` | 1.483x / 1.451x (1877/1707ms) | **1.318x / 1.335x (1568/1608ms)** |
+| `m_resp` | 1.411x / 1.405x (2806/2635ms) | **1.346x / 1.333x (2503/2522ms)** |
+| `m_e3` | 1.332x / 1.320x | 1.331x / 1.331x (no squeeze) |
+
+The horizontal squeeze needs no equivalent -- it already runs along rows, so
+its accesses were contiguous to begin with.
+
+The arithmetic is untouched, so output is byte-identical to the previous
+commit across all 1242 corpus files. Corpus **1.48x -> 1.46x**. ASan clean,
+115 reproducers clean, amalgamation compiles.
+
 ### Upsampling eight wide, and one thing that looked obvious and was not
 `v_rs2` and `v_rs4` were the worst ratios left, and a `-vs` profile of
 `P3-sRGB-red.v_rs2` made the comparison unusually direct, because both

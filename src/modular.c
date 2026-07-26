@@ -1256,38 +1256,67 @@ static int squeeze_inverse_v(jxl_ctx *ctx, jxl_mchan *merged) {
     int32_t *scratch;
     uint32_t x, y;
 
+    /* A strip of columns at a time, not one. The lifting step down a column
+       is serial -- `top` feeds the next row's tendency -- so this cannot be
+       vectorised across y, but neighbouring columns are completely
+       independent, and running JXL_SQ_STRIP of them in lockstep is what makes
+       the memory access sane. One column at a time walked the image with a
+       stride, touching a separate cache line for every row and then coming
+       back for the next column once those lines had been evicted; a strip of
+       16 is 64 bytes, so every line fetched is used in full, and both the
+       copy in and the stores back run sequentially.
+
+       The copy is still needed: the outputs for row 2y overwrite inputs that
+       later rows still have to read. The arithmetic is untouched. */
+#define JXL_SQ_STRIP 16
     if (width == 0 || height == 0) return 0;
-    scratch = (int32_t *)jxl_malloc(ctx, (size_t)height * sizeof(int32_t));
+    scratch = (int32_t *)jxl_malloc(
+        ctx, (size_t)height * JXL_SQ_STRIP * sizeof(int32_t));
     if (!scratch) return -1;
 
-    for (x = 0; x < width; x++) {
-        const int32_t *avg_col, *residu_col;
-        int32_t avg, top;
+    for (x = 0; x < width; x += JXL_SQ_STRIP) {
         uint32_t nresidu = height / 2;
+        uint32_t sw = width - x < JXL_SQ_STRIP ? width - x : JXL_SQ_STRIP;
+        int32_t avg[JXL_SQ_STRIP], top[JXL_SQ_STRIP];
+        uint32_t dx;
+
         for (y = 0; y < height; y++) {
-            scratch[y] = merged->data[(size_t)y * merged->stride + x];
+            memcpy(scratch + (size_t)y * sw,
+                   merged->data + (size_t)y * merged->stride + x,
+                   (size_t)sw * sizeof(int32_t));
         }
-        avg_col = scratch;
-        residu_col = scratch + avg_height;
-        avg = avg_col[0];
-        top = avg;
+        for (dx = 0; dx < sw; dx++) {
+            avg[dx] = scratch[dx];
+            top[dx] = avg[dx];
+        }
         for (y = 0; y < nresidu; y++) {
-            int32_t residu = residu_col[y];
-            int32_t next_avg = (y + 1 < avg_height) ? avg_col[y + 1] : avg;
-            int32_t diff = (int32_t)((uint32_t)residu +
-                                     (uint32_t)squeeze_tendency(top, avg, next_avg));
-            int32_t first = (int32_t)((uint32_t)avg + (uint32_t)(diff / 2));
-            int32_t second = (int32_t)((uint32_t)first - (uint32_t)diff);
-            merged->data[(size_t)(2 * y) * merged->stride + x] = first;
-            merged->data[(size_t)(2 * y + 1) * merged->stride + x] = second;
-            avg = next_avg;
-            top = second;
+            const int32_t *residu_row = scratch + (size_t)(avg_height + y) * sw;
+            const int32_t *next_row = (y + 1 < avg_height)
+                                          ? scratch + (size_t)(y + 1) * sw
+                                          : NULL;
+            int32_t *out0 = merged->data + (size_t)(2 * y) * merged->stride + x;
+            int32_t *out1 = out0 + merged->stride;
+            for (dx = 0; dx < sw; dx++) {
+                int32_t next_avg = next_row ? next_row[dx] : avg[dx];
+                int32_t diff = (int32_t)((uint32_t)residu_row[dx] +
+                        (uint32_t)squeeze_tendency(top[dx], avg[dx], next_avg));
+                int32_t first = (int32_t)((uint32_t)avg[dx] +
+                                          (uint32_t)(diff / 2));
+                int32_t second = (int32_t)((uint32_t)first - (uint32_t)diff);
+                out0[dx] = first;
+                out1[dx] = second;
+                avg[dx] = next_avg;
+                top[dx] = second;
+            }
         }
         if (height & 1) {
-            merged->data[(size_t)(height - 1) * merged->stride + x] =
-                avg_col[avg_height - 1];
+            const int32_t *last = scratch + (size_t)(avg_height - 1) * sw;
+            int32_t *out = merged->data +
+                           (size_t)(height - 1) * merged->stride + x;
+            for (dx = 0; dx < sw; dx++) out[dx] = last[dx];
         }
     }
+#undef JXL_SQ_STRIP
     jxl_free(ctx, scratch);
     return 0;
 }
