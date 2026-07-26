@@ -171,6 +171,46 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Caching the WP lookup table on the tree
+The WP-error table is 16384 tree walks to build, and it was built **per
+channel**. That is fine for one big channel and bad for the way frames are
+actually laid out: `flower_alpha.m_e3` decodes 54 group streams of 4 channels
+each, so it built 216 copies of the same table. `flower_alpha.v_e3` builds 54
+(one alpha channel per group, each 256x256 -- exactly the size threshold, so
+the table cost a quarter of the samples it served).
+
+The table is a function of the WP error alone whenever no real node tests the
+channel or stream index, which is exactly what `ma_tests_const_props` already
+reports for the folding pass. Both files come back `fold=0`, so one table
+serves every channel of every stream, and it now lives on the `jxl_ma_config`
+and is built once.
+
+That condition is doing double duty and both halves matter. It is what makes
+the table channel-independent, and it is also what guarantees `cma == ma`, so
+the leaf pointers the table stores point into `ma->flat` rather than into a
+per-channel specialised tree that gets freed at the end of the channel.
+Caching a table of dangling pointers is the obvious way to get this wrong.
+
+| preset | rebuild p1 / p2 | cached p1 / p2 |
+|---|---|---|
+| `m_e3` (ours, ms) | 2858.6 / 2864.0 | **2745.3 / 2738.2** |
+| `v_d1` (ours, ms) | 919.5 / 942.8 | 910.9 / 956.1 |
+
+`m_e3` is a clean 4.2% with libjxl's column flat at 2070-2122ms. The VarDCT
+presets do not move, and the reason is visible in the same debug line that
+gave `fold`: `m_e3` carries four channels per stream against `v_e3`'s one, so
+it had four times the redundant builds to remove. Predicting this would help
+the alpha-heavy VarDCT files was wrong -- 54 rebuilds saved is real work, but
+it is small next to the entropy decode those files are actually spending
+their time in.
+
+Output byte-identical to the previous commit across all 1242 corpus files.
+Corpus stays at **1.49x** -- the gain is concentrated in one preset and does
+not move the total. ASan clean, 115 reproducers clean.
+
+`JXL_DEBUG_TRACK` now also prints `fold` and the first channel's dimensions,
+which is what made the four-channels-versus-one explanation visible.
+
 ### Restructuring the fixed-leaf loop the way libjxl does
 Reading `encoding.cc` again for the shape rather than the tracks: libjxl does
 not just specialise on the *tree*, it specialises on the **predictor**, and

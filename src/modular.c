@@ -432,6 +432,8 @@ void jxl_ma_config_free(jxl_ctx *ctx, jxl_ma_config *ma) {
     ma->raw = NULL;
     jxl_free(ctx, ma->leaves);
     ma->leaves = NULL;
+    jxl_free(ctx, (void *)ma->wp_lut);
+    ma->wp_lut = NULL;
     ma->nraw = 0;
     ma->root = 0;
     jxl_dec_free(&ma->dec);
@@ -1820,6 +1822,8 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
     uint32_t props_mask;
     int wp_lut_usable = 0;
     int can_fold;
+    int wp_lut_ready = 0;   /* table contents already valid                 */
+    int wp_lut_local = 0;   /* we allocated it and still own it             */
     const jxl_ma_leaf **wp_lut = NULL;
     jxl_ma_config spec;
     int spec_ok = 0;
@@ -1846,10 +1850,29 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
        function of one clamped value, so it can be tabulated per channel. */
     wp_lut_usable = need_sc && (props_mask & ~(1u | 2u | 0x8000u)) == 0 &&
                     ma_wp_lut_ok(ma);
+    can_fold = ma->raw && ma_tests_const_props(ma);
     if (wp_lut_usable) {
-        wp_lut = (const jxl_ma_leaf **)jxl_calloc(ctx, JXL_WP_LUT_N,
-                                                  sizeof(*wp_lut));
-        if (!wp_lut) goto done;
+        /* When no real node tests the channel or the stream index -- which is
+           exactly what can_fold reports -- the table is a function of the WP
+           error alone, so it is the same table for every channel of every
+           stream. Building it costs JXL_WP_LUT_N walks, and a VarDCT frame
+           with an alpha channel decodes that channel once per group: 56
+           streams on flower_alpha.v_e3, which was 56 rebuilds of an identical
+           table. Cache it on the tree instead.
+
+           Only safe in that case, and for a second reason as well: with
+           can_fold set, each channel walks its own specialised tree whose
+           storage is freed at the end of the channel, so the leaf pointers a
+           cached table held would dangle. */
+        if (!can_fold && ma->wp_lut) {
+            wp_lut = ma->wp_lut;
+            wp_lut_ready = 1;
+        } else {
+            wp_lut = (const jxl_ma_leaf **)jxl_calloc(ctx, JXL_WP_LUT_N,
+                                                      sizeof(*wp_lut));
+            if (!wp_lut) goto done;
+            wp_lut_local = 1;
+        }
     }
     /* Which specialisation a stream lands on, and how big its tree is. The
        two tracks below only pay when they trigger, and whether they trigger
@@ -1857,13 +1880,13 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
        preset turns out slow this is the first thing worth knowing. Sibling
        of JXL_DEBUG_TREE above. */
     if (getenv("JXL_DEBUG_TRACK")) {
-        fprintf(stderr, "stream %u: mask=0x%x need_sc=%d fixed=%d wplut=%d "
-                "nflat=%u nchan=%u\n", (unsigned)stream_idx,
+        fprintf(stderr, "stream %u: fold=%d mask=0x%x need_sc=%d fixed=%d wplut=%d "
+                "nflat=%u nchan=%u w=%u h=%u\n", (unsigned)stream_idx, can_fold,
                 (unsigned)props_mask, need_sc,
                 (!need_sc && (props_mask & ~3u) == 0), wp_lut_usable,
-                (unsigned)ma->nflat, (unsigned)cl->n);
+                (unsigned)ma->nflat, (unsigned)cl->n,
+                (unsigned)cl->chans[0].w, (unsigned)cl->chans[0].h);
     }
-    can_fold = ma->raw && ma_tests_const_props(ma);
     max_prev = ma_max_prev_channels(ma);
     if (max_prev) {
         prev = (const jxl_mchan **)jxl_calloc(ctx, cl->n, sizeof(jxl_mchan *));
@@ -1932,9 +1955,18 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
             memset(&pr, 0, sizeof(pr));
             pr.cache[0] = (int32_t)ci;
             pr.cache[1] = (int32_t)stream_idx;
-            for (v = 0; v < JXL_WP_LUT_N; v++) {
-                pr.cache[15] = JXL_WP_LUT_LO + (int32_t)v;
-                wp_lut[v] = ma_get_leaf(cma, &ps, &pr);
+            if (!wp_lut_ready) {
+                for (v = 0; v < JXL_WP_LUT_N; v++) {
+                    pr.cache[15] = JXL_WP_LUT_LO + (int32_t)v;
+                    wp_lut[v] = ma_get_leaf(cma, &ps, &pr);
+                }
+                if (!can_fold) {
+                    /* Channel-independent, and built from ma->flat, which
+                       outlives this call -- hand it to the tree to keep. */
+                    ma->wp_lut = wp_lut;
+                    wp_lut_local = 0;
+                    wp_lut_ready = 1;
+                }
             }
             pr.has_sc = 1;
             for (y = 0; y < ch->h; y++) {
@@ -2126,7 +2158,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
 
 done:
     jxl_free(ctx, spec.flat);
-    jxl_free(ctx, wp_lut);
+    if (wp_lut_local) jxl_free(ctx, wp_lut);
     pred_state_free(ctx, &ps);
     jxl_free(ctx, prev);
     return rc;
