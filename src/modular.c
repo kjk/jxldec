@@ -1628,6 +1628,32 @@ static const jxl_ma_leaf *ma_get_leaf(const jxl_ma_config *ma,
 
 /* True when the tree can ask for the self-correcting predictor or property
    15, the only cases where running it is needed. */
+/* Bitmask of the properties any decision node in the tree actually tests.
+   libjxl specialises its inner loop on exactly this (encoding.cc's
+   is_wp_only / is_gradient_only tracks); the cheapest case to exploit is a
+   tree that only tests properties 0 and 1, channel index and stream index,
+   which are constant for a whole channel -- so the leaf is too, and both the
+   property fill and the tree walk drop out of the per-sample loop.
+   Properties >= 32 cannot be represented, and set every bit so the caller
+   takes the general path. */
+static uint32_t ma_props_mask(const jxl_ma_config *ma) {
+    uint32_t i, mask = 0;
+    for (i = 0; i < ma->nflat; i++) {
+        const jxl_ma_flat *f = &ma->flat[i];
+        uint32_t p[3];
+        int k;
+        if (f->property < 0) continue;
+        p[0] = (uint32_t)f->property;
+        p[1] = f->u.dec.prop1;
+        p[2] = f->u.dec.prop2;
+        for (k = 0; k < 3; k++) {
+            if (p[k] >= 32) return 0xffffffffu;
+            mask |= 1u << p[k];
+        }
+    }
+    return mask;
+}
+
 static int ma_needs_self_correcting(const jxl_ma_config *ma) {
     uint32_t i;
     for (i = 0; i < ma->nflat; i++) {
@@ -1676,6 +1702,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
     const jxl_mchan **prev = NULL;
     uint32_t max_prev;
     int need_sc;
+    uint32_t props_mask;
     int rc = -1;
 
     if (!ma || !ma->valid) {
@@ -1692,6 +1719,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
 
     memset(&ps, 0, sizeof(ps));
     need_sc = ma_needs_self_correcting(ma);
+    props_mask = ma_props_mask(ma);
     max_prev = ma_max_prev_channels(ma);
     if (max_prev) {
         prev = (const jxl_mchan **)jxl_calloc(ctx, cl->n, sizeof(jxl_mchan *));
@@ -1721,6 +1749,50 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
         if (pred_state_reset(ctx, &ps, ch->w, need_sc ? &m->header.wp : NULL,
                              prev, nprev) != 0)
             goto done;
+
+        /* Fast track: the tree only tests channel and stream index, both
+           fixed for this channel, so the leaf is fixed too -- resolve it once
+           here instead of walking the tree a million times. predict_sample
+           only reads the property struct for the self-correcting predictor,
+           so with no weighted predictor in play the whole per-sample property
+           fill goes as well. libjxl specialises the same way. */
+        {
+            jxl_props pr0;
+            const jxl_ma_leaf *fixed = NULL;
+            if (!need_sc && (props_mask & ~3u) == 0) {
+                memset(&pr0, 0, sizeof(pr0));
+                pr0.cache[0] = (int32_t)ci;
+                pr0.cache[1] = (int32_t)stream_idx;
+                fixed = ma_get_leaf(ma, &ps, &pr0);
+                if (fixed->predictor == JXL_PRED_SELF_CORRECTING) fixed = NULL;
+            }
+            if (fixed) {
+                uint32_t cluster = fixed->cluster;
+                uint32_t mult = fixed->multiplier;
+                int32_t off = fixed->offset;
+                uint8_t predictor = fixed->predictor;
+                for (y = 0; y < ch->h; y++) {
+                    int32_t *row = ch->data + (size_t)y * ch->stride;
+                    for (x = 0; x < ch->w; x++) {
+                        uint32_t token = jxl_dec_read_clustered(dec, br, cluster,
+                                                                dist_multiplier);
+                        int32_t diff = jxl_unpack_signed(token);
+                        int32_t value;
+                        diff = (int32_t)((uint32_t)diff * mult + (uint32_t)off);
+                        value = (int32_t)((uint32_t)diff +
+                                (uint32_t)predict_sample(&ps, &pr0, predictor));
+                        row[x] = value;
+                        pred_record(&ps, &pr0, value);
+                    }
+                    if (br->err || dec->err) {
+                        JXL_ERR(ctx, "modular: truncated stream %u",
+                                (unsigned)stream_idx);
+                        goto done;
+                    }
+                }
+                continue;
+            }
+        }
 
         for (y = 0; y < ch->h; y++) {
             int32_t *row = ch->data + (size_t)y * ch->stride;
