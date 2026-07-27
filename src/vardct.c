@@ -901,6 +901,8 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
     uint32_t hfp_bits, hfp;
     uint32_t *nz_row[3];
     uint32_t nz_len[3];
+    uint32_t order0_offsets[3][64];
+    uint8_t order0_ready[3] = {0, 0, 0};
     uint32_t x, y;
     int c, rc = -1;
 
@@ -980,6 +982,7 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                 uint32_t dx8;
                 uint32_t is_prev_nonzero;
                 const uint16_t *ord;
+                const uint32_t *coeff_offsets = NULL;
                 int32_t *coeff_out = NULL;
                 size_t coeff_stride = 0;
                 uint32_t coeff_ctx_base;
@@ -1010,8 +1013,13 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                          (predicted >= 8 ? 4 + predicted / 2 : predicted) *
                              bc->num_block_clusters;
 
-                non_zeros = jxl_dec_read_clustered(
-                    dist, br, dist->clusters[cluster_base + nz_ctx], 0);
+                if (dist->lz77_enabled) {
+                    non_zeros = jxl_dec_read_clustered(
+                        dist, br, dist->clusters[cluster_base + nz_ctx], 0);
+                } else {
+                    non_zeros = jxl_dec_read_clustered_no_lz77(
+                        dist, br, dist->clusters[cluster_base + nz_ctx]);
+                }
                 if (non_zeros > (63u << num_blocks_log)) {
                     JXL_ERR(ctx, "vardct: non_zeros too large");
                     goto done;
@@ -1031,10 +1039,86 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                     coeff_stride = stride[cc];
                     coeff_out = (int32_t *)out[cc] +
                         (size_t)(sy * 8) * coeff_stride + sx * 8;
+                    if (num_blocks == 1 && order_id == 0) {
+                        if (!order0_ready[cc]) {
+                            uint32_t oi;
+                            for (oi = 0; oi < 64; oi++) {
+                                uint32_t oxy, odx, ody;
+                                memcpy(&oxy, ord + oi * 2, sizeof(oxy));
+                                odx = oxy & 0xffffu;
+                                ody = oxy >> 16;
+                                if (need_transpose) {
+                                    uint32_t t = odx; odx = ody; ody = t;
+                                }
+                                order0_offsets[cc][oi] =
+                                    (uint32_t)(ody * coeff_stride + odx);
+                            }
+                            order0_ready[cc] = 1;
+                        }
+                        coeff_offsets = order0_offsets[cc];
+                    }
                 }
 
                 coeff_ctx_base = block_ctx * 458 + 37 * bc->num_block_clusters;
-                if (num_blocks == 1) {
+                if (coeff_offsets && p->coeff_shift == 0 &&
+                    !dist->lz77_enabled) {
+                    for (k = 1; k < 64; k++) {
+                        uint32_t nzi = non_zeros - 1;
+                        uint32_t fi = k - 1;
+                        uint32_t coeff_ctx =
+                            (coeff_num_nonzero_context[nzi] +
+                             coeff_freq_context[fi]) * 2 + is_prev_nonzero;
+                        uint32_t ucoeff;
+                        int32_t coeff;
+
+                        if (coeff_ctx >= 458) {
+                            JXL_ERR(ctx, "vardct: too many zeros in varblock");
+                            goto done;
+                        }
+                        ucoeff = jxl_dec_read_clustered_no_lz77(
+                            dist, br,
+                            dist->clusters[cluster_base + coeff_ctx_base +
+                                           coeff_ctx]);
+                        if (ucoeff == 0) {
+                            is_prev_nonzero = 0;
+                            continue;
+                        }
+                        coeff = jxl_unpack_signed(ucoeff);
+                        coeff_out[coeff_offsets[k]] += coeff;
+                        is_prev_nonzero = 1;
+                        non_zeros--;
+                        if (non_zeros == 0) break;
+                    }
+                } else if (coeff_offsets) {
+                    for (k = 1; k < 64; k++) {
+                        uint32_t nzi = non_zeros - 1;
+                        uint32_t fi = k - 1;
+                        uint32_t coeff_ctx =
+                            (coeff_num_nonzero_context[nzi] +
+                             coeff_freq_context[fi]) * 2 + is_prev_nonzero;
+                        uint32_t ucoeff;
+                        int32_t coeff;
+
+                        if (coeff_ctx >= 458) {
+                            JXL_ERR(ctx, "vardct: too many zeros in varblock");
+                            goto done;
+                        }
+                        ucoeff = jxl_dec_read_clustered(
+                            dist, br,
+                            dist->clusters[cluster_base + coeff_ctx_base +
+                                           coeff_ctx],
+                            0);
+                        if (ucoeff == 0) {
+                            is_prev_nonzero = 0;
+                            continue;
+                        }
+                        coeff = jxl_unpack_signed(ucoeff) << p->coeff_shift;
+                        coeff_out[coeff_offsets[k]] += coeff;
+                        is_prev_nonzero = 1;
+                        non_zeros--;
+                        if (non_zeros == 0) break;
+                    }
+                } else if (num_blocks == 1) {
                     /* The overwhelmingly common 8x8 case. libjxl selects
                        this shape at compile time; keeping it separate here
                        likewise removes two variable shifts and their bounds
@@ -1795,13 +1879,111 @@ void jxl_fill_varblock_lf(float *coeff, size_t stride, int tr,
 
    The plane holds `w` x `h` valid samples in the top-left of a `stride`-wide
    buffer that must already be large enough for the doubled result. */
+#ifdef JXL_VARDCT_SSE2
+/* Expand complete interior groups right-to-left. All three source vectors
+   are loaded before either interleaved output vector is stored, so the
+   in-place traversal has the same dependency shape as the scalar loop. */
+JXL_TARGET_AVX2
+static uint32_t chroma_upsample_h_row_x8(float *row, uint32_t end) {
+    const __m256 three_fourths = _mm256_set1_ps(0.75f);
+    const __m256 one_fourth = _mm256_set1_ps(0.25f);
+    while (end >= 9) {
+        uint32_t x = end - 8;
+        __m256 cur = _mm256_mul_ps(_mm256_loadu_ps(row + x), three_fourths);
+        __m256 lo = _mm256_add_ps(
+            cur, _mm256_mul_ps(_mm256_loadu_ps(row + x - 1), one_fourth));
+        __m256 hi = _mm256_add_ps(
+            cur, _mm256_mul_ps(_mm256_loadu_ps(row + x + 1), one_fourth));
+        __m256 il = _mm256_unpacklo_ps(lo, hi);
+        __m256 ih = _mm256_unpackhi_ps(lo, hi);
+        _mm256_storeu_ps(row + 2 * (size_t)x,
+                         _mm256_permute2f128_ps(il, ih, 0x20));
+        _mm256_storeu_ps(row + 2 * (size_t)x + 8,
+                         _mm256_permute2f128_ps(il, ih, 0x31));
+        end = x;
+    }
+    _mm256_zeroupper();
+    return end;
+}
+
+static uint32_t chroma_upsample_h_row_x4(float *row, uint32_t end) {
+    const __m128 three_fourths = _mm_set1_ps(0.75f);
+    const __m128 one_fourth = _mm_set1_ps(0.25f);
+    while (end >= 5) {
+        uint32_t x = end - 4;
+        __m128 cur = _mm_mul_ps(_mm_loadu_ps(row + x), three_fourths);
+        __m128 lo = _mm_add_ps(
+            cur, _mm_mul_ps(_mm_loadu_ps(row + x - 1), one_fourth));
+        __m128 hi = _mm_add_ps(
+            cur, _mm_mul_ps(_mm_loadu_ps(row + x + 1), one_fourth));
+        _mm_storeu_ps(row + 2 * (size_t)x, _mm_unpacklo_ps(lo, hi));
+        _mm_storeu_ps(row + 2 * (size_t)x + 4, _mm_unpackhi_ps(lo, hi));
+        end = x;
+    }
+    return end;
+}
+
+JXL_TARGET_AVX2
+static uint32_t chroma_upsample_v_row_x8(
+    const float *top, const float *mid, const float *bot,
+    float *out0, float *out1, uint32_t w, uint32_t x, int write_out1) {
+    const __m256 three_fourths = _mm256_set1_ps(0.75f);
+    const __m256 one_fourth = _mm256_set1_ps(0.25f);
+    for (; x + 8 <= w; x += 8) {
+        __m256 m = _mm256_mul_ps(_mm256_loadu_ps(mid + x), three_fourths);
+        __m256 lo = _mm256_add_ps(
+            m, _mm256_mul_ps(_mm256_loadu_ps(top + x), one_fourth));
+        __m256 hi = _mm256_add_ps(
+            m, _mm256_mul_ps(_mm256_loadu_ps(bot + x), one_fourth));
+        _mm256_storeu_ps(out0 + x, lo);
+        if (write_out1) _mm256_storeu_ps(out1 + x, hi);
+    }
+    _mm256_zeroupper();
+    return x;
+}
+
+static uint32_t chroma_upsample_v_row_x4(
+    const float *top, const float *mid, const float *bot,
+    float *out0, float *out1, uint32_t w, uint32_t x, int write_out1) {
+    const __m128 three_fourths = _mm_set1_ps(0.75f);
+    const __m128 one_fourth = _mm_set1_ps(0.25f);
+    for (; x + 4 <= w; x += 4) {
+        __m128 m = _mm_mul_ps(_mm_loadu_ps(mid + x), three_fourths);
+        __m128 lo = _mm_add_ps(
+            m, _mm_mul_ps(_mm_loadu_ps(top + x), one_fourth));
+        __m128 hi = _mm_add_ps(
+            m, _mm_mul_ps(_mm_loadu_ps(bot + x), one_fourth));
+        _mm_storeu_ps(out0 + x, lo);
+        if (write_out1) _mm_storeu_ps(out1 + x, hi);
+    }
+    return x;
+}
+#endif
+
 static void chroma_upsample_h(float *p, uint32_t w, uint32_t h, size_t stride,
                               uint32_t out_w) {
-    uint32_t x, y;
+    uint32_t y;
+#ifdef JXL_VARDCT_SSE2
+    const int use_avx2 = jxl_has_avx2();
+#endif
     for (y = 0; y < h; y++) {
         float *row = p + (size_t)y * stride;
+        uint32_t end = w;
         /* Right to left, so the source samples are not overwritten first. */
-        for (x = w; x-- > 0;) {
+        if (end) {
+            uint32_t x = --end;
+            float cur = row[x] * 0.75f;
+            float prev = row[x ? x - 1 : 0];
+            float next = row[x + 1 < w ? x + 1 : w - 1];
+            if (2 * x + 1 < out_w) row[2 * x + 1] = cur + 0.25f * next;
+            row[2 * x] = cur + 0.25f * prev;
+        }
+#ifdef JXL_VARDCT_SSE2
+        if (use_avx2) end = chroma_upsample_h_row_x8(row, end);
+        end = chroma_upsample_h_row_x4(row, end);
+#endif
+        while (end) {
+            uint32_t x = --end;
             float cur = row[x] * 0.75f;
             float prev = row[x ? x - 1 : 0];
             float next = row[x + 1 < w ? x + 1 : w - 1];
@@ -1813,18 +1995,31 @@ static void chroma_upsample_h(float *p, uint32_t w, uint32_t h, size_t stride,
 
 static void chroma_upsample_v(float *p, uint32_t w, uint32_t h, size_t stride,
                               uint32_t out_h) {
-    uint32_t x, y;
+    uint32_t y;
+#ifdef JXL_VARDCT_SSE2
+    const int use_avx2 = jxl_has_avx2();
+#endif
     for (y = h; y-- > 0;) {
         const float *mid = p + (size_t)y * stride;
         const float *top = p + (size_t)(y ? y - 1 : 0) * stride;
         const float *bot = p + (size_t)(y + 1 < h ? y + 1 : h - 1) * stride;
         float *out0 = p + (size_t)(2 * y) * stride;
         float *out1 = p + (size_t)(2 * y + 1) * stride;
-        for (x = 0; x < w; x++) {
+        int write_out1 = 2 * y + 1 < out_h;
+        uint32_t x = 0;
+#ifdef JXL_VARDCT_SSE2
+        if (use_avx2) {
+            x = chroma_upsample_v_row_x8(top, mid, bot, out0, out1, w, x,
+                                         write_out1);
+        }
+        x = chroma_upsample_v_row_x4(top, mid, bot, out0, out1, w, x,
+                                     write_out1);
+#endif
+        for (; x < w; x++) {
             float m = mid[x] * 0.75f;
             float lo = m + 0.25f * top[x];
             float hi = m + 0.25f * bot[x];
-            if (2 * y + 1 < out_h) out1[x] = hi;
+            if (write_out1) out1[x] = hi;
             out0[x] = lo;
         }
     }

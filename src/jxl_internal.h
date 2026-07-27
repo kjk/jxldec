@@ -415,6 +415,9 @@ uint32_t jxl_dec_read_mult(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx,
    tree stores cluster indices directly in its leaves). */
 uint32_t jxl_dec_read_clustered(jxl_dec *dec, jxl_br *br, uint32_t cluster,
                                 uint32_t dist_multiplier);
+/* Literal-only entropy streams avoid the general LZ77 state machine. */
+uint32_t jxl_dec_read_clustered_no_lz77(jxl_dec *dec, jxl_br *br,
+                                        uint32_t cluster);
 /* Fast path for prefix-coded LZ77 streams whose distance histogram is the
    constant one. The caller keeps the last value and remaining run, avoiding
    the general 4 MB history window. */

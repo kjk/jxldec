@@ -1009,6 +1009,15 @@ uint32_t jxl_dec_read_clustered(jxl_dec *dec, jxl_br *br, uint32_t cluster,
     return r;
 }
 
+uint32_t jxl_dec_read_clustered_no_lz77(jxl_dec *dec, jxl_br *br,
+                                        uint32_t cluster) {
+    uint32_t token;
+    /* Callers take this from the parsed context map, whose entries are
+       validated against num_clusters when the distribution is built. */
+    token = dec_read_symbol(dec, br, cluster);
+    return read_uint(br, &dec->configs[cluster], token);
+}
+
 uint32_t jxl_dec_read_mult(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx,
                            uint32_t dist_multiplier) {
     if (ctx_idx >= dec->num_dist) { dec->err = 1; return 0; }

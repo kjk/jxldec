@@ -62,7 +62,8 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.16x libjxl** (1.21x before the small-error
+1245-file corpus we are **about 1.16x libjxl** (recent full sweeps range from
+1.15x to 1.17x with machine temperature; 1.21x before the small-error
 self-correcting-weight and max-error specializations below; 1.25x before the
 identity-WP and gradient-property specializations below; 1.37x before the folded-predictor
 specialization; 2.74x before the SIMD work below;
@@ -81,7 +82,13 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep, including the self-correcting predictor work below,
+The latest full sweep, including the chroma-upsample and HF coefficient work
+below, measured 21459.18ms against libjxl's 18409.24ms, **1.17x** overall.
+Both columns were 10-12% slower than a compact rerun of the immediately
+preceding checkpoint (19188.79ms against 16676.89ms, **1.151x**), so the
+alternating saved-executable comparisons below are the better measure of
+these small changes.
+The preceding full sweep, including the self-correcting predictor work below,
 measured 19319.66ms against libjxl's 16651.20ms, **1.16x** overall.
 The preceding full sweep, including the identity-WP loop, reduced property
 builder and branchless packed-tree walk below, measured 20855.35ms against
@@ -160,6 +167,33 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Vectorize JPEG chroma upsampling and specialize common HF reads
+A 220-run side-by-side profile of the 4:2:2 JPEG-transcode
+`flower.png.im_q85_422.jpeg.jxl` measured 40.24ms against libjxl's 31.51ms,
+1.28x. The horizontal chroma upsampler was the largest non-entropy target at
+2505 samples. Its in-place right-to-left expansion now processes eight
+samples with AVX2 or four with SSE2; vertical expansion uses matching
+eight-/four-wide kernels. The operation order of each output sample is
+unchanged. A post-change profile put horizontal upsampling at 1358 samples
+(-45.8%) and the target at 38.95ms against 31.63ms, 1.23x.
+
+The same profile put `jxl_write_hf_coeff` at 5530 self samples. The normal
+one-block DCT8 order now caches its 64 transposed linear offsets instead of
+unpacking coordinates and multiplying by the stride for every block.
+Literal-only, zero-shift coefficient streams also bypass the general LZ77
+state machine and the redundant coefficient shift. A later profile put the
+coefficient loop at 5158 samples (-6.7%). Alternating seven-file
+saved-executable comparisons measured 536.28ms with the offset cache against
+538.60ms before it, then 530.67ms with the literal-only path against 533.76ms
+without it.
+
+All selected JPEG subsampling and VarDCT oracle comparisons pass. Experiments
+that measured neutral or slower and were reverted: precomputing the XYB cube
+root/intensity terms, fusing XYB conversion with the sRGB transfer function,
+writing zero HF coefficients branchlessly, forcing the literal entropy
+helper inline, and streaming EPF passes in 16-row tiles. The last was
+pixel-identical but about 0.5% slower in an alternating seven-file A/B.
 
 ### Shorten self-correcting predictor dependencies
 `flower_alpha.m_e9` initially measured 1.12x in a 40-run side-by-side
