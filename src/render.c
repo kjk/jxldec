@@ -258,8 +258,10 @@ JXL_TARGET_AVX2
 static void write_transposed_rgba8_avx2(const jxl_out_planes *op,
                                         uint32_t orientation,
                                         uint32_t sw, uint32_t sh,
-                                        uint8_t *dst, int stride) {
+                                        uint8_t *dst, int stride, int bgr) {
     const uint32_t ow = sh, oh = sw;
+    const jxl_fplane *rp = bgr ? op->b : op->r;
+    const jxl_fplane *bp = bgr ? op->r : op->b;
     const __m256i opaque = _mm256_set1_epi32(255);
     const __m256i reverse = _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
     uint32_t by, bx;
@@ -278,12 +280,12 @@ static void write_transposed_rgba8_avx2(const jxl_out_planes *op,
                     for (i = 0; i < 8; i++) {
                         uint32_t sy = (orientation == 6 || orientation == 7)
                                           ? sh - 1 - ox - i : ox + i;
-                        const float *r = op->r->data +
-                                         (size_t)sy * op->r->stride + sx;
+                        const float *r = rp->data +
+                                         (size_t)sy * rp->stride + sx;
                         const float *g = op->g->data +
                                          (size_t)sy * op->g->stride + sx;
-                        const float *b = op->b->data +
-                                         (size_t)sy * op->b->stride + sx;
+                        const float *b = bp->data +
+                                         (size_t)sy * bp->stride + sx;
                         __m256i qr = quantize8_255(r);
                         __m256i qg = quantize8_255(g);
                         __m256i qb = quantize8_255(b);
@@ -323,8 +325,10 @@ static void write_transposed_rgba8_avx2(const jxl_out_planes *op,
 static void write_transposed_rgba8(const jxl_out_planes *op,
                                    uint32_t orientation,
                                    uint32_t sw, uint32_t sh,
-                                   uint8_t *dst, int stride) {
+                                   uint8_t *dst, int stride, int bgr) {
     const uint32_t ow = sh, oh = sw;
+    const jxl_fplane *rp = bgr ? op->b : op->r;
+    const jxl_fplane *bp = bgr ? op->r : op->b;
     uint32_t by, bx;
     const __m128i opaque = _mm_set1_epi32(255);
 
@@ -342,12 +346,12 @@ static void write_transposed_rgba8(const jxl_out_planes *op,
                     for (i = 0; i < 4; i++) {
                         uint32_t sy = (orientation == 6 || orientation == 7)
                                           ? sh - 1 - ox - i : ox + i;
-                        const float *r = op->r->data +
-                                         (size_t)sy * op->r->stride + sx;
+                        const float *r = rp->data +
+                                         (size_t)sy * rp->stride + sx;
                         const float *g = op->g->data +
                                          (size_t)sy * op->g->stride + sx;
-                        const float *b = op->b->data +
-                                         (size_t)sy * op->b->stride + sx;
+                        const float *b = bp->data +
+                                         (size_t)sy * bp->stride + sx;
                         __m128i qr = quantize4v(r, 255);
                         __m128i qg = quantize4v(g, 255);
                         __m128i qb = quantize4v(b, 255);
@@ -445,13 +449,14 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
     transposed = orientation >= 5;
 
 #ifdef JXL_RENDER_SSE2
-    if (direct && transposed && !wide && !gray && !bgr && ncomp == 4 &&
+    if (direct && transposed && !wide && !gray && ncomp == 4 &&
         (ow & 3u) == 0 && (oh & 3u) == 0) {
         if (use_avx2 && (ow & 7u) == 0 && (oh & 7u) == 0) {
-            write_transposed_rgba8_avx2(&op, orientation, sw, sh, dst, stride);
+            write_transposed_rgba8_avx2(&op, orientation, sw, sh, dst, stride,
+                                        bgr);
             return 0;
         }
-        write_transposed_rgba8(&op, orientation, sw, sh, dst, stride);
+        write_transposed_rgba8(&op, orientation, sw, sh, dst, stride, bgr);
         return 0;
     }
 #endif

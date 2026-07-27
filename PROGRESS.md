@@ -141,6 +141,37 @@ specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
 
+### Keep transposed BGRA32 in the tiled SIMD output path
+A fresh full BGRA sweep exposed four Rec.2020 orientation files as the
+largest substantial regressions: green, blue, color-ring and color-bars were
+2.02x, 1.92x, 1.90x and 1.88x respectively. The earlier BGRA row packer did
+not reach them because the specialized 8x8/4x4 transposed RGBA kernels still
+had a `!bgr` guard. A 220-run side-by-side profile of
+`R2020-sRGB-green.v_orient.jxl` measured ours at 31.32ms against libjxl's
+17.15ms, with 9957 self samples (21.3% of the combined trace) in the generic
+`write_pixels` path.
+
+The tiled AVX2 and SSE2 transpose kernels now accept BGRA directly, selecting
+their first and third source planes once before quantizing the tile. This
+keeps orientation output in contiguous SIMD stores without adding a
+post-decode swizzle. Alternating best-of-400 saved-executable timings reduced
+the green target from 29.87-29.88ms to **20.82ms (-30.3%)**. Across the four
+Rec.2020 orientation files, best of 200, our total fell from 114.51ms to
+**80.31ms (-29.9%)** and the aggregate ratio moved from 1.89x to **1.36x**.
+
+The post-change profile measured 21.33ms against libjxl's 16.67ms, 1.28x.
+Output self samples fell from 9957 to **1273 (-87.2%)**, while total combined
+trace samples fell from 46644 to **36104 (-22.6%)**. The full BGRA sweep
+remains 1.25x overall after rounding, but all four orientation outliers are
+gone; the largest substantial remaining entries are unrelated prefix-gradient,
+EPF/spline and general Modular paths.
+
+Forced-scalar output is byte-identical to the new SIMD paths for orientations
+5 through 8, covering the 8x8 AVX2 kernel, the 4x4 SSE2 fallback, the generic
+non-multiple tail and a real-alpha image. `bun cmd/tests.ts -all` is
+1245/1245 and all 115 ASan fuzz reproducers are clean. The amalgamation
+compiles warning-free under clang and MSVC.
+
 ### Pack Sumatra's BGRA32 output eight pixels at a time
 After the forward RGB packer, the default-output full sweep remained 1.26x
 overall. Fresh side-by-side profiles found no new general Modular opening:
