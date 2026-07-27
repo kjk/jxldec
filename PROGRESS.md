@@ -79,11 +79,15 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep measured 22761.46ms against libjxl's 16867.43ms,
-**1.35x** overall. Its worst meaningful ratio was
+The latest full sweep, including the vertical-squeeze work below, measured
+21732.90ms against libjxl's 16524.88ms, **1.32x** overall. The preceding
+sweep measured 22761.46ms against 16867.43ms, 1.35x, and its worst meaningful
+ratio was
 `500px_cvo9xd_keong_macan_srgb8.m_e1` at 2.06x; a longer finalist run put it
 at 1.93x. The distance-one RLE work below reduced it to 1.79x, leaving
-`cvo9xd_keong_macan_grayscale.lm_d1` at 1.92x as the next stable candidate.
+`cvo9xd_keong_macan_grayscale.lm_d1` as the next stable candidate. A longer
+baseline put that file at 1.83x, and the vertical-squeeze work below reduced
+it to 1.65x.
 The preceding sweep's worst ratio among files that take libjxl more than 5ms
 was `flower.png.im_q85_gray.jpeg` at 2.14x. The grayscale JPEG work below
 reduced it to 1.70x. The next entry, `P3-sRGB-color-bars.v_noise`, was 2.00x
@@ -99,6 +103,46 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### AVX2 vertical inverse squeeze
+After the effort-one RLE fast path, the next stable target was
+`cvo9xd_keong_macan_grayscale.lm_d1.jxl`. A best-of-100 baseline measured
+10.85ms against libjxl's 5.89ms, **1.84x**. Its 100-run side-by-side
+winperf trace measured 11.15ms against 6.47ms and showed that our inverse
+squeeze was still scalar arithmetic: `squeeze_inverse_h` took 768 self
+samples and `squeeze_inverse_v` took 575, versus 245 and 169 respectively
+for libjxl's AVX2 implementations.
+
+The vertical pass already processes a cache-line-wide strip of independent
+columns, so its tendency and lifting arithmetic now runs eight columns at a
+time. The branchless formulation matches libjxl's `FastUnsqueeze`: division
+of a non-negative difference by three is an integer multiply-high, the
+monotonicity and two clamps become masks, and signed division by two is an
+arithmetic shift after correcting negative odd values. Inputs outside the
+range where every intermediate is provably representable in int32 fall back
+to the existing scalar/int64 calculation, preserving behavior for extreme
+samples as well as ordinary images.
+
+Alternating saved-executable A/B, best of 200:
+
+| file | scalar | AVX2 |
+|---|---:|---:|
+| `cvo9xd_keong_macan_grayscale.lm_d1` | 10.79ms (1.83x) | **9.61ms (1.65x)** |
+| `flower_small.g.lm_d1` | 11.64ms | **10.51ms** |
+| `colorful_chessboards.lm_d1` | 48.83ms | **45.69ms** |
+| total | 71.26ms | **65.81ms** |
+
+That is a **10.9%** reduction on the target and 7.6% across the three-file
+squeeze set. The post-change 100-run trace measured 10.44ms against 7.09ms;
+combined samples fell from 8072 to 7626, and `squeeze_inverse_v` fell from
+575 self samples to 120, a **79.1%** reduction. Horizontal squeeze is now
+the remaining transform hotspot.
+
+All 1245 corpus outputs are byte-identical to the pre-change executable,
+including the target's SHA-256. A separate `JXL_NO_AVX2` clang build matches
+the target as well. The full libjxl oracle remains `1245/1245 ok`, all 115
+ASan fuzz reproducers are clean, and the regenerated amalgamation compiles
+without warnings under clang and MSVC.
 
 ### Distance-one Modular RLE fast path
 A fresh best-of-five sweep over all 1245 files measured 22761.46ms against

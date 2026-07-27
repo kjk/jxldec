@@ -17,6 +17,7 @@
  */
 #include "jxl_internal.h"
 
+#include <immintrin.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -1270,6 +1271,169 @@ static int squeeze_inverse_h(jxl_ctx *ctx, jxl_mchan *merged) {
     return 0;
 }
 
+#define JXL_SQ_STRIP 16
+
+/* Eight independent columns of the vertical lifting step. This is the
+   branchless form used by libjxl's FastUnsqueeze: floor(abs(B-a) / 3) is a
+   multiply-high by 0x55555556, and signed diff/2 is an arithmetic shift after
+   adding one for negative odd values. Keep extreme samples on the scalar
+   int64 path so all int32 inputs retain squeeze_tendency's semantics. */
+static JXL_TARGET_AVX2 void squeeze_inverse_v_avx2(
+    jxl_mchan *merged, int32_t *scratch, uint32_t width, uint32_t height,
+    uint32_t avg_height) {
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i one = _mm256_set1_epi32(1);
+    const __m256i two = _mm256_set1_epi32(2);
+    const __m256i all = _mm256_set1_epi32(-1);
+    const __m256i magic3 = _mm256_set1_epi32(0x55555556);
+    const __m256i limit = _mm256_set1_epi32(0x1fffffff);
+    const __m256i neg_limit = _mm256_set1_epi32(-0x1fffffff);
+    uint32_t x, y;
+
+    for (x = 0; x < width; x += JXL_SQ_STRIP) {
+        uint32_t nresidu = height / 2;
+        uint32_t sw = width - x < JXL_SQ_STRIP ? width - x : JXL_SQ_STRIP;
+        int32_t avg[JXL_SQ_STRIP], top[JXL_SQ_STRIP];
+        uint32_t dx;
+
+        for (y = 0; y < height; y++) {
+            memcpy(scratch + (size_t)y * sw,
+                   merged->data + (size_t)y * merged->stride + x,
+                   (size_t)sw * sizeof(int32_t));
+        }
+        for (dx = 0; dx < sw; dx++) {
+            avg[dx] = scratch[dx];
+            top[dx] = avg[dx];
+        }
+        for (y = 0; y < nresidu; y++) {
+            const int32_t *residu_row =
+                scratch + (size_t)(avg_height + y) * sw;
+            const int32_t *next_row = (y + 1 < avg_height)
+                                          ? scratch + (size_t)(y + 1) * sw
+                                          : NULL;
+            int32_t *out0 =
+                merged->data + (size_t)(2 * y) * merged->stride + x;
+            int32_t *out1 = out0 + merged->stride;
+
+            for (dx = 0; dx + 8 <= sw; dx += 8) {
+                __m256i av = _mm256_loadu_si256((const __m256i *)(avg + dx));
+                __m256i tv = _mm256_loadu_si256((const __m256i *)(top + dx));
+                __m256i nv = next_row
+                    ? _mm256_loadu_si256((const __m256i *)(next_row + dx))
+                    : av;
+                __m256i bad = _mm256_or_si256(
+                    _mm256_or_si256(_mm256_cmpgt_epi32(av, limit),
+                                    _mm256_cmpgt_epi32(neg_limit, av)),
+                    _mm256_or_si256(
+                        _mm256_or_si256(_mm256_cmpgt_epi32(tv, limit),
+                                        _mm256_cmpgt_epi32(neg_limit, tv)),
+                        _mm256_or_si256(_mm256_cmpgt_epi32(nv, limit),
+                                        _mm256_cmpgt_epi32(neg_limit, nv))));
+
+                if (_mm256_movemask_epi8(bad) == 0) {
+                    __m256i ba = _mm256_sub_epi32(tv, av);
+                    __m256i an = _mm256_sub_epi32(av, nv);
+                    __m256i abs_ba = _mm256_abs_epi32(ba);
+                    __m256i abs_an = _mm256_abs_epi32(an);
+                    __m256i abs_bn =
+                        _mm256_abs_epi32(_mm256_sub_epi32(tv, nv));
+                    __m256i pe = _mm256_mul_epu32(abs_ba, magic3);
+                    __m256i po = _mm256_mul_epu32(
+                        _mm256_srli_epi64(abs_ba, 32), magic3);
+                    __m256i div3 = _mm256_or_si256(
+                        _mm256_srli_epi64(pe, 32),
+                        _mm256_slli_epi64(_mm256_srli_epi64(po, 32), 32));
+                    __m256i absdiff = _mm256_srli_epi32(
+                        _mm256_add_epi32(
+                            _mm256_add_epi32(div3, abs_bn), two), 2);
+                    __m256i odd = _mm256_and_si256(absdiff, one);
+                    __m256i ba2 =
+                        _mm256_add_epi32(_mm256_slli_epi32(abs_ba, 1), odd);
+                    __m256i repl =
+                        _mm256_add_epi32(_mm256_slli_epi32(abs_ba, 1), one);
+                    absdiff = _mm256_blendv_epi8(
+                        absdiff, repl, _mm256_cmpgt_epi32(absdiff, ba2));
+                    odd = _mm256_and_si256(absdiff, one);
+                    {
+                        __m256i an2 = _mm256_slli_epi32(abs_an, 1);
+                        __m256i rounded = _mm256_add_epi32(absdiff, odd);
+                        absdiff = _mm256_blendv_epi8(
+                            absdiff, an2,
+                            _mm256_cmpgt_epi32(rounded, an2));
+                    }
+                    {
+                        __m256i neg = _mm256_sub_epi32(zero, absdiff);
+                        __m256i tendency = _mm256_blendv_epi8(
+                            absdiff, neg, _mm256_cmpgt_epi32(nv, tv));
+                        __m256i neq_ba = _mm256_xor_si256(
+                            _mm256_cmpeq_epi32(ba, zero), all);
+                        __m256i neq_an = _mm256_xor_si256(
+                            _mm256_cmpeq_epi32(an, zero), all);
+                        __m256i nonmono = _mm256_cmpgt_epi32(
+                            zero, _mm256_xor_si256(ba, an));
+                        __m256i skip = _mm256_and_si256(
+                            _mm256_and_si256(neq_ba, neq_an), nonmono);
+                        __m256i residu = _mm256_loadu_si256(
+                            (const __m256i *)(residu_row + dx));
+                        __m256i diff, first, second;
+                        tendency =
+                            _mm256_blendv_epi8(tendency, zero, skip);
+                        diff = _mm256_add_epi32(residu, tendency);
+                        first = _mm256_add_epi32(
+                            av, _mm256_srai_epi32(
+                                    _mm256_add_epi32(
+                                        diff, _mm256_srli_epi32(diff, 31)),
+                                    1));
+                        second = _mm256_sub_epi32(first, diff);
+                        _mm256_storeu_si256((__m256i *)(out0 + dx), first);
+                        _mm256_storeu_si256((__m256i *)(out1 + dx), second);
+                        _mm256_storeu_si256((__m256i *)(avg + dx), nv);
+                        _mm256_storeu_si256((__m256i *)(top + dx), second);
+                    }
+                } else {
+                    uint32_t k;
+                    for (k = 0; k < 8; k++) {
+                        uint32_t i = dx + k;
+                        int32_t next_avg = next_row ? next_row[i] : avg[i];
+                        int32_t diff = (int32_t)(
+                            (uint32_t)residu_row[i] +
+                            (uint32_t)squeeze_tendency(
+                                top[i], avg[i], next_avg));
+                        int32_t first = (int32_t)(
+                            (uint32_t)avg[i] + (uint32_t)(diff / 2));
+                        int32_t second =
+                            (int32_t)((uint32_t)first - (uint32_t)diff);
+                        out0[i] = first;
+                        out1[i] = second;
+                        avg[i] = next_avg;
+                        top[i] = second;
+                    }
+                }
+            }
+            for (; dx < sw; dx++) {
+                int32_t next_avg = next_row ? next_row[dx] : avg[dx];
+                int32_t diff = (int32_t)(
+                    (uint32_t)residu_row[dx] +
+                    (uint32_t)squeeze_tendency(top[dx], avg[dx], next_avg));
+                int32_t first = (int32_t)(
+                    (uint32_t)avg[dx] + (uint32_t)(diff / 2));
+                int32_t second =
+                    (int32_t)((uint32_t)first - (uint32_t)diff);
+                out0[dx] = first;
+                out1[dx] = second;
+                avg[dx] = next_avg;
+                top[dx] = second;
+            }
+        }
+        if (height & 1) {
+            const int32_t *last = scratch + (size_t)(avg_height - 1) * sw;
+            int32_t *out = merged->data +
+                           (size_t)(height - 1) * merged->stride + x;
+            memcpy(out, last, (size_t)sw * sizeof(int32_t));
+        }
+    }
+}
+
 static int squeeze_inverse_v(jxl_ctx *ctx, jxl_mchan *merged) {
     uint32_t width = merged->w, height = merged->h;
     uint32_t avg_height = div_ceil_u32(height, 2);
@@ -1288,11 +1452,16 @@ static int squeeze_inverse_v(jxl_ctx *ctx, jxl_mchan *merged) {
 
        The copy is still needed: the outputs for row 2y overwrite inputs that
        later rows still have to read. The arithmetic is untouched. */
-#define JXL_SQ_STRIP 16
     if (width == 0 || height == 0) return 0;
     scratch = (int32_t *)jxl_malloc(
         ctx, (size_t)height * JXL_SQ_STRIP * sizeof(int32_t));
     if (!scratch) return -1;
+
+    if (jxl_has_avx2()) {
+        squeeze_inverse_v_avx2(merged, scratch, width, height, avg_height);
+        jxl_free(ctx, scratch);
+        return 0;
+    }
 
     for (x = 0; x < width; x += JXL_SQ_STRIP) {
         uint32_t nresidu = height / 2;
@@ -1336,10 +1505,11 @@ static int squeeze_inverse_v(jxl_ctx *ctx, jxl_mchan *merged) {
             for (dx = 0; dx < sw; dx++) out[dx] = last[dx];
         }
     }
-#undef JXL_SQ_STRIP
     jxl_free(ctx, scratch);
     return 0;
 }
+
+#undef JXL_SQ_STRIP
 
 static const int16_t delta_palette[72][3] = {
     {0,0,0},{4,4,4},{11,0,0},{0,0,-13},{0,-12,0},{-10,-10,-10},
