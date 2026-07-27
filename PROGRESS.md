@@ -141,6 +141,46 @@ specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
 
+### Pack Sumatra's BGRA32 output eight pixels at a time
+After the forward RGB packer, the default-output full sweep remained 1.26x
+overall. Fresh side-by-side profiles found no new general Modular opening:
+`P3-sRGB-blue.v_e3` spent the same dominant time in the already-audited MA
+tree, predictor and entropy loop. On `splines.v_e3`, EPF pass 1 was still the
+largest gap (9158 self samples against libjxl's 5317), but generated assembly
+confirmed the same register-pressure tradeoff whose reload form was already
+measured and rejected.
+
+The application path was much less optimized. Sumatra requests RGBA32 and
+sets `jxl_ctx_set_bgr`, but both SIMD packers were guarded by `!bgr`, leaving
+BGRA32 on the scalar per-pixel output loop. The AVX2 packer now selects B or R
+as its first plane once per row and writes eight BGRA pixels in one 32-byte
+store. The four-wide SSE2 path swaps its already-quantized R/B vectors before
+packing, covering non-AVX2 machines, tails and nontrivial orientations.
+`cmd/bench.ts` and `cmd/prof.ts` gained `-bgra` so this consumer path can be
+measured directly against libjxl's corresponding RGBA32 decode.
+
+Alternating best-of-400 saved-executable timings on
+`P3-sRGB-color-bars.v_e3` reduced ours from **14.20-14.23ms to 12.00ms**,
+15.5%, and the in-process ratio from 1.91-1.95x to 1.66x. Across five
+representative effort-3 files, best of 100, our total fell from 218.58ms to
+**191.77ms (-12.3%)**; libjxl was 124.19/124.22ms and the aggregate ratio
+moved from 1.76x to **1.54x**. A final 220-run `winperf -print-agent`
+profile measured 12.65ms against libjxl's 8.41ms, 1.51x; `write_pixels` was
+down to 387 self samples, 1.9% of the combined trace.
+
+BGRA output is an exact R/B swap of RGBA output on both opaque and alpha
+files. Forced-scalar and SIMD builds are byte-identical on direct RGB, real
+RGBA-with-alpha and orientation-5 controls. `bun cmd/tests.ts -all` is
+1245/1245, all 115 ASan fuzz reproducers are clean, and the amalgamation
+compiles warning-free under clang and MSVC.
+
+Three independent experiments were rejected before this retained change:
+directly entering a fixed DCT16 leaf reduced DCT profile samples by 9.7% but
+was neutral in release timings; precomputing EPF inverse sigma removed
+repeated divides but left `splines.v_e3` inside its 58.12-58.49ms baseline
+band; and folding XYB intensity scaling into the inverse matrix measured
+58.28ms on the same target, also neutral.
+
 ### Pack forward RGB24 and RGBA32 eight pixels at a time
 The post-EPF rerank put `flower_small.ga.v_prog` at 1.73x. Its 220-run
 side-by-side profile measured 20.70ms against libjxl's 12.12ms and was the

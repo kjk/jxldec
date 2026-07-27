@@ -1,6 +1,6 @@
 /* jxl_prof.c -- decode one file repeatedly, for the profiler.
  *
- *   jxl_prof [-runs N] file.jxl
+ *   jxl_prof [-runs N] [-bgra] file.jxl
  *
  * Only our decoder runs, so a sampling profile of this process is a profile
  * of jxldec alone. Built with debug info so winperf can symbolize it; see
@@ -33,7 +33,7 @@ static void on_error(void *user, jxl_severity sev, const char *msg) {
 
 int main(int argc, char **argv) {
     const char *path = NULL;
-    int runs = 10, i;
+    int runs = 10, bgra = 0, i;
     FILE *f;
     long n;
     uint8_t *data;
@@ -43,12 +43,14 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-runs") == 0 && i + 1 < argc) {
             runs = atoi(argv[++i]);
             if (runs < 1) runs = 1;
+        } else if (strcmp(argv[i], "-bgra") == 0) {
+            bgra = 1;
         } else {
             path = argv[i];
         }
     }
     if (!path) {
-        fprintf(stderr, "usage: jxl_prof [-runs N] file.jxl\n");
+        fprintf(stderr, "usage: jxl_prof [-runs N] [-bgra] file.jxl\n");
         return 2;
     }
     f = fopen(path, "rb");
@@ -73,7 +75,9 @@ int main(int argc, char **argv) {
 
         winperf_profile_start();
         ctx = jxl_ctx_new(NULL, NULL, on_error, NULL);
-        img = jxl_decode(ctx, data, len, JXLDEC_FORMAT_NATIVE);
+        if (bgra) jxl_ctx_set_bgr(ctx, 1);
+        img = jxl_decode(ctx, data, len,
+                         bgra ? JXLDEC_FORMAT_RGBA32 : JXLDEC_FORMAT_NATIVE);
         winperf_profile_stop();
         if (!img) {
             fprintf(stderr, "decode failed: %s\n", path);

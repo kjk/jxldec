@@ -184,26 +184,28 @@ static __m256i quantize8_255(const float *src) {
     return _mm256_and_si256(_mm256_castps_si256(pos), t);
 }
 
-/* Eight forward RGB(A) pixels. RGBA is already one packed dword per lane.
-   For RGB24, vpshufb removes the unused fourth byte independently in each
-   128-bit half, producing two 12-byte groups. Two overlapping 16-byte stores
-   write those groups; the next vector (or the existing four-pixel/scalar
-   tail) overwrites the four-byte overhang. */
+/* Eight forward RGB(A) or BGR(A) pixels. Four-component output is already one
+   packed dword per lane. For three components, vpshufb removes the unused
+   fourth byte independently in each 128-bit half, producing two 12-byte
+   groups. Two overlapping 16-byte stores write those groups; the next vector
+   (or the existing four-pixel/scalar tail) overwrites the overhang. */
 JXL_TARGET_AVX2
 static uint32_t write_rgb8_row_avx2(const float *r, const float *g,
                                     const float *b, const float *a,
                                     uint8_t *dst, uint32_t x, uint32_t w,
-                                    int ncomp) {
+                                    int ncomp, int bgr) {
     const __m256i opaque = _mm256_set1_epi32(255);
     const __m256i rgb_shuffle = _mm256_setr_epi8(
         0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1,
         0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1);
+    const float *c0 = bgr ? b : r;
+    const float *c2 = bgr ? r : b;
     uint32_t end = ncomp == 4 ? w : (w >= 8 ? w - 8 : 0);
 
     for (; x + 8 <= end; x += 8) {
-        __m256i qr = quantize8_255(r + x);
+        __m256i qr = quantize8_255(c0 + x);
         __m256i qg = quantize8_255(g + x);
-        __m256i qb = quantize8_255(b + x);
+        __m256i qb = quantize8_255(c2 + x);
         __m256i packed = _mm256_or_si256(
             _mm256_or_si256(qr, _mm256_slli_epi32(qg, 8)),
             _mm256_slli_epi32(qb, 16));
@@ -509,9 +511,9 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
                                  _mm_packus_epi16(h0, h1));
             }
         }
-        if (use_avx2 && direct && !wide && !gray && !bgr &&
+        if (use_avx2 && direct && !wide && !gray &&
             !transposed && !reverse_x && (ncomp == 3 || ncomp == 4)) {
-            ox = write_rgb8_row_avx2(pr, pg, pb, pa, row8, ox, ow, ncomp);
+            ox = write_rgb8_row_avx2(pr, pg, pb, pa, row8, ox, ow, ncomp, bgr);
         }
         /* The two common 8-bit RGB formats pack without any shuffling: each
            lane's three or four components are already 0..255 in separate
@@ -522,8 +524,7 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
            pixel and is overwritten by it. The loop stops four pixels short of
            the row so the last such overhang stays inside the row and the
            scalar tail below rewrites it. */
-        if (direct && !wide && !gray && !bgr &&
-            (ncomp == 3 || ncomp == 4)) {
+        if (direct && !wide && !gray && (ncomp == 3 || ncomp == 4)) {
             uint32_t lim = ncomp == 4 ? ow : (ow >= 4 ? ow - 4 : 0);
             const __m128i amax = _mm_set1_epi32((int)maxval);
             for (; ox + 4 <= lim; ox += 4) {
@@ -542,6 +543,11 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
                     b = quantize4v(pb + qx, maxval);
                     a = (pa && ncomp == 4) ? quantize4v(pa + qx, maxval)
                                            : amax;
+                }
+                if (bgr) {
+                    __m128i t = r;
+                    r = b;
+                    b = t;
                 }
                 /* RGB24 discards this lane, so do not pay to quantise it. */
                 __m128i packed = _mm_or_si128(

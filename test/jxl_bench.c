@@ -1,6 +1,6 @@
 /* jxl_bench.c -- decode timing, ours against libjxl, in one process.
  *
- *   jxl_bench [-runs N] [-list paths.txt] file.jxl ...
+ *   jxl_bench [-runs N] [-bgra] [-list paths.txt] file.jxl ...
  *
  * Both decoders produce 8-bit interleaved samples of the first frame, which
  * is what an application like SumatraPDF asks for. libjxl runs
@@ -46,6 +46,8 @@ static void on_error(void *user, jxl_severity sev, const char *msg) {
     (void)msg;
 }
 
+static int output_bgra;
+
 static uint8_t *read_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");
     uint8_t *buf;
@@ -73,8 +75,10 @@ static double bench_ours(const uint8_t *data, size_t len) {
     jxl_image *img;
     double t0, dt;
     if (!ctx) return -1;
+    if (output_bgra) jxl_ctx_set_bgr(ctx, 1);
     t0 = now_ms();
-    img = jxl_decode(ctx, data, len, JXLDEC_FORMAT_NATIVE);
+    img = jxl_decode(ctx, data, len,
+                     output_bgra ? JXLDEC_FORMAT_RGBA32 : JXLDEC_FORMAT_NATIVE);
     dt = now_ms() - t0;
     if (!img) dt = -1;
     jxl_image_destroy(ctx, img);
@@ -110,8 +114,10 @@ static double bench_libjxl(const uint8_t *data, size_t len) {
         switch (st) {
             case JXL_DEC_BASIC_INFO:
                 if (JxlDecoderGetBasicInfo(dec, &info) != JXL_DEC_SUCCESS) goto fail;
-                fmt.num_channels = info.num_color_channels +
-                                   (info.alpha_bits ? 1 : 0);
+                fmt.num_channels = output_bgra
+                                       ? 4
+                                       : info.num_color_channels +
+                                             (info.alpha_bits ? 1 : 0);
                 break;
             case JXL_DEC_NEED_IMAGE_OUT_BUFFER:
                 if (JxlDecoderImageOutBufferSize(dec, &fmt, &out_size) !=
@@ -214,6 +220,8 @@ int main(int argc, char **argv) {
             if (runs < 1) runs = 1;
         } else if (strcmp(argv[i], "-list") == 0 && i + 1 < argc) {
             list_path = argv[++i];
+        } else if (strcmp(argv[i], "-bgra") == 0) {
+            output_bgra = 1;
         }
     }
     printf("%-46s %10s %10s %8s\n", "file", "libjxl", "jxldec", "ratio");

@@ -1,7 +1,7 @@
 /* jxl_test.c -- CLI harness for the C JPEG XL decoder (jbig2dec-flavored).
  *
  *   jxl_test -info in.jxl
- *   jxl_test -out out.pam in.jxl
+ *   jxl_test [-bgr] -out out.pam in.jxl
  *   jxl_test -frame N -out out.pam in.jxl
  *
  * Writes binary PAM, the same thing `djxl in.jxl out.pam` produces, so the
@@ -199,7 +199,7 @@ static int write_pam(const char *path, const jxl_image *img) {
 int main(int argc, char **argv) {
     const char *in_path = NULL;
     const char *out_path = NULL;
-    int do_info = 0, do_frames = 0, frame_no = 0;
+    int do_info = 0, do_frames = 0, bgr = 0, frame_no = 0;
     jxl_format fmt = JXLDEC_FORMAT_NATIVE;
     int i, rc = 0;
     uint8_t *data;
@@ -209,6 +209,7 @@ int main(int argc, char **argv) {
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-info") == 0) do_info = 1;
         else if (strcmp(argv[i], "-frames") == 0) do_frames = 1;
+        else if (strcmp(argv[i], "-bgr") == 0) bgr = 1;
         else if (strcmp(argv[i], "-out") == 0 && i + 1 < argc) out_path = argv[++i];
         else if (strcmp(argv[i], "-frame") == 0 && i + 1 < argc) frame_no = atoi(argv[++i]);
         else if (strcmp(argv[i], "-fmt") == 0 && i + 1 < argc) fmt = (jxl_format)atoi(argv[++i]);
@@ -220,7 +221,8 @@ int main(int argc, char **argv) {
     }
     if (!in_path) {
         fprintf(stderr,
-                "usage: jxl_test [-info] [-frames] [-frame N] [-out out.pnm] in.jxl\n");
+                "usage: jxl_test [-info] [-frames] [-bgr] [-frame N] "
+                "[-out out.pnm] in.jxl\n");
         return 2;
     }
 
@@ -232,6 +234,7 @@ int main(int argc, char **argv) {
         free(data);
         return 1;
     }
+    if (bgr) jxl_ctx_set_bgr(ctx, 1);
 
     if (do_info) rc = cmd_info(ctx, data, len);
     if (!rc && do_frames) rc = cmd_frames(ctx, data, len);

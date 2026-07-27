@@ -1,6 +1,6 @@
 // bench.ts -- benchmark our decoder against libjxl.
 //
-//   bun cmd/bench.ts <file.jxl ... | -rand N | -all> [-runs N] [-preset a,b]
+//   bun cmd/bench.ts <file.jxl ... | -rand N | -all> [-runs N] [-preset a,b] [-bgra]
 //
 // Builds jxl_bench, which links the dist/ amalgamation and libjxl's static
 // libraries into one process, then decodes each file with both. The selection
@@ -22,6 +22,7 @@ const ROOT = dirname(import.meta.dir);
 const argv = process.argv.slice(2);
 const runsIdx = argv.indexOf("-runs");
 const RUNS = runsIdx >= 0 ? argv[runsIdx + 1] : "3";
+const BGRA = argv.includes("-bgra");
 
 if (!isWindows) {
   console.error("bench: the harness links libjxl's MSVC build; Windows only.");
@@ -39,6 +40,7 @@ selection (required; default prints this help):
 options:
   -runs N         decodes per file per decoder, best wins (default 3)
   -preset a,b     restrict the generated corpus to these presets
+  -bgra           request BGRA8 from ours and RGBA8 from libjxl
 
 ${corpusSummary()}`,
   ["-rand", "-runs", "-preset"],
@@ -50,7 +52,8 @@ const listFile = join(tmp, "files.txt");
 writeFileSync(listFile, files.join("\n") + "\n");
 try {
   const proc = Bun.spawnSync({
-    cmd: [EXE, "-runs", RUNS, "-list", listFile],
+    cmd: [EXE, "-runs", RUNS, ...(BGRA ? ["-bgra"] : []),
+          "-list", listFile],
     stdout: "inherit",
     stderr: "inherit",
     cwd: ROOT,

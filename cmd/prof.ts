@@ -1,7 +1,7 @@
 // prof.ts -- sampling profile of one decode on Windows via ../winperf
 // (-vs profiles ours and libjxl together).
 //
-//   bun cmd/prof.ts <file.jxl> [-runs N] [-hz N] [-vs]
+//   bun cmd/prof.ts <file.jxl> [-runs N] [-hz N] [-vs] [-bgra]
 //
 // Builds jxl_prof (our amalgamation only, with -Zi so the profiler can
 // symbolize it), then records it under winperf and prints winperf's agent
@@ -46,6 +46,7 @@ const flagVal = (name: string, dflt: string) => {
 };
 const RUNS = flagVal("-runs", "10");
 const HZ = flagVal("-hz", "4000");
+const BGRA = argv.includes("-bgra");
 // Only these take a value; treating every flag as if it did would swallow
 // the filename after a boolean one like -vs.
 const VALUE_FLAGS = ["-runs", "-hz"];
@@ -53,11 +54,12 @@ const files = argv.filter(
   (a, i) => !a.startsWith("-") && !VALUE_FLAGS.includes(argv[i - 1] ?? ""));
 
 if (!isWindows || files.length !== 1) {
-  console.error(`usage: bun cmd/prof.ts <file.jxl> [-runs N] [-hz N] [-vs]
+  console.error(`usage: bun cmd/prof.ts <file.jxl> [-runs N] [-hz N] [-vs] [-bgra]
   -runs N   decodes of the file inside the profiled process (default 10)
   -hz N     sampling rate (default 4000)
   -vs       profile ours *and* libjxl together, both symbolized (builds a
             debug-info libjxl the first time, which is slow)
+  -bgra     request BGRA8 from ours and RGBA8 from libjxl
 
 Windows only: winperf records with xperf and needs Administrator rights
 (and the Windows Performance Toolkit from the ADK).
@@ -94,7 +96,7 @@ const OUT = resolve(outDir, "winperf.etl");
 
 console.log(`prof: ${WINPERF}`);
 console.log(`  exe:  ${EXE}`);
-console.log(`  work: -runs ${RUNS} ${file}`);
+console.log(`  work: -runs ${RUNS}${BGRA ? " -bgra" : ""} ${file}`);
 console.log(`  out:  ${OUT}`);
 
 const proc = Bun.spawnSync({
@@ -102,7 +104,7 @@ const proc = Bun.spawnSync({
   // shows up as a trace full of unrelated system processes rather than an
   // error.
   cmd: [WINPERF, "record", "-i", HZ, "-o", OUT, "-print-agent",
-        "--", resolve(EXE), "-runs", RUNS, file],
+        "--", resolve(EXE), "-runs", RUNS, ...(BGRA ? ["-bgra"] : []), file],
   stdout: "inherit",
   stderr: "inherit",
   cwd: ROOT,
