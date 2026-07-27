@@ -450,6 +450,23 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
            below reads those results instead of calling quantize(). Horizontal
            flips reverse the finished lanes, while transposed orientations
            gather four samples at +/-stride. */
+        /* A grayscale byte row needs no component interleave. Pack sixteen
+           quantized int32 lanes down to bytes and store them together instead
+           of bouncing each group through four temporary uint32_t arrays and
+           a per-pixel component loop. */
+        if (direct && !wide && gray && ncomp == 1 &&
+            !transposed && !reverse_x) {
+            for (; ox + 16 <= ow; ox += 16) {
+                __m128i q0 = quantize4v(pr + ox, maxval);
+                __m128i q1 = quantize4v(pr + ox + 4, maxval);
+                __m128i q2 = quantize4v(pr + ox + 8, maxval);
+                __m128i q3 = quantize4v(pr + ox + 12, maxval);
+                __m128i h0 = _mm_packs_epi32(q0, q1);
+                __m128i h1 = _mm_packs_epi32(q2, q3);
+                _mm_storeu_si128((__m128i *)(row8 + ox),
+                                 _mm_packus_epi16(h0, h1));
+            }
+        }
         /* The two common 8-bit RGB formats pack without any shuffling: each
            lane's three or four components are already 0..255 in separate
            32-bit lanes, so r | g<<8 | b<<16 | a<<24 lays a whole pixel out in

@@ -79,13 +79,59 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The last full sweep's worst ratios among files that take libjxl more than 5ms
-are `flower.png.im_q85_gray.jpeg` and `P3-sRGB-color-bars.v_noise`, both at
-2.02x. The two Rec.2020 files that preceded them have since been reduced:
+The latest full sweep's worst ratio among files that take libjxl more than 5ms
+was `flower.png.im_q85_gray.jpeg` at 2.14x. The grayscale JPEG work below
+reduced it to 1.70x; the next entry in that sweep is now
+`P3-sRGB-color-bars.v_noise` at 2.00x. The two Rec.2020 files that preceded
+them have also been reduced:
 `R2020-sRGB-blue.v_prog` fell from 2.51x to 1.45x with the folded-predictor
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Skip discarded grayscale JPEG channels
+A fresh best-of-five corpus sweep measured 22181.15ms against libjxl's
+16382.77ms, **1.35x** overall. Its slowest meaningful ratio was
+`flower.png.im_q85_gray.jpeg.jxl`: 49.20ms against 23.04ms, **2.14x**.
+A 100-run side-by-side winperf trace measured 50.53ms against 26.19ms and
+showed three independent costs:
+
+- `write_pixels` took 2485 self samples (7.8%) to quantize a contiguous GRAY8
+  result through the generic per-component output loop.
+- `jxl_write_hf_coeff` plus inverse DCT and dequantization reconstructed all
+  three JPEG YCbCr planes even though grayscale output retains only
+  `Y + 1.402 Cr`.
+- the full YCbCr-to-RGB conversion generated two color planes that were
+  immediately discarded.
+
+Contiguous non-transposed GRAY8 output now has an SSE2 kernel that quantizes
+and packs 16 pixels per iteration. Grayscale JPEG frames convert only the
+retained gray plane and then release the unused planes. When color transform
+application is requested, the decoder still consumes every Cb entropy symbol
+and updates its coefficient contexts, but skips coefficient placement,
+dequantization, inverse DCT and chroma-from-luma work for that discarded
+plane.
+
+Best of 50:
+
+| measurement | before | after |
+|---|---:|---:|
+| ours | 49.25ms | **39.81ms** |
+| libjxl | 23.73ms | 23.41ms |
+| ratio | 2.08x | **1.70x** |
+
+That is a **19.2%** reduction in our decoder. The post-change 100-run trace
+measured 39.53ms against 25.86ms. Combined samples fell from 31973 to 27548;
+`write_pixels` disappeared from the top 15, inverse DCT fell from 1661 to
+1072 self samples, and dequantization fell from 1359 to 861. Our entropy
+reader and libjxl's remain similar-sized leading costs, so the remaining gap
+is distributed across the decode pipeline rather than concentrated in one
+arithmetic loop.
+
+All 29 corpus files with `gray` in their names are byte-identical to a
+pre-change executable. The target's SHA-256 is unchanged, the full libjxl
+oracle remains `1245/1245 ok`, all 115 fuzz reproducers are clean, and the
+amalgamation compiles without warnings under clang and MSVC.
 
 ### Tiled SSE2/AVX2 transpose for oriented RGBA8 output
 A 100-run side-by-side winperf trace of `R2020-sRGB-blue.v_orient` measured

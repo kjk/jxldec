@@ -1020,9 +1020,12 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                 if (non_zeros == 0) continue;
 
                 is_prev_nonzero = (non_zeros <= num_blocks * 4) ? 1 : 0;
-                ord = p->pass->order[order_id][cc];
-                if (!ord) ord = jxl_natural_order(ctx, p->no, (int)order_id);
-                if (!ord) goto done;
+                ord = NULL;
+                if (!(p->discard_mask & (1u << cc))) {
+                    ord = p->pass->order[order_id][cc];
+                    if (!ord) ord = jxl_natural_order(ctx, p->no, (int)order_id);
+                    if (!ord) goto done;
+                }
 
                 coeff_ctx_base = block_ctx * 458 + 37 * bc->num_block_clusters;
                 for (k = num_blocks; k < num_blocks * 64; k++) {
@@ -1053,18 +1056,22 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                         continue;
                     }
                     coeff = jxl_unpack_signed(ucoeff) << p->coeff_shift;
-                    dx = ord[k * 2];
-                    dy = ord[k * 2 + 1];
-                    if (jxl_tr_need_transpose(bi->dct_select)) {
-                        uint32_t t = dx; dx = dy; dy = t;
-                    }
-                    px = sx * 8 + dx;
-                    py = sy * 8 + dy;
-                    {
-                        /* Coefficients accumulate as integers, stored in the
-                           float plane's bit pattern until dequantization. */
-                        int32_t *slot = (int32_t *)&out[cc][(size_t)py * stride[cc] + px];
-                        *slot += coeff;
+                    if (!(p->discard_mask & (1u << cc))) {
+                        dx = ord[k * 2];
+                        dy = ord[k * 2 + 1];
+                        if (jxl_tr_need_transpose(bi->dct_select)) {
+                            uint32_t t = dx; dx = dy; dy = t;
+                        }
+                        px = sx * 8 + dx;
+                        py = sy * 8 + dy;
+                        {
+                            /* Coefficients accumulate as integers, stored in
+                               the float plane's bit pattern until
+                               dequantization. */
+                            int32_t *slot = (int32_t *)&out[cc][
+                                (size_t)py * stride[cc] + px];
+                            *slot += coeff;
+                        }
                     }
                     is_prev_nonzero = 1;
                     non_zeros--;
@@ -1418,7 +1425,7 @@ void jxl_dequant_varblock(float *coeff, size_t stride, int tr, int32_t hf_mul,
 
 void jxl_cfl_hf(float *cx, float *cy, float *cb, size_t stride, uint32_t gw,
                 uint32_t gh, const int32_t *x_from_y, const int32_t *b_from_y,
-                uint32_t cfl_stride, const jxl_lf_chan_corr *corr) {
+                uint32_t cfl_stride, const jxl_lf_chan_corr *corr, int skip_x) {
     uint32_t x, y, x0;
     /* The two correlation factors are indexed by x / 64, so they are constant
        over each run of 64 columns -- but the loop was recomputing them per
@@ -1444,15 +1451,16 @@ void jxl_cfl_hf(float *cx, float *cy, float *cb, size_t stride, uint32_t gw,
                 const __m128 vkb = _mm_set1_ps(kb);
                 for (; x + 4 <= xe; x += 4) {
                     __m128 vy = _mm_loadu_ps(ry + x);
-                    _mm_storeu_ps(rx + x, _mm_add_ps(_mm_loadu_ps(rx + x),
-                                                     _mm_mul_ps(vkx, vy)));
+                    if (!skip_x)
+                        _mm_storeu_ps(rx + x, _mm_add_ps(_mm_loadu_ps(rx + x),
+                                                         _mm_mul_ps(vkx, vy)));
                     _mm_storeu_ps(rb + x, _mm_add_ps(_mm_loadu_ps(rb + x),
                                                      _mm_mul_ps(vkb, vy)));
                 }
             }
 #endif
             for (; x < xe; x++) {
-                rx[x] += kx * ry[x];
+                if (!skip_x) rx[x] += kx * ry[x];
                 rb[x] += kb * ry[x];
             }
         }
@@ -1792,6 +1800,35 @@ static void ycbcr_to_rgb_x4(float *cb, float *y, float *cr, size_t n,
     }
     *idx = i;
 }
+
+JXL_TARGET_AVX2
+static void ycbcr_to_gray_x8(float *gray, const float *y, const float *cr,
+                             size_t n, size_t *idx) {
+    const __m256 yoff = _mm256_set1_ps(128.0f / 255.0f);
+    const __m256 crcr = _mm256_set1_ps(1.402f);
+    size_t i = *idx;
+    for (; i + 8 <= n; i += 8) {
+        __m256 yv = _mm256_add_ps(_mm256_loadu_ps(y + i), yoff);
+        __m256 r = _mm256_loadu_ps(cr + i);
+        _mm256_storeu_ps(gray + i,
+                         _mm256_add_ps(yv, _mm256_mul_ps(crcr, r)));
+    }
+    _mm256_zeroupper();
+    *idx = i;
+}
+
+static void ycbcr_to_gray_x4(float *gray, const float *y, const float *cr,
+                             size_t n, size_t *idx) {
+    const __m128 yoff = _mm_set1_ps(128.0f / 255.0f);
+    const __m128 crcr = _mm_set1_ps(1.402f);
+    size_t i = *idx;
+    for (; i + 4 <= n; i += 4) {
+        __m128 yv = _mm_add_ps(_mm_loadu_ps(y + i), yoff);
+        __m128 r = _mm_loadu_ps(cr + i);
+        _mm_storeu_ps(gray + i, _mm_add_ps(yv, _mm_mul_ps(crcr, r)));
+    }
+    *idx = i;
+}
 #endif
 
 void jxl_ycbcr_to_rgb(float *cb, float *y, float *cr, size_t n) {
@@ -1810,5 +1847,18 @@ void jxl_ycbcr_to_rgb(float *cb, float *y, float *cr, size_t n) {
         cb[i] = yv + crcr * r_;
         y[i] = yv + cgcb * b_ + cgcr * r_;
         cr[i] = yv + cbcb * b_;
+    }
+}
+
+void jxl_ycbcr_to_gray(float *gray, const float *y, const float *cr, size_t n) {
+    const float crcr = 1.402f;
+    size_t i = 0;
+#ifdef JXL_VARDCT_SSE2
+    if (jxl_has_avx2()) ycbcr_to_gray_x8(gray, y, cr, n, &i);
+    ycbcr_to_gray_x4(gray, y, cr, n, &i);
+#endif
+    for (; i < n; i++) {
+        float yv = y[i] + 128.0f / 255.0f;
+        gray[i] = yv + crcr * cr[i];
     }
 }

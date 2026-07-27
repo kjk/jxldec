@@ -853,6 +853,8 @@ void jxl_chroma_upsample(float *p, uint32_t w, uint32_t h, size_t stride,
                          int hs, int vs, uint32_t out_w, uint32_t out_h);
 /* (Cb, Y, Cr) -> (R, G, B), in place. */
 void jxl_ycbcr_to_rgb(float *cb, float *y, float *cr, size_t n);
+/* Grayscale YCbCr: compute only the R/gray plane that output retains. */
+void jxl_ycbcr_to_gray(float *gray, const float *y, const float *cr, size_t n);
 int jxl_hf_block_ctx_read(jxl_ctx *ctx, jxl_br *br, jxl_hf_block_ctx *bc);
 void jxl_hf_block_ctx_free(jxl_ctx *ctx, jxl_hf_block_ctx *bc);
 
@@ -882,6 +884,7 @@ typedef struct {
     jxl_hf_pass *pass;
     uint32_t coeff_shift;
     jxl_natural_orders *no;
+    uint8_t discard_mask;              /* decode entropy, omit coefficient store */
 } jxl_hf_coeff_params;
 
 int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
@@ -906,7 +909,7 @@ void jxl_cfl_lf(float *x, float *y, float *b, uint32_t w, uint32_t h,
                 size_t stride, const jxl_lf_chan_corr *corr);
 void jxl_cfl_hf(float *cx, float *cy, float *cb, size_t stride, uint32_t gw,
                 uint32_t gh, const int32_t *x_from_y, const int32_t *b_from_y,
-                uint32_t cfl_stride, const jxl_lf_chan_corr *corr);
+                uint32_t cfl_stride, const jxl_lf_chan_corr *corr, int skip_x);
 void jxl_dequant_varblock(float *coeff, size_t stride, int tr, int32_t hf_mul,
                           int channel, const jxl_dequant_matrices *dm,
                           const jxl_quantizer *q, float qm_scale,

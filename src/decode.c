@@ -82,6 +82,18 @@ void jxl_fimage_free(jxl_ctx *ctx, jxl_fimage *img) {
     img->nplane = 0;
 }
 
+/* VarDCT starts with three color planes. Once a grayscale color transform
+   has produced the one visible plane, discard the other two and slide extra
+   channels down so alpha keeps its documented index. */
+static void fimage_keep_gray(jxl_ctx *ctx, jxl_fimage *img) {
+    uint32_t k;
+    jxl_free(ctx, img->plane[1].data);
+    jxl_free(ctx, img->plane[2].data);
+    for (k = 3; k < img->nplane; k++) img->plane[k - 2] = img->plane[k];
+    img->nplane -= 2;
+    img->ncolor = 1;
+}
+
 /* ===================================================================== */
 /* section readers                                                        */
 /* ===================================================================== */
@@ -424,7 +436,7 @@ static void merge_hf_meta(jxl_vardct_state *v, const jxl_hf_meta *m,
    of the frame, leaving XYB samples in v->coeff. */
 static void vardct_finish_blocks(jxl_vardct_state *v,
                                  const jxl_image_metadata *meta,
-                                 const jxl_frame_header *fh) {
+                                 const jxl_frame_header *fh, int skip_cb) {
     float qm_scale[3];
     uint32_t bx, by;
     int c;
@@ -433,7 +445,12 @@ static void vardct_finish_blocks(jxl_vardct_state *v,
     qm_scale[1] = 1.0f;
     qm_scale[2] = powf(0.8f, (float)fh->b_qm_scale - 2.0f);
 
-    for (c = 0; c < 3; c++) {
+    /* In grayscale YCbCr output, the final retained value is
+       Y + 1.402*Cr. Cb entropy was consumed to keep the ANS state and
+       nonzero contexts in step, but its coefficients and CfL update were
+       discarded, so neither dequantization nor an inverse transform remains
+       to do for that channel. */
+    for (c = skip_cb ? 1 : 0; c < 3; c++) {
         for (by = 0; by < v->bh; by++) {
             uint32_t sby = by >> v->vs[c];
             if ((sby << v->vs[c]) != by) continue;
@@ -454,10 +471,10 @@ static void vardct_finish_blocks(jxl_vardct_state *v,
        applies when nothing is subsampled -- as in libjxl's DequantDC. */
     if (!v->hs[0] && !v->vs[0] && !v->hs[2] && !v->vs[2]) {
         jxl_cfl_hf(v->coeff[0], v->coeff[1], v->coeff[2], v->pw, v->pw, v->ph,
-                   v->x_from_y, v->b_from_y, v->cfl_w, &v->chan_corr);
+                   v->x_from_y, v->b_from_y, v->cfl_w, &v->chan_corr, skip_cb);
     }
 
-    for (c = 0; c < 3; c++) {
+    for (c = skip_cb ? 1 : 0; c < 3; c++) {
         for (by = 0; by < v->bh; by++) {
             uint32_t sby = by >> v->vs[c];
             if ((sby << v->vs[c]) != by) continue;
@@ -506,7 +523,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     jxl_splines splines;
     jxl_noise_params noise;
     int have_patches = 0, have_splines = 0, have_noise = 0;
-    int is_vardct;
+    int is_vardct, discard_cb;
     uint32_t nspecs = 0, i, split;
     uint32_t color_w, color_h, group_dim, group_dim_shift;
     uint32_t num_lf_groups, num_groups, num_passes;
@@ -527,6 +544,8 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     memset(out, 0, sizeof(*out));
 
     is_vardct = (fh->encoding == JXL_ENC_VARDCT);
+    discard_cb = is_vardct && apply_ct && fh->do_ycbcr &&
+                 meta->colour.colour_space == JXLDEC_CS_GRAY;
     if ((fh->flags & JXL_FF_USE_LF_FRAME) && !st->lf_valid) {
         JXL_ERR(ctx, "frame: LF frame referenced but not decoded");
         return -1;
@@ -833,6 +852,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                     hp.pass = &vd.passes[p];
                     hp.coeff_shift = p < 16 ? fh->passes.shift[p] : 0;
                     hp.no = &vd.no;
+                    hp.discard_mask = discard_cb ? 1u : 0u;
                     if (jxl_write_hf_coeff(ctx, br, &hp, outp, strides) != 0)
                         goto done;
                 }
@@ -900,7 +920,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                 }
             }
         }
-        vardct_finish_blocks(&vd, meta, fh);
+        vardct_finish_blocks(&vd, meta, fh, discard_cb);
 
         /* Bring subsampled chroma back to full resolution before the loop
            filters, which is where libjxl's pipeline puts it. */
@@ -1061,11 +1081,23 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
        far more than enough for the vector loops inside. */
     if (apply_ct && fh->do_ycbcr && out->ncolor >= 3) {
         uint32_t row, rows = out->plane[0].h, rw = out->plane[0].w;
-        for (row = 0; row < rows; row++) {
-            jxl_ycbcr_to_rgb(out->plane[0].data + (size_t)row * out->plane[0].stride,
-                             out->plane[1].data + (size_t)row * out->plane[1].stride,
-                             out->plane[2].data + (size_t)row * out->plane[2].stride,
-                             rw);
+        if (meta->colour.colour_space == JXLDEC_CS_GRAY) {
+            for (row = 0; row < rows; row++) {
+                jxl_ycbcr_to_gray(
+                    out->plane[0].data + (size_t)row * out->plane[0].stride,
+                    out->plane[1].data + (size_t)row * out->plane[1].stride,
+                    out->plane[2].data + (size_t)row * out->plane[2].stride,
+                    rw);
+            }
+            fimage_keep_gray(ctx, out);
+        } else {
+            for (row = 0; row < rows; row++) {
+                jxl_ycbcr_to_rgb(
+                    out->plane[0].data + (size_t)row * out->plane[0].stride,
+                    out->plane[1].data + (size_t)row * out->plane[1].stride,
+                    out->plane[2].data + (size_t)row * out->plane[2].stride,
+                    rw);
+            }
         }
     } else if (apply_ct && meta->xyb_encoded && out->ncolor >= 3) {
         uint32_t row, rows = out->plane[0].h, rw = out->plane[0].w;
@@ -1089,12 +1121,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         /* Grayscale XYB decodes into three identical planes; drop two so the
            extra channels (alpha!) keep their expected plane indices. */
         if (meta->colour.colour_space == JXLDEC_CS_GRAY && out->ncolor == 3) {
-            uint32_t k;
-            jxl_free(ctx, out->plane[1].data);
-            jxl_free(ctx, out->plane[2].data);
-            for (k = 3; k < out->nplane; k++) out->plane[k - 2] = out->plane[k];
-            out->nplane -= 2;
-            out->ncolor = 1;
+            fimage_keep_gray(ctx, out);
         }
     }
     rc = 0;
