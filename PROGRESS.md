@@ -62,7 +62,7 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.29x libjxl** (1.37x before the folded-predictor
+1245-file corpus we are **1.28x libjxl** (1.37x before the folded-predictor
 specialization below; 2.74x before the SIMD work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
@@ -79,10 +79,13 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep, including the bit-reader work below, measured
-21020.73ms against libjxl's 16345.67ms, **1.29x** overall. Its worst stable
-ratio remains `hdr_room.m_e1`, now 10.22ms against 4.99ms, 2.05x. The
-preceding sweep measured 21868.50ms against libjxl's 16861.19ms, **1.30x**;
+The latest full sweep, including the prefix work below, measured 21249.81ms
+against libjxl's 16540.57ms, **1.28x** overall. Its worst stable ratio remains
+`hdr_room.m_e1`, now 9.25ms against 4.90ms, 1.89x, just ahead of
+`colorful_chessboards.v_rs2` at 1.86x. The preceding sweep, after the
+bit-reader work, measured 21020.73ms against libjxl's 16345.67ms, **1.29x**;
+the target was 10.22ms against 4.99ms, 2.05x. The sweep before that measured
+21868.50ms against libjxl's 16861.19ms, **1.30x**;
 that target was 12.06ms against 5.31ms, 2.27x, and a 100-run finalist measured
 11.24ms against 5.32ms, 2.11x. The sweep before that measured 21732.90ms
 against libjxl's 16524.88ms, **1.32x** overall. The earlier 1.35x sweep's
@@ -107,6 +110,40 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Zero-field hybrid uint and packed prefix entries
+After the bit-reader work, `hdr_room.m_e1` still spent almost all of its time
+in `pfx_read`, `read_uint`, and the gradient RLE loop. A temporary gated dump
+of the parsed entropy configuration showed that every literal cluster uses
+`split=1, msb_in_token=0, lsb_in_token=0`; the run-length configuration also
+has both token fields zero, with `split=16` and exponent 4.
+
+With both token fields empty, the general hybrid-uint expression reduces to
+reading `n = split_exponent + token - split` bits and setting bit `n`. A
+guarded helper now uses that form in the effort-one RLE path, while any
+different configuration retains the generic decoder. This removes several
+variable shifts and the five nonvolatile-register saves visible in MSVC's
+generic `read_uint` assembly.
+
+Best-of-500 alternating saved-executable timings reduced `hdr_room.m_e1`
+from 9.95-9.96ms to **9.05-9.13ms**, another 8-9%. Across five representative
+effort-one files, 50 runs each, our aggregate fell from 295.93-304.73ms to
+**280.47-281.21ms**, a stable 5-8% reduction. A 140-run profile measured
+9.53ms against libjxl's 5.28ms, 1.80x, and `read_uint` disappeared as a
+standalone hot function.
+
+The prefix lookup table already occupied four bytes per entry, but its
+symbol, length, and nested flag were fetched as separate struct fields.
+Storing the same values as one numeric packed word lets the decoder fetch
+them with one aligned 32-bit load and extract them in registers. This smaller
+follow-up reduced `pfx_read` from 1444 to 1407 self samples; alternating tests
+measured about 1% on the target and 0.6% across three large prefix files.
+The final 140-run profile measured 9.52ms against 5.40ms, 1.76x.
+
+The full-corpus ratio improved from 1.29x to **1.28x**. All 1245 corpus
+outputs are byte-identical to the pre-change executable, all 115 ASan fuzz
+reproducers are clean, and the regenerated amalgamation compiles without
+warnings under clang and MSVC.
 
 ### Single-load bit refill and derived stream position
 After the gradient-RLE work, `hdr_room.m_e1` still measured 10.86-10.89ms

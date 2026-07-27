@@ -346,9 +346,9 @@ int jxl_read_icc(jxl_ctx *ctx, jxl_br *br, uint8_t **out, size_t *out_len);
 uint32_t jxl_bitlen(uint32_t x);
 
 typedef struct {
-    uint16_t sym;    /* symbol, or offset into the sub-table when nested */
-    uint8_t len;     /* bits to consume, or sub-table index mask when nested */
-    uint8_t nested;
+    /* symbol/sub-table offset in bits 0..15, code length/sub-table mask in
+       bits 16..23, and the nested-table flag in bit 24. */
+    uint32_t bits;
 } jxl_pfx_entry;
 
 typedef struct {

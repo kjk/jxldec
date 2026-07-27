@@ -29,6 +29,10 @@ uint32_t jxl_bitlen(uint32_t x) {
 #define PFX_MAX_BITS 15
 #define PFX_ROOT_BITS 8
 
+static uint32_t pfx_entry(uint32_t sym, uint32_t len, uint32_t nested) {
+    return sym | (len << 16) | (nested << 24);
+}
+
 static uint32_t reverse_bits(uint32_t v, int n) {
     uint32_t r = 0;
     int i;
@@ -50,9 +54,7 @@ static void pfx_single_into(jxl_pfx_hist *h, uint16_t sym) {
     h->root_bits = 0;
     h->root_mask = 0;
     h->single_symbol = (int)sym;
-    h->root[0].sym = sym;
-    h->root[0].len = 0;
-    h->root[0].nested = 0;
+    h->root[0].bits = pfx_entry(sym, 0, 0);
     h->nsub = 0;
     h->sub = NULL;
 }
@@ -137,9 +139,8 @@ static int pfx_build(jxl_ctx *ctx, jxl_pfx_hist *h, const uint8_t *lens,
     /* Nested root entries first, so leaf fills can't overwrite them. */
     for (i = 0; i < root_size; i++) {
         if (!sub_maxlen[i]) continue;
-        h->root[i].nested = 1;
-        h->root[i].sym = (uint16_t)sub_off[i];
-        h->root[i].len = (uint8_t)((1u << (sub_maxlen[i] - root_bits)) - 1);
+        h->root[i].bits = pfx_entry(
+            sub_off[i], (1u << (sub_maxlen[i] - root_bits)) - 1, 1);
     }
 
     /* Pass 2: fill leaves. */
@@ -151,9 +152,7 @@ static int pfx_build(jxl_ctx *ctx, jxl_pfx_hist *h, const uint8_t *lens,
             if (len <= root_bits) {
                 step = 1u << len;
                 for (k = rev; k < root_size; k += step) {
-                    h->root[k].sym = (uint16_t)sym;
-                    h->root[k].len = (uint8_t)len;
-                    h->root[k].nested = 0;
+                    h->root[k].bits = pfx_entry(sym, (uint32_t)len, 0);
                 }
             } else {
                 uint32_t prefix = rev & root_mask;
@@ -162,9 +161,7 @@ static int pfx_build(jxl_ctx *ctx, jxl_pfx_hist *h, const uint8_t *lens,
                 step = 1u << (len - root_bits);
                 for (k = hi; k < sub_size; k += step) {
                     jxl_pfx_entry *e = &h->sub[sub_off[prefix] + k];
-                    e->sym = (uint16_t)sym;
-                    e->len = (uint8_t)len;
-                    e->nested = 0;
+                    e->bits = pfx_entry(sym, (uint32_t)len, 0);
                 }
             }
         }
@@ -174,15 +171,14 @@ static int pfx_build(jxl_ctx *ctx, jxl_pfx_hist *h, const uint8_t *lens,
 
 static uint32_t pfx_read(const jxl_pfx_hist *h, jxl_br *br) {
     uint32_t peeked = jxl_br_peek(br, PFX_MAX_BITS);
-    const jxl_pfx_entry *e = &h->root[peeked & h->root_mask];
-    if (e->nested) {
-        const jxl_pfx_entry *e2 =
-            &h->sub[e->sym + ((peeked >> h->root_bits) & e->len)];
-        jxl_br_consume(br, e2->len);
-        return e2->sym;
+    uint32_t e = h->root[peeked & h->root_mask].bits;
+    if (e >> 24) {
+        uint32_t sym = e & 0xffff;
+        uint32_t mask = (e >> 16) & 0xff;
+        e = h->sub[sym + ((peeked >> h->root_bits) & mask)].bits;
     }
-    jxl_br_consume(br, e->len);
-    return e->sym;
+    jxl_br_consume(br, (int)((e >> 16) & 0xff));
+    return e & 0xffff;
 }
 
 static int pfx_parse_simple(jxl_ctx *ctx, jxl_br *br, jxl_pfx_hist *h,
@@ -306,9 +302,7 @@ static int pfx_parse_complex(jxl_ctx *ctx, jxl_br *br, jxl_pfx_hist *h,
                 rev = reverse_bits(next_code[len]++, len);
                 step = 1u << len;
                 for (k = rev; k < (1u << max_len); k += step) {
-                    cl_root[k].sym = (uint16_t)sym;
-                    cl_root[k].len = (uint8_t)len;
-                    cl_root[k].nested = 0;
+                    cl_root[k].bits = pfx_entry(sym, (uint32_t)len, 0);
                 }
             }
         }
@@ -704,6 +698,18 @@ static uint32_t read_uint(jxl_br *br, const jxl_int_config *cfg,
     return (uint32_t)result;
 }
 
+/* Hybrid uint with both token bit fields empty. This is the configuration
+   fjxl's effort-one RLE streams use for every literal and for run lengths.
+   The generic expression reduces to setting bit n above the n raw bits. */
+static JXL_INLINE_HINT uint32_t read_uint_00(jxl_br *br,
+                                             const jxl_int_config *cfg,
+                                             uint32_t token) {
+    uint32_t n;
+    if (token < cfg->split) return token;
+    n = (cfg->split_exponent + token - cfg->split) & 31;
+    return (1u << n) | jxl_br_read(br, (int)n);
+}
+
 /* ===================================================================== */
 /* the entropy decoder                                                    */
 /* ===================================================================== */
@@ -1037,18 +1043,25 @@ uint32_t jxl_dec_read_prefix_rle1(jxl_dec *dec, jxl_br *br, uint32_t cluster,
     token = pfx_read(&dec->pfx[cluster], br);
     if (token >= dec->min_symbol) {
         uint32_t n;
+        const jxl_int_config *cfg = &dec->lz_len_conf;
         if (!*have) {
             dec->err = 1;
             return 0;
         }
-        n = read_uint(br, &dec->lz_len_conf, token - dec->min_symbol);
+        token -= dec->min_symbol;
+        n = (cfg->msb_in_token | cfg->lsb_in_token) == 0
+                ? read_uint_00(br, cfg, token)
+                : read_uint(br, cfg, token);
         if (n > 0xffffffffu - dec->min_length) {
             dec->err = 1;
             return 0;
         }
         *run = n + dec->min_length - 1;
     } else {
-        *last = read_uint(br, &dec->configs[cluster], token);
+        const jxl_int_config *cfg = &dec->configs[cluster];
+        *last = (cfg->msb_in_token | cfg->lsb_in_token) == 0
+                    ? read_uint_00(br, cfg, token)
+                    : read_uint(br, cfg, token);
         *have = 1;
     }
     return *last;
