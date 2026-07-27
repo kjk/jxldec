@@ -104,6 +104,44 @@ specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
 
+### AVX2 horizontal inverse squeeze
+After vertical squeeze was vectorized, the same profile left
+`squeeze_inverse_h` at 786 self samples, versus 235 for libjxl's AVX2
+implementation. Horizontal lifting is serial across x because each odd
+output becomes the next sample's left neighbor, so adjacent columns cannot
+be SIMD lanes. Adjacent rows are independent, however.
+
+The new kernel loads eight rows at a time and transposes each 8x8 block so
+one vector holds the same column from all rows. It then advances the
+left-neighbor state horizontally through eight vector lifting steps,
+transposes the even and odd results back, and interleaves them into the
+output rows. Horizontal and vertical squeeze now share the same exact
+branchless AVX2 tendency calculation; partial row/column blocks and extreme
+int32 samples retain the scalar/int64 path.
+
+Alternating saved-executable A/B, best of 200:
+
+| file | vertical AVX2 only | horizontal + vertical AVX2 |
+|---|---:|---:|
+| `cvo9xd_keong_macan_grayscale.lm_d1` | 9.51ms (1.64x) | **7.98ms (1.38x)** |
+| `flower_small.g.lm_d1` | 10.40ms | **9.43ms** |
+| `colorful_chessboards.lm_d1` | 45.70ms | **40.90ms** |
+| total | 65.61ms | **58.30ms** |
+
+That is a **16.1%** reduction on the target and 11.1% across the three-file
+squeeze set. The 100-run side-by-side profile measured 9.05ms against
+libjxl's 6.67ms, down from 10.44ms against 7.09ms. Combined samples fell
+from 7626 to 7125, and horizontal squeeze fell from 786 self samples to 240,
+a **69.5%** reduction. Our horizontal kernel is now the same size in the
+profile as libjxl's (240 versus 242 self samples); the remaining target gap
+is back in ANS decoding and MA-tree lookup.
+
+All 1245 corpus outputs are byte-identical to the pre-SIMD executable,
+including the target's SHA-256. A separate `JXL_NO_AVX2` clang build matches
+the target as well. The full libjxl oracle remains `1245/1245 ok`, all 115
+ASan fuzz reproducers are clean, and the regenerated amalgamation compiles
+without warnings under clang and MSVC.
+
 ### AVX2 vertical inverse squeeze
 After the effort-one RLE fast path, the next stable target was
 `cvo9xd_keong_macan_grayscale.lm_d1.jxl`. A best-of-100 baseline measured
