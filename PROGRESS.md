@@ -79,13 +79,17 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep, including the 16-bit output packing below, measured
-20833.65ms against libjxl's 16333.30ms, **1.28x** overall. Our summed time
-fell another 31.25ms while the rounded ratio held. Stable 150-run timings put
-the remaining leaders at `hdr_room.m_e1` (1.77x), `flower.v_rs4` (1.75x),
-and `P3-sRGB-color-bars.v_icc` (1.74x). The preceding sweep, after the 2x
-upsampling work, measured 20864.90ms against libjxl's 16304.27ms, also
-**1.28x**; our summed time had fallen 384.91ms and
+The latest full sweep, including the 4x upsampling work below, measured
+20841.47ms against libjxl's 16312.48ms, **1.28x** overall. The five-run
+aggregate is statistically flat with the preceding sweep (+7.82ms, 0.04%)
+despite the controlled 73-file `v_rs4` set falling by 27-28ms. Stable
+high-run timings leave `hdr_room.m_e1` (1.77x) and
+`P3-sRGB-color-bars.v_icc` (1.74x) at the front; `flower.v_rs4` fell from
+1.77x to about 1.55x. The preceding sweep, after the 16-bit output packing,
+measured 20833.65ms against libjxl's 16333.30ms, also **1.28x**; our summed
+time had fallen 31.25ms. The sweep before that, after the 2x upsampling work,
+measured 20864.90ms against libjxl's 16304.27ms, also **1.28x**; our summed
+time had fallen 384.91ms and
 `colorful_chessboards.v_rs2` left the leading group. The sweep before that,
 after the prefix work, measured 21249.81ms against libjxl's 16540.57ms, also
 **1.28x**; its leaders were `hdr_room.m_e1` at 1.89x and
@@ -117,6 +121,37 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Share 4x upsampling taps by output row
+After the 16-bit output work, `flower.v_rs4` measured 34.64ms against
+libjxl's 19.62ms, **1.77x**. Its 120-run side-by-side winperf trace measured
+35.23ms against 21.86ms, **1.61x**, and put 32.0% of our decode in
+upsampling. `up_block8` alone took 5455 self samples, 18.2%, versus 4089,
+13.7%, for libjxl's corresponding AVX2 kernel.
+
+A 4x block has sixteen output positions, all using the same 25 input vectors.
+The general output-outer loops loaded those vectors separately for all
+sixteen filters and once more for min/max: 425 vector loads. The new
+specialization computes the four horizontal phases of one output row
+together, then moves to the next row. Folding min/max into the first row's
+tap walk reduces the block to 100 input loads without trying to keep all
+sixteen accumulators live. Every accumulator still sees taps 0 through 24 in
+the original order, with separate multiply and add operations.
+
+Alternating saved-executable timings, best of 300, reduced the target from
+33.74ms to **30.51-30.62ms**, about 9.3-9.6%. Across all 73 `v_rs4` files,
+30 runs each, our aggregate fell from 276.09ms to **248.53-249.06ms**,
+9.8-10.0%.
+
+The final 120-run profile measured 31.95ms against libjxl's 21.84ms,
+**1.46x**. `up_block8` fell from 5455 to 3749 self samples, **31.3%**, now
+slightly below libjxl's 3879 samples for its kernel. Combined samples fell
+from 29900 to 27714, 7.3%. The five-run full sweep remained **1.28x** and
+moved only 0.04%, within sweep noise.
+
+All 1245 corpus outputs are byte-identical to the pre-change executable, all
+115 ASan fuzz reproducers are clean, and the regenerated amalgamation
+compiles without warnings under clang and MSVC.
 
 ### Pack direct 16-bit RGB/RGBA output into 64-bit stores
 After the 2x upsampling work, `hdr_room.m_e1` was again the worst stable

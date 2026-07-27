@@ -194,7 +194,7 @@ static void up_block4(const float *const *srow, uint32_t x, uint32_t N,
 JXL_TARGET_AVX2
 static void up_block8(const float *const *srow, uint32_t x, uint32_t N,
                       const float *kernel, float *dst_rows[8], uint32_t ny) {
-    __m256 vlo, vhi;
+    __m256 vlo = _mm256_setzero_ps(), vhi = _mm256_setzero_ps();
     uint32_t oy, ox;
     int py, px;
 
@@ -277,7 +277,7 @@ static void up_block8(const float *const *srow, uint32_t x, uint32_t N,
         return;
     }
 
-    {
+    if (!(N == 4 && ny == 4)) {
         __m256 mn = _mm256_loadu_ps(srow[0] + x - 2), mx = mn;
         for (py = 0; py < 5; py++) {
             const float *r = srow[py] + x - 2;
@@ -289,6 +289,91 @@ static void up_block8(const float *const *srow, uint32_t x, uint32_t N,
         }
         vlo = mn;
         vhi = mx;
+    }
+
+    /* Four horizontal phases on one 4x output row share the same 25 input
+       vectors. Accumulate those phases together, reducing the filter loads
+       from 4 * 25 to 25 per output row without carrying all sixteen output
+       accumulators at once. */
+    if (N == 4 && ny == 4) {
+        __m256 mn = _mm256_setzero_ps(), mx = _mm256_setzero_ps();
+        for (oy = 0; oy < 4; oy++) {
+            const float *k0 = kernel + ((size_t)oy * 4 + 0) * 25;
+            const float *k1 = k0 + 25;
+            const float *k2 = k1 + 25;
+            const float *k3 = k2 + 25;
+            __m256 a0 = _mm256_setzero_ps();
+            __m256 a1 = _mm256_setzero_ps();
+            __m256 a2 = _mm256_setzero_ps();
+            __m256 a3 = _mm256_setzero_ps();
+            __m256 m;
+            int t = 0;
+
+            for (py = 0; py < 5; py++) {
+                const float *r = srow[py] + x - 2;
+                for (px = 0; px < 5; px++, t++) {
+                    __m256 v = _mm256_loadu_ps(r + px);
+                    if (oy == 0) {
+                        if (t == 0) {
+                            mn = v;
+                            mx = v;
+                        } else {
+                            mn = _mm256_min_ps(mn, v);
+                            mx = _mm256_max_ps(mx, v);
+                        }
+                    }
+                    a0 = _mm256_add_ps(a0,
+                        _mm256_mul_ps(v, _mm256_set1_ps(k0[t])));
+                    a1 = _mm256_add_ps(a1,
+                        _mm256_mul_ps(v, _mm256_set1_ps(k1[t])));
+                    a2 = _mm256_add_ps(a2,
+                        _mm256_mul_ps(v, _mm256_set1_ps(k2[t])));
+                    a3 = _mm256_add_ps(a3,
+                        _mm256_mul_ps(v, _mm256_set1_ps(k3[t])));
+                }
+            }
+            if (oy == 0) {
+                vlo = mn;
+                vhi = mx;
+            }
+
+#define JXL_UP_CLAMP(v)                                                     \
+            m = _mm256_cmp_ps((v), vlo, _CMP_LT_OQ);                       \
+            (v) = _mm256_or_ps(_mm256_and_ps(m, vlo),                      \
+                               _mm256_andnot_ps(m, (v)));                   \
+            m = _mm256_cmp_ps((v), vhi, _CMP_GT_OQ);                       \
+            (v) = _mm256_or_ps(_mm256_and_ps(m, vhi),                      \
+                               _mm256_andnot_ps(m, (v)))
+            JXL_UP_CLAMP(a0);
+            JXL_UP_CLAMP(a1);
+            JXL_UP_CLAMP(a2);
+            JXL_UP_CLAMP(a3);
+#undef JXL_UP_CLAMP
+
+            {
+                __m128 lo0 = _mm256_castps256_ps128(a0);
+                __m128 lo1 = _mm256_castps256_ps128(a1);
+                __m128 lo2 = _mm256_castps256_ps128(a2);
+                __m128 lo3 = _mm256_castps256_ps128(a3);
+                __m128 hi0 = _mm256_extractf128_ps(a0, 1);
+                __m128 hi1 = _mm256_extractf128_ps(a1, 1);
+                __m128 hi2 = _mm256_extractf128_ps(a2, 1);
+                __m128 hi3 = _mm256_extractf128_ps(a3, 1);
+                float *drow = dst_rows[oy];
+                _MM_TRANSPOSE4_PS(lo0, lo1, lo2, lo3);
+                _mm_storeu_ps(drow + x * 4, lo0);
+                _mm_storeu_ps(drow + x * 4 + 4, lo1);
+                _mm_storeu_ps(drow + x * 4 + 8, lo2);
+                _mm_storeu_ps(drow + x * 4 + 12, lo3);
+                _MM_TRANSPOSE4_PS(hi0, hi1, hi2, hi3);
+                _mm_storeu_ps(drow + (x + 4) * 4, hi0);
+                _mm_storeu_ps(drow + (x + 4) * 4 + 4, hi1);
+                _mm_storeu_ps(drow + (x + 4) * 4 + 8, hi2);
+                _mm_storeu_ps(drow + (x + 4) * 4 + 12, hi3);
+            }
+        }
+        _mm256_zeroupper();
+        return;
     }
 
     for (oy = 0; oy < ny; oy++) {
