@@ -17,7 +17,6 @@ void jxl_br_init(jxl_br *br, const uint8_t *data, size_t len) {
     br->byte_pos = 0;
     br->buf = 0;
     br->nbits = 0;
-    br->bits_read = 0;
     br->err = 0;
 }
 
@@ -26,10 +25,10 @@ void jxl_br_refill(jxl_br *br) {
         uint64_t bits;
         int read_bytes;
         const uint8_t *p = br->data + br->byte_pos;
-        bits = (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) |
-               ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32) |
-               ((uint64_t)p[5] << 40) | ((uint64_t)p[6] << 48) |
-               ((uint64_t)p[7] << 56);
+        memcpy(&bits, p, sizeof(bits));
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        bits = __builtin_bswap64(bits);
+#endif
         br->buf |= bits << br->nbits;
         read_bytes = (63 - br->nbits) >> 3;
         br->nbits |= 56;
@@ -50,21 +49,17 @@ void jxl_br_refill(jxl_br *br) {
 void jxl_br_skip(jxl_br *br, size_t n) {
     if ((size_t)br->nbits >= n) {
         br->nbits -= (int)n;
-        br->bits_read += n;
         br->buf >>= n;
         return;
     }
     n -= (size_t)br->nbits;
-    br->bits_read += (size_t)br->nbits;
     br->buf = 0;
     br->nbits = 0;
     if (n > (br->len - br->byte_pos) * 8) {
-        br->bits_read += (br->len - br->byte_pos) * 8;
         br->byte_pos = br->len;
         br->err = 1;
         return;
     }
-    br->bits_read += n;
     br->byte_pos += n / 8;
     n %= 8;
     jxl_br_refill(br);
@@ -151,7 +146,7 @@ uint32_t jxl_br_enum(jxl_br *br) {
 }
 
 void jxl_br_zero_pad_to_byte(jxl_br *br) {
-    size_t rem = br->bits_read & 7;
+    size_t rem = jxl_br_bits_read(br) & 7;
     if (rem == 0) return;
     if (jxl_br_read(br, (int)(8 - rem)) != 0) {
         br->err = 1;
@@ -159,7 +154,7 @@ void jxl_br_zero_pad_to_byte(jxl_br *br) {
 }
 
 size_t jxl_br_byte_pos(const jxl_br *br) {
-    return (br->bits_read + 7) / 8;
+    return (jxl_br_bits_read(br) + 7) / 8;
 }
 
 void jxl_br_seek_byte(jxl_br *br, size_t byte_off) {
@@ -170,5 +165,4 @@ void jxl_br_seek_byte(jxl_br *br, size_t byte_off) {
     br->byte_pos = byte_off;
     br->buf = 0;
     br->nbits = 0;
-    br->bits_read = byte_off * 8;
 }

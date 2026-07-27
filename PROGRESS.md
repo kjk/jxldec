@@ -62,7 +62,7 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.30x libjxl** (1.37x before the folded-predictor
+1245-file corpus we are **1.29x libjxl** (1.37x before the folded-predictor
 specialization below; 2.74x before the SIMD work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
@@ -79,13 +79,14 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep, including both inverse-squeeze kernels below, measured
-21868.50ms against libjxl's 16861.19ms, **1.30x** overall. Its worst stable
-ratio was `hdr_room.m_e1` at 12.06ms against 5.31ms, 2.27x; a 100-run
-finalist measured 11.24ms against 5.32ms, 2.11x. The preceding sweep measured
-21732.90ms against libjxl's 16524.88ms, **1.32x** overall. The sweep before
-that measured 22761.46ms against 16867.43ms, 1.35x, and its worst meaningful
-ratio was
+The latest full sweep, including the bit-reader work below, measured
+21020.73ms against libjxl's 16345.67ms, **1.29x** overall. Its worst stable
+ratio remains `hdr_room.m_e1`, now 10.22ms against 4.99ms, 2.05x. The
+preceding sweep measured 21868.50ms against libjxl's 16861.19ms, **1.30x**;
+that target was 12.06ms against 5.31ms, 2.27x, and a 100-run finalist measured
+11.24ms against 5.32ms, 2.11x. The sweep before that measured 21732.90ms
+against libjxl's 16524.88ms, **1.32x** overall. The earlier 1.35x sweep's
+worst meaningful ratio was
 `500px_cvo9xd_keong_macan_srgb8.m_e1` at 2.06x; a longer finalist run put it
 at 1.93x. The distance-one RLE work below reduced it to 1.79x, leaving
 `cvo9xd_keong_macan_grayscale.lm_d1` as the next stable candidate. A longer
@@ -106,6 +107,37 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Single-load bit refill and derived stream position
+After the gradient-RLE work, `hdr_room.m_e1` still measured 10.86-10.89ms
+against libjxl's roughly 5ms. Its profile put `jxl_br_refill` at 455 self
+samples, next to the prefix decoder. Inspecting MSVC's assembly explained
+why: the explicit little-endian expression compiled to eight byte loads and
+a chain of shifts and ORs rather than one unaligned load.
+
+The full-width refill now uses `memcpy`, which both MSVC and clang recognize
+as a single 64-bit load; a compile-time byte swap retains the same result on
+big-endian targets. That alone reduced the target to 10.47-10.52ms and
+removed `jxl_br_refill` from winperf's top-function list.
+
+The same assembly also exposed a load/add/store of `bits_read` for every
+consumed entropy symbol. That field was redundant: `byte_pos * 8 - nbits`
+is always the exact consumed position. Refill adds equal counts to pulled
+bytes and buffered bits, consume subtracts buffered bits, seek establishes
+the invariant with an empty buffer, and truncation empties the remaining
+buffer at the end. Deriving the position at the handful of callers removed
+the per-symbol memory traffic and reduced the target again to 9.90-9.96ms.
+Together the two changes are about **9%** faster than the committed baseline.
+
+A final 120-run side-by-side profile measured 10.42ms against libjxl's
+5.54ms, **1.88x**, with 8205 combined samples. The intermediate single-load
+profile measured 10.82ms against 5.33ms, 2.03x, with 8458 samples;
+`pfx_read` fell from 1403 to 1227 self samples after removing the counter.
+The full-corpus sweep improved from 1.30x to **1.29x**.
+
+All 1245 corpus outputs are byte-identical to the pre-change executable. All
+115 ASan fuzz reproducers are clean, and the regenerated amalgamation
+compiles without warnings under clang and MSVC.
 
 ### Cache effort-one RLE residuals and split predictor edges
 The `hdr_room.m_e1` finalist's 100-run side-by-side winperf trace measured

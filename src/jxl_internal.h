@@ -82,9 +82,14 @@ typedef struct {
     size_t byte_pos;       /* next byte to pull into buf                  */
     uint64_t buf;          /* bit buffer, LSB = next bit                  */
     int nbits;             /* valid bits in buf                           */
-    size_t bits_read;      /* bits consumed since jxl_br_init             */
     int err;               /* sticky: 1 once a read ran past the end      */
 } jxl_br;
+
+/* Bytes pulled into the buffer minus the bits still there. Keeping this
+   derived avoids a load/add/store on every entropy symbol. */
+static inline size_t jxl_br_bits_read(const jxl_br *br) {
+    return br->byte_pos * 8 - (size_t)br->nbits;
+}
 
 void jxl_br_init(jxl_br *br, const uint8_t *data, size_t len);
 void jxl_br_refill(jxl_br *br);
@@ -147,13 +152,11 @@ static JXL_INLINE_HINT void jxl_br_consume(jxl_br *br, int n) {
     if (br->nbits < n) {
         /* Ran off the end: report the failure and stop advancing. */
         br->err = 1;
-        br->bits_read += (size_t)br->nbits;
         br->buf = 0;
         br->nbits = 0;
         return;
     }
     br->nbits -= n;
-    br->bits_read += (size_t)n;
     br->buf >>= n;
 }
 

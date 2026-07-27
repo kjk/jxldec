@@ -450,7 +450,7 @@ int jxl_read_toc(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
     if (!toc->entries) goto done;
 
     /* sizes[] is in bitstream order; perm maps original index -> bitstream. */
-    acc = br->bits_read / 8;
+    acc = jxl_br_bits_read(br) / 8;
     toc->end_off = acc;
     if (permutated) {
         size_t *offs = (size_t *)jxl_calloc(ctx, entry_count, sizeof(size_t));

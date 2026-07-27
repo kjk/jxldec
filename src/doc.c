@@ -36,8 +36,8 @@ jxl_doc *jxl_doc_open(jxl_ctx *ctx, const uint8_t *data, size_t len) {
         JXL_ERR(ctx, "codestream: truncated headers");
         goto fail;
     }
-    doc->first_frame_bitpos = br.bits_read;
-    doc->first_frame_off = br.bits_read / 8;
+    doc->first_frame_bitpos = jxl_br_bits_read(&br);
+    doc->first_frame_off = doc->first_frame_bitpos / 8;
     return doc;
 
 fail:
