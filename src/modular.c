@@ -2124,6 +2124,26 @@ static const jxl_ma_leaf *ma_get_leaf(const jxl_ma_config *ma,
     return &f->u.leaf;
 }
 
+/* When the tree never tests a previous-channel property, all three property
+   indices in a packed entry address cache[]. Selecting this walker outside
+   the sample loop removes three range tests per entry. */
+static const jxl_ma_leaf *ma_get_leaf_local(const jxl_ma_config *ma,
+                                            const jxl_props *pr) {
+    const jxl_ma_flat *flat = ma->flat;
+    const jxl_ma_flat *f = flat;
+    while (f->property >= 0) {
+        uint32_t o0, o1;
+        int32_t v0 = pr->cache[f->property];
+        int32_t v1 = pr->cache[f->u.dec.prop1];
+        int32_t v2 = pr->cache[f->u.dec.prop2];
+        o0 = v0 > f->u.dec.split0 ? 0u : 1u;
+        o1 = o0 ? (v2 > f->u.dec.split2 ? 0u : 1u)
+                : (v1 > f->u.dec.split1 ? 0u : 1u);
+        f = &flat[f->u.dec.child + 2 * o0 + o1];
+    }
+    return &f->u.leaf;
+}
+
 /* True when the tree can ask for the self-correcting predictor or property
    15, the only cases where running it is needed. */
 /* Bitmask of the properties any decision node in the tree actually tests.
@@ -2390,7 +2410,9 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
             fixed = ma_get_leaf(cma, &ps, &pr0);
             if (fixed->predictor == JXL_PRED_SELF_CORRECTING) fixed = NULL;
         }
-        channel_need_sc = need_sc && !fixed;
+        channel_need_sc =
+            need_sc && !fixed &&
+            (!spec_ok || ma_needs_self_correcting(cma));
 
         if (max_prev) {
             /* Previously decoded channels with identical geometry, newest
@@ -2650,30 +2672,40 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
             }
         }
 
-        for (y = 0; y < ch->h; y++) {
-            int32_t *row = ch->data + (size_t)y * ch->stride;
-            for (x = 0; x < ch->w; x++) {
-                jxl_props pr;
-                const jxl_ma_leaf *leaf;
-                uint32_t token;
-                int32_t diff, value;
-
-                props_compute(&ps, &pr, (int32_t)ci, (int32_t)stream_idx);
-                leaf = ma_get_leaf(cma, &ps, &pr);
-                token = jxl_dec_read_clustered(dec, br, leaf->cluster, dist_multiplier);
-                diff = jxl_unpack_signed(token);
-                diff = (int32_t)((uint32_t)diff * leaf->multiplier +
-                                 (uint32_t)leaf->offset);
-                value = (int32_t)((uint32_t)diff +
-                                  (uint32_t)predict_sample(&ps, &pr, leaf->predictor));
-                row[x] = value;
-                pred_record(&ps, &pr, value);
-            }
-            if (br->err || dec->err) {
-                JXL_ERR(ctx, "modular: truncated stream %u", (unsigned)stream_idx);
-                goto done;
-            }
+#define JXL_GENERAL_LOOP(GET_LEAF)                                           \
+        for (y = 0; y < ch->h; y++) {                                        \
+            int32_t *row = ch->data + (size_t)y * ch->stride;                \
+            for (x = 0; x < ch->w; x++) {                                    \
+                jxl_props pr;                                                 \
+                const jxl_ma_leaf *leaf;                                      \
+                uint32_t token;                                               \
+                int32_t diff, value;                                          \
+                                                                              \
+                props_compute(&ps, &pr, (int32_t)ci, (int32_t)stream_idx);    \
+                leaf = (GET_LEAF);                                            \
+                token = jxl_dec_read_clustered(dec, br, leaf->cluster,        \
+                                               dist_multiplier);              \
+                diff = jxl_unpack_signed(token);                              \
+                diff = (int32_t)((uint32_t)diff * leaf->multiplier +          \
+                                 (uint32_t)leaf->offset);                      \
+                value = (int32_t)((uint32_t)diff +                            \
+                    (uint32_t)predict_sample(&ps, &pr, leaf->predictor));      \
+                row[x] = value;                                               \
+                pred_record(&ps, &pr, value);                                 \
+            }                                                                 \
+            if (br->err || dec->err) {                                        \
+                JXL_ERR(ctx, "modular: truncated stream %u",                  \
+                        (unsigned)stream_idx);                                 \
+                goto done;                                                    \
+            }                                                                 \
         }
+
+        if (max_prev == 0) {
+            JXL_GENERAL_LOOP(ma_get_leaf_local(cma, &pr))
+        } else {
+            JXL_GENERAL_LOOP(ma_get_leaf(cma, &ps, &pr))
+        }
+#undef JXL_GENERAL_LOOP
     }
 
     if (jxl_dec_finalize(dec) != 0) {

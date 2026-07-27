@@ -79,10 +79,19 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep, including the one-block HF coefficient specialization
-below, measured 20364.70ms against libjxl's 16235.96ms, **1.25x** overall.
-Its slowest files taking libjxl at least 5ms were `hdr_room.m_e1` at 1.76x,
-`P3-sRGB-color-bars.v_e3` at 1.75x and `flower_small.ga.v_prog` at 1.73x.
+The latest full sweep, including the folded-tree predictor and local-property
+walk below, measured 20192.10ms against libjxl's 16178.97ms, **1.25x**
+overall. Exact saved-executable A/B runs are cleaner than comparing those
+temperature-sensitive sweeps: all 73 `v_prog` files fell from 761.40ms to
+693.23ms (-9.0%), and all 73 `lm_d1` files fell from 1159.39ms to 1132.30ms
+(-2.3%). A controlled rerank leaves `colorful_chessboards.v_e3` and
+`splines.v_e3` at 1.64x as the leading files taking libjxl at least 5ms;
+the former leader `flower_small.ga.v_prog` is now 1.22x.
+The preceding full sweep, including the one-block HF coefficient
+specialization below, measured 20364.70ms against libjxl's 16235.96ms,
+**1.25x** overall. Its slowest files taking libjxl at least 5ms were
+`hdr_room.m_e1` at 1.76x, `P3-sRGB-color-bars.v_e3` at 1.75x and
+`flower_small.ga.v_prog` at 1.73x.
 The preceding full sweep, including the eight-wide RGB output below, measured
 20736.79ms against libjxl's 16454.36ms, **1.26x** overall. Our summed time
 fell 149.88ms from the preceding sweep while libjxl's column fell 93.98ms;
@@ -144,6 +153,45 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Use the folded tree's weighted-predictor requirement
+A controlled rerank selected `flower_small.ga.v_prog.jxl` at 20.17ms against
+libjxl's 11.51ms, 1.75x. Its 120-run side-by-side winperf profile put
+libjxl's `DecodeModularChannelMAANS` no-weighted-predictor loop first at 6572
+self samples. Our matching work instead split across `ma_get_leaf` (4574),
+`sc_predict` (4194), `ans_read_symbol` (2429), `jxl_modular_decode` (1441)
+and `sc_record` (1175).
+
+The mismatch was real. This tree globally uses the weighted predictor, but
+the existing per-channel fold removes channel/stream decisions and can also
+remove every branch that reads weighted-predictor property 15 or selects the
+self-correcting predictor. `channel_need_sc` still came from the original
+tree, so those folded channels allocated and cleared the predictor's five
+error rows and ran `sc_predict` plus `sc_record` for every sample anyway.
+The folded tree is now rescanned when, and only when, the original tree used
+weighted prediction. If its surviving nodes do not need it, predictor state
+and both per-sample operations are skipped. Trees that never used it take
+the old short-circuit path and pay no scan.
+
+The same profile also justified a specialization that was neutral on the
+single target but useful across lossless Modular: when no property reaches a
+previous channel, a dedicated walker indexes all three packed tests directly
+from the 16 local-property slots. The choice is outside the pixel loop, so it
+removes three range tests from every packed tree entry. Exact HEAD/current
+saved-executable runs measured:
+
+| set | before | after |
+|---|---:|---:|
+| `flower_small.ga.v_prog` | 19.59-20.00ms | **15.25-15.41ms** |
+| all 73 `v_prog` | 761.40ms | **693.23ms (-9.0%)** |
+| all 73 `lm_d1` | 1159.39ms | **1132.30ms (-2.3%)** |
+
+The final profile measured 15.93ms against libjxl's 12.37ms. `sc_predict`
+and `sc_record` disappeared from the hot list; the complete trace fell from
+35950 to 30214 samples. The full corpus sweep measured 20.192s against
+libjxl's 16.179s, **1.25x**. 1245/1245 oracle comparisons pass, all 115
+malformed-input reproducers are clean under ASan, and the distribution
+amalgamation compiles cleanly with clang and MSVC.
 
 ### Specialize the one-block HF coefficient loop
 A fresh default-output sweep measured 21.568s against libjxl's 17.093s,
