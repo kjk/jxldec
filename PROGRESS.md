@@ -62,7 +62,7 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.35x libjxl** (1.37x before the folded-predictor
+1245-file corpus we are **1.30x libjxl** (1.37x before the folded-predictor
 specialization below; 2.74x before the SIMD work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
@@ -79,9 +79,12 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep, including the vertical-squeeze work below, measured
-21732.90ms against libjxl's 16524.88ms, **1.32x** overall. The preceding
-sweep measured 22761.46ms against 16867.43ms, 1.35x, and its worst meaningful
+The latest full sweep, including both inverse-squeeze kernels below, measured
+21868.50ms against libjxl's 16861.19ms, **1.30x** overall. Its worst stable
+ratio was `hdr_room.m_e1` at 12.06ms against 5.31ms, 2.27x; a 100-run
+finalist measured 11.24ms against 5.32ms, 2.11x. The preceding sweep measured
+21732.90ms against libjxl's 16524.88ms, **1.32x** overall. The sweep before
+that measured 22761.46ms against 16867.43ms, 1.35x, and its worst meaningful
 ratio was
 `500px_cvo9xd_keong_macan_srgb8.m_e1` at 2.06x; a longer finalist run put it
 at 1.93x. The distance-one RLE work below reduced it to 1.79x, leaving
@@ -103,6 +106,37 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Cache effort-one RLE residuals and split predictor edges
+The `hdr_room.m_e1` finalist's 100-run side-by-side winperf trace measured
+11.62ms against libjxl's 5.23ms, **2.22x**. Our time was concentrated in
+`jxl_modular_decode` (1250 self samples), `read_uint` (1111), `pfx_read`
+(943), and `jxl_br_refill` (432); libjxl's complete corresponding
+`DecodeModularChannelMAANS<1>` took 1827.
+
+The distance-one fast path already carries the packed residual across an LZ
+run, but it unpacked that unchanged residual again for every repeated pixel.
+It also selected the north/west/northwest edge cases three times per sample.
+The loop now carries the unpacked residual as libjxl does, handles the first
+row and first column separately, and leaves the interior gradient loop free
+of those edge tests. Entropy state and gradient arithmetic are unchanged.
+
+Alternating saved-executable tests over five representative effort-one files,
+40 runs each, measured 318.42-322.48ms before and **311.02-311.79ms** after,
+a stable **2.3-3.3%** reduction. On `hdr_room.m_e1`, best-of-300 timings moved
+from 11.15ms to 10.63-10.90ms. A post-change profile measured 11.33ms against
+5.48ms, 2.07x; combined samples fell from 7360 to 7176 and
+`jxl_modular_decode` fell from 1250 to 1196 self samples.
+
+Fusing the prefix lookup and hybrid-uint extra-bit read into one buffer
+advance was also tested. It measured 10.92-11.18ms against 10.91-10.92ms for
+the separate reads, so it was discarded: avoiding a second shift did not
+repay the less selective refill behavior.
+
+All 1245 corpus outputs are byte-identical to the pre-change executable, so
+the existing `1245/1245` libjxl verdict is unchanged. All 115 ASan fuzz
+reproducers are clean, and the regenerated amalgamation compiles without
+warnings under clang and MSVC.
 
 ### AVX2 horizontal inverse squeeze
 After vertical squeeze was vectorized, the same profile left

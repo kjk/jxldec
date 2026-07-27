@@ -2273,6 +2273,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
     int spec_ok = 0;
     int rle1_fast;
     uint32_t rle1_value = 0, rle1_run = 0;
+    int32_t rle1_diff = 0;
     int rle1_have = 0;
     int rc = -1;
 
@@ -2498,29 +2499,55 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                    run to continue across channel boundaries exactly as the
                    entropy stream specifies. */
                 if (rle1_fast) {
-                    for (y = 0; y < ch->h; y++) {
-                        int32_t *row = ch->data + (size_t)y * ch->stride;
-                        const int32_t *rtop =
-                            y ? row - ch->stride : row;
-                        for (x = 0; x < ch->w; x++) {
-                            int32_t left =
-                                x ? row[x - 1] : (y ? rtop[0] : 0);
-                            int32_t top = y ? rtop[x] : left;
-                            int32_t topleft =
-                                (x && y) ? rtop[x - 1] : left;
-                            uint32_t token;
-                            int32_t diff;
+                    int32_t *row = ch->data;
+
+                    /* The gradient degenerates to west on the first row.
+                       Pull it and the first column out of the general loop
+                       so interior samples carry no x/y edge branches. */
+                    for (x = 0; x < ch->w; x++) {
+                        int32_t guess = x ? row[x - 1] : 0;
+                        if (rle1_run) {
+                            rle1_run--;
+                        } else {
+                            uint32_t token = jxl_dec_read_prefix_rle1(
+                                dec, br, cluster, &rle1_value, &rle1_run,
+                                &rle1_have);
+                            rle1_diff = jxl_unpack_signed(token);
+                        }
+                        row[x] = (int32_t)((uint32_t)rle1_diff +
+                                           (uint32_t)guess);
+                    }
+                    if (br->err || dec->err) {
+                        JXL_ERR(ctx, "modular: truncated stream %u",
+                                (unsigned)stream_idx);
+                        goto done;
+                    }
+                    for (y = 1; y < ch->h; y++) {
+                        const int32_t *rtop;
+                        row = ch->data + (size_t)y * ch->stride;
+                        rtop = row - ch->stride;
+                        if (rle1_run) {
+                            rle1_run--;
+                        } else {
+                            uint32_t token = jxl_dec_read_prefix_rle1(
+                                dec, br, cluster, &rle1_value, &rle1_run,
+                                &rle1_have);
+                            rle1_diff = jxl_unpack_signed(token);
+                        }
+                        row[0] = (int32_t)((uint32_t)rle1_diff +
+                                           (uint32_t)rtop[0]);
+                        for (x = 1; x < ch->w; x++) {
                             if (rle1_run) {
-                                token = rle1_value;
                                 rle1_run--;
                             } else {
-                                token = jxl_dec_read_prefix_rle1(
+                                uint32_t token = jxl_dec_read_prefix_rle1(
                                     dec, br, cluster, &rle1_value, &rle1_run,
                                     &rle1_have);
+                                rle1_diff = jxl_unpack_signed(token);
                             }
-                            diff = jxl_unpack_signed(token);
-                            row[x] = (int32_t)((uint32_t)diff +
-                                (uint32_t)grad_clamped(top, left, topleft));
+                            row[x] = (int32_t)((uint32_t)rle1_diff +
+                                (uint32_t)grad_clamped(
+                                    rtop[x], row[x - 1], rtop[x - 1]));
                         }
                         if (br->err || dec->err) {
                             JXL_ERR(ctx, "modular: truncated stream %u",
