@@ -79,11 +79,15 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep, including the prefix work below, measured 21249.81ms
-against libjxl's 16540.57ms, **1.28x** overall. Its worst stable ratio remains
-`hdr_room.m_e1`, now 9.25ms against 4.90ms, 1.89x, just ahead of
-`colorful_chessboards.v_rs2` at 1.86x. The preceding sweep, after the
-bit-reader work, measured 21020.73ms against libjxl's 16345.67ms, **1.29x**;
+The latest full sweep, including the 2x upsampling work below, measured
+20864.90ms against libjxl's 16304.27ms, **1.28x** overall. Our summed time
+fell another 384.91ms while the rounded ratio held. `colorful_chessboards.v_rs2`
+left the leading group; the worst stable ratios are now `hdr_room.m_e1` at
+1.86x and `flower.v_rs4` at 1.81x. The preceding sweep, after the prefix work,
+measured 21249.81ms against libjxl's 16540.57ms, also **1.28x**; its leaders
+were `hdr_room.m_e1` at 1.89x and `colorful_chessboards.v_rs2` at 1.86x. The
+sweep before that, after the bit-reader work, measured 21020.73ms against
+libjxl's 16345.67ms, **1.29x**;
 the target was 10.22ms against 4.99ms, 2.05x. The sweep before that measured
 21868.50ms against libjxl's 16861.19ms, **1.30x**;
 that target was 12.06ms against 5.31ms, 2.27x, and a 100-run finalist measured
@@ -110,6 +114,36 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Reuse 2x upsampling taps across all four outputs
+Once effort-one prefix decoding approached the VarDCT ratios,
+`colorful_chessboards.v_rs2` measured 12.62ms against libjxl's 6.82ms,
+**1.85x**. Its 180-run side-by-side winperf trace put 26.8% of our decode in
+upsampling and 20.5% in `up_block8` alone (3275 self samples), versus 8.1%
+for libjxl's corresponding AVX2 row kernel.
+
+The eight-wide kernel was load-bound for a structural reason. A 2x block has
+four output positions, all using the same 25 input vectors, but the
+output-outer loops loaded those vectors independently for every output and
+then a fifth time for min/max: 125 vector loads. The new 2x specialization
+walks the taps once, updates four side-by-side accumulators, and derives the
+clamp bounds from the same vectors. Each accumulator still sees taps 0
+through 24 in the original scalar order, so multiply/add rounding is
+unchanged.
+
+Alternating saved-executable timings, best of 300, reduced the target from
+12.39-12.47ms to **10.61-10.63ms**, about 15%. Across five representative
+2x-resampled files, 50 runs each, our aggregate fell from 142.24-143.86ms to
+**123.81-124.18ms**, a stable 13-14% reduction.
+
+The post-change 180-run profile measured 10.97ms against libjxl's 7.98ms,
+**1.37x**. `up_block8` fell from 3275 to 1946 self samples, **40.6%**, and
+combined samples fell from 15949 to 14630. The full sweep reduced our summed
+time by 384.91ms; the corpus ratio remains **1.28x** after rounding.
+
+All 1245 corpus outputs are byte-identical to the pre-change executable, all
+115 ASan fuzz reproducers are clean, and the regenerated amalgamation
+compiles without warnings under clang and MSVC.
 
 ### Zero-field hybrid uint and packed prefix entries
 After the bit-reader work, `hdr_room.m_e1` still spent almost all of its time

@@ -198,6 +198,85 @@ static void up_block8(const float *const *srow, uint32_t x, uint32_t N,
     uint32_t oy, ox;
     int py, px;
 
+    /* For 2x, all four output positions use the same 25 input vectors.
+       Keep their accumulators side by side and fold the clamp reduction into
+       that one tap walk: the general output-outer loop loads the inputs four
+       times for the filter and once more for min/max. Each accumulator still
+       sees taps 0..24 in exactly the scalar order. */
+    if (N == 2 && ny == 2) {
+        const float *k0 = kernel;
+        const float *k1 = kernel + 25;
+        const float *k2 = kernel + 50;
+        const float *k3 = kernel + 75;
+        __m256 a0 = _mm256_setzero_ps();
+        __m256 a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps();
+        __m256 a3 = _mm256_setzero_ps();
+        __m256 mn = _mm256_setzero_ps(), mx = _mm256_setzero_ps();
+        __m256 m;
+        int t = 0;
+
+        for (py = 0; py < 5; py++) {
+            const float *r = srow[py] + x - 2;
+            for (px = 0; px < 5; px++, t++) {
+                __m256 v = _mm256_loadu_ps(r + px);
+                if (t == 0) {
+                    mn = v;
+                    mx = v;
+                } else {
+                    mn = _mm256_min_ps(mn, v);
+                    mx = _mm256_max_ps(mx, v);
+                }
+                a0 = _mm256_add_ps(a0,
+                    _mm256_mul_ps(v, _mm256_set1_ps(k0[t])));
+                a1 = _mm256_add_ps(a1,
+                    _mm256_mul_ps(v, _mm256_set1_ps(k1[t])));
+                a2 = _mm256_add_ps(a2,
+                    _mm256_mul_ps(v, _mm256_set1_ps(k2[t])));
+                a3 = _mm256_add_ps(a3,
+                    _mm256_mul_ps(v, _mm256_set1_ps(k3[t])));
+            }
+        }
+
+#define JXL_UP_CLAMP(v)                                                     \
+        m = _mm256_cmp_ps((v), mn, _CMP_LT_OQ);                            \
+        (v) = _mm256_or_ps(_mm256_and_ps(m, mn),                           \
+                           _mm256_andnot_ps(m, (v)));                       \
+        m = _mm256_cmp_ps((v), mx, _CMP_GT_OQ);                            \
+        (v) = _mm256_or_ps(_mm256_and_ps(m, mx),                           \
+                           _mm256_andnot_ps(m, (v)))
+        JXL_UP_CLAMP(a0);
+        JXL_UP_CLAMP(a1);
+        JXL_UP_CLAMP(a2);
+        JXL_UP_CLAMP(a3);
+#undef JXL_UP_CLAMP
+
+        {
+            __m128 a0lo = _mm256_castps256_ps128(a0);
+            __m128 a1lo = _mm256_castps256_ps128(a1);
+            __m128 a0hi = _mm256_extractf128_ps(a0, 1);
+            __m128 a1hi = _mm256_extractf128_ps(a1, 1);
+            __m128 a2lo = _mm256_castps256_ps128(a2);
+            __m128 a3lo = _mm256_castps256_ps128(a3);
+            __m128 a2hi = _mm256_extractf128_ps(a2, 1);
+            __m128 a3hi = _mm256_extractf128_ps(a3, 1);
+            float *d0 = dst_rows[0];
+            float *d1 = dst_rows[1];
+            _mm_storeu_ps(d0 + x * 2, _mm_unpacklo_ps(a0lo, a1lo));
+            _mm_storeu_ps(d0 + x * 2 + 4, _mm_unpackhi_ps(a0lo, a1lo));
+            _mm_storeu_ps(d0 + (x + 4) * 2, _mm_unpacklo_ps(a0hi, a1hi));
+            _mm_storeu_ps(d0 + (x + 4) * 2 + 4,
+                          _mm_unpackhi_ps(a0hi, a1hi));
+            _mm_storeu_ps(d1 + x * 2, _mm_unpacklo_ps(a2lo, a3lo));
+            _mm_storeu_ps(d1 + x * 2 + 4, _mm_unpackhi_ps(a2lo, a3lo));
+            _mm_storeu_ps(d1 + (x + 4) * 2, _mm_unpacklo_ps(a2hi, a3hi));
+            _mm_storeu_ps(d1 + (x + 4) * 2 + 4,
+                          _mm_unpackhi_ps(a2hi, a3hi));
+        }
+        _mm256_zeroupper();
+        return;
+    }
+
     {
         __m256 mn = _mm256_loadu_ps(srow[0] + x - 2), mx = mn;
         for (py = 0; py < 5; py++) {
