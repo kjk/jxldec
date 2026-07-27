@@ -77,6 +77,7 @@ static uint32_t quantize(float v, uint32_t maxval) {
      (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
 #define JXL_RENDER_SSE2 1
 #include <emmintrin.h>
+#include <immintrin.h>
 
 /* Four samples through the exact logic of quantize() above. */
 static __m128i quantize4m(__m128 v, uint32_t maxval) {
@@ -167,6 +168,192 @@ static void pick_planes(const jxl_fimage *img, const jxl_image_metadata *meta,
     }
 }
 
+#ifdef JXL_RENDER_SSE2
+JXL_TARGET_AVX2
+static __m256i quantize8_255(const float *src) {
+    const __m256 vm = _mm256_set1_ps(255.0f);
+    const __m256 zero = _mm256_setzero_ps();
+    __m256 v = _mm256_loadu_ps(src);
+    __m256 s = _mm256_add_ps(_mm256_mul_ps(v, vm), _mm256_set1_ps(0.5f));
+    __m256i t = _mm256_cvttps_epi32(s);
+    __m256 pos = _mm256_cmp_ps(v, zero, _CMP_GT_OQ);
+    __m256 sat = _mm256_cmp_ps(s, vm, _CMP_GE_OQ);
+    __m256i mx = _mm256_set1_epi32(255);
+    t = _mm256_or_si256(_mm256_and_si256(_mm256_castps_si256(sat), mx),
+                        _mm256_andnot_si256(_mm256_castps_si256(sat), t));
+    return _mm256_and_si256(_mm256_castps_si256(pos), t);
+}
+
+/* Transpose eight rows of eight packed pixels. */
+JXL_TARGET_AVX2
+static void transpose8x8_i32(__m256i p[8]) {
+    __m256i t0 = _mm256_unpacklo_epi32(p[0], p[1]);
+    __m256i t1 = _mm256_unpackhi_epi32(p[0], p[1]);
+    __m256i t2 = _mm256_unpacklo_epi32(p[2], p[3]);
+    __m256i t3 = _mm256_unpackhi_epi32(p[2], p[3]);
+    __m256i t4 = _mm256_unpacklo_epi32(p[4], p[5]);
+    __m256i t5 = _mm256_unpackhi_epi32(p[4], p[5]);
+    __m256i t6 = _mm256_unpacklo_epi32(p[6], p[7]);
+    __m256i t7 = _mm256_unpackhi_epi32(p[6], p[7]);
+    __m256i u0 = _mm256_unpacklo_epi64(t0, t2);
+    __m256i u1 = _mm256_unpackhi_epi64(t0, t2);
+    __m256i u2 = _mm256_unpacklo_epi64(t1, t3);
+    __m256i u3 = _mm256_unpackhi_epi64(t1, t3);
+    __m256i u4 = _mm256_unpacklo_epi64(t4, t6);
+    __m256i u5 = _mm256_unpackhi_epi64(t4, t6);
+    __m256i u6 = _mm256_unpacklo_epi64(t5, t7);
+    __m256i u7 = _mm256_unpackhi_epi64(t5, t7);
+    p[0] = _mm256_permute2x128_si256(u0, u4, 0x20);
+    p[1] = _mm256_permute2x128_si256(u1, u5, 0x20);
+    p[2] = _mm256_permute2x128_si256(u2, u6, 0x20);
+    p[3] = _mm256_permute2x128_si256(u3, u7, 0x20);
+    p[4] = _mm256_permute2x128_si256(u0, u4, 0x31);
+    p[5] = _mm256_permute2x128_si256(u1, u5, 0x31);
+    p[6] = _mm256_permute2x128_si256(u2, u6, 0x31);
+    p[7] = _mm256_permute2x128_si256(u3, u7, 0x31);
+}
+
+JXL_TARGET_AVX2
+static void write_transposed_rgba8_avx2(const jxl_out_planes *op,
+                                        uint32_t orientation,
+                                        uint32_t sw, uint32_t sh,
+                                        uint8_t *dst, int stride) {
+    const uint32_t ow = sh, oh = sw;
+    const __m256i opaque = _mm256_set1_epi32(255);
+    const __m256i reverse = _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+    uint32_t by, bx;
+
+    for (by = 0; by < oh; by += 64) {
+        uint32_t ylim = JXL_MIN(by + 64, oh);
+        for (bx = 0; bx < ow; bx += 64) {
+            uint32_t xlim = JXL_MIN(bx + 64, ow);
+            uint32_t oy, ox;
+            for (oy = by; oy < ylim; oy += 8) {
+                uint32_t sx = (orientation == 7 || orientation == 8)
+                                  ? sw - oy - 8 : oy;
+                for (ox = bx; ox < xlim; ox += 8) {
+                    __m256i p[8];
+                    uint32_t i;
+                    for (i = 0; i < 8; i++) {
+                        uint32_t sy = (orientation == 6 || orientation == 7)
+                                          ? sh - 1 - ox - i : ox + i;
+                        const float *r = op->r->data +
+                                         (size_t)sy * op->r->stride + sx;
+                        const float *g = op->g->data +
+                                         (size_t)sy * op->g->stride + sx;
+                        const float *b = op->b->data +
+                                         (size_t)sy * op->b->stride + sx;
+                        __m256i qr = quantize8_255(r);
+                        __m256i qg = quantize8_255(g);
+                        __m256i qb = quantize8_255(b);
+                        __m256i qa = opaque;
+                        if (op->a) {
+                            const float *a = op->a->data +
+                                             (size_t)sy * op->a->stride + sx;
+                            qa = quantize8_255(a);
+                        }
+                        p[i] = _mm256_or_si256(
+                            _mm256_or_si256(qr, _mm256_slli_epi32(qg, 8)),
+                            _mm256_or_si256(_mm256_slli_epi32(qb, 16),
+                                            _mm256_slli_epi32(qa, 24)));
+                        if (orientation == 7 || orientation == 8)
+                            p[i] = _mm256_permutevar8x32_epi32(p[i], reverse);
+                    }
+                    transpose8x8_i32(p);
+                    for (i = 0; i < 8; i++) {
+                        _mm256_storeu_si256(
+                            (__m256i *)(dst + (size_t)(oy + i) * stride +
+                                        (size_t)ox * 4),
+                            p[i]);
+                    }
+                }
+            }
+        }
+    }
+    _mm256_zeroupper();
+}
+
+/* Orientations 5..8 transpose the image. Walking one output row at a time
+   gathers down four widely separated source rows for every vector, which is
+   particularly expensive for planar RGBA. Work in 64x64 tiles and transpose
+   four already-packed pixels at a time: all four source-plane loads and all
+   four output stores are contiguous, while the tile keeps both sides hot.
+   The AVX2 twin above applies the same layout eight pixels at a time. */
+static void write_transposed_rgba8(const jxl_out_planes *op,
+                                   uint32_t orientation,
+                                   uint32_t sw, uint32_t sh,
+                                   uint8_t *dst, int stride) {
+    const uint32_t ow = sh, oh = sw;
+    uint32_t by, bx;
+    const __m128i opaque = _mm_set1_epi32(255);
+
+    for (by = 0; by < oh; by += 64) {
+        uint32_t ylim = JXL_MIN(by + 64, oh);
+        for (bx = 0; bx < ow; bx += 64) {
+            uint32_t xlim = JXL_MIN(bx + 64, ow);
+            uint32_t oy, ox;
+            for (oy = by; oy < ylim; oy += 4) {
+                uint32_t sx = (orientation == 7 || orientation == 8)
+                                  ? sw - oy - 4 : oy;
+                for (ox = bx; ox < xlim; ox += 4) {
+                    __m128i p[4];
+                    uint32_t i;
+                    for (i = 0; i < 4; i++) {
+                        uint32_t sy = (orientation == 6 || orientation == 7)
+                                          ? sh - 1 - ox - i : ox + i;
+                        const float *r = op->r->data +
+                                         (size_t)sy * op->r->stride + sx;
+                        const float *g = op->g->data +
+                                         (size_t)sy * op->g->stride + sx;
+                        const float *b = op->b->data +
+                                         (size_t)sy * op->b->stride + sx;
+                        __m128i qr = quantize4v(r, 255);
+                        __m128i qg = quantize4v(g, 255);
+                        __m128i qb = quantize4v(b, 255);
+                        __m128i qa = opaque;
+                        if (op->a) {
+                            const float *a = op->a->data +
+                                             (size_t)sy * op->a->stride + sx;
+                            qa = quantize4v(a, 255);
+                        }
+                        p[i] = _mm_or_si128(
+                            _mm_or_si128(qr, _mm_slli_epi32(qg, 8)),
+                            _mm_or_si128(_mm_slli_epi32(qb, 16),
+                                         _mm_slli_epi32(qa, 24)));
+                        if (orientation == 7 || orientation == 8)
+                            p[i] = _mm_shuffle_epi32(
+                                p[i], _MM_SHUFFLE(0, 1, 2, 3));
+                    }
+                    {
+                        __m128 q0 = _mm_castsi128_ps(p[0]);
+                        __m128 q1 = _mm_castsi128_ps(p[1]);
+                        __m128 q2 = _mm_castsi128_ps(p[2]);
+                        __m128 q3 = _mm_castsi128_ps(p[3]);
+                        _MM_TRANSPOSE4_PS(q0, q1, q2, q3);
+                        _mm_storeu_si128(
+                            (__m128i *)(dst + (size_t)oy * stride +
+                                        (size_t)ox * 4),
+                            _mm_castps_si128(q0));
+                        _mm_storeu_si128(
+                            (__m128i *)(dst + (size_t)(oy + 1) * stride +
+                                        (size_t)ox * 4),
+                            _mm_castps_si128(q1));
+                        _mm_storeu_si128(
+                            (__m128i *)(dst + (size_t)(oy + 2) * stride +
+                                        (size_t)ox * 4),
+                            _mm_castps_si128(q2));
+                        _mm_storeu_si128(
+                            (__m128i *)(dst + (size_t)(oy + 3) * stride +
+                                        (size_t)ox * 4),
+                            _mm_castps_si128(q3));
+                    }
+                }
+            }
+        }
+    }
+}
+#endif
+
 static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
                         jxl_format fmt, uint8_t *dst, int stride) {
     const jxl_image_metadata *meta = &doc->meta;
@@ -212,6 +399,18 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
              (!op.a || plane_is_full(op.a, sw, sh));
     reverse_x = orientation == 2 || orientation == 3;
     transposed = orientation >= 5;
+
+#ifdef JXL_RENDER_SSE2
+    if (direct && transposed && !wide && !gray && !bgr && ncomp == 4 &&
+        (ow & 3u) == 0 && (oh & 3u) == 0) {
+        if (jxl_has_avx2() && (ow & 7u) == 0 && (oh & 7u) == 0) {
+            write_transposed_rgba8_avx2(&op, orientation, sw, sh, dst, stride);
+            return 0;
+        }
+        write_transposed_rgba8(&op, orientation, sw, sh, dst, stride);
+        return 0;
+    }
+#endif
 
     for (oy = 0; oy < oh; oy++) {
         uint8_t *row8 = dst + (size_t)oy * stride;

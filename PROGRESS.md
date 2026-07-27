@@ -79,11 +79,44 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The worst ratio among files that take libjxl more than 5ms is now
-`R2020-sRGB-blue.v_orient` at 2.04x; the former worst,
-`R2020-sRGB-blue.v_prog`, fell from 2.51x to 1.45x with the folded-predictor
-specialization below. Files below ~1ms sit at much larger ratios purely on
-fixed setup cost.
+The last full sweep's worst ratios among files that take libjxl more than 5ms
+are `flower.png.im_q85_gray.jpeg` and `P3-sRGB-color-bars.v_noise`, both at
+2.02x. The two Rec.2020 files that preceded them have since been reduced:
+`R2020-sRGB-blue.v_prog` fell from 2.51x to 1.45x with the folded-predictor
+specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
+the tiled transpose below. Files below ~1ms sit at much larger ratios purely
+on fixed setup cost.
+
+### Tiled SSE2/AVX2 transpose for oriented RGBA8 output
+A 100-run side-by-side winperf trace of `R2020-sRGB-blue.v_orient` measured
+32.99ms against libjxl's 16.96ms. `write_pixels` alone took 4540 self samples,
+**21.2%** of the combined trace: orientation 5 turns every output row into a
+source column, so the four-lane output kernel gathered R, G, B and A down four
+separate planar images with a full-row stride.
+
+The RGBA8 orientation 5..8 path now works in 64x64 cache tiles. Its SSE2
+kernel packs a 4x4 block from contiguous plane loads and transposes the packed
+pixels into four contiguous output stores; AVX2 does the same with an 8x8
+integer transpose. Qualifying dimensions use the wider runtime-selected
+kernel, while the existing gather path remains the fallback for other formats
+and dimensions.
+
+Best of 50:
+
+| file | before | tiled AVX2 |
+|---|---:|---:|
+| `R2020-sRGB-blue.v_orient`, ours | 31.86ms | **21.73ms** |
+| libjxl | 16.30ms | 16.17ms |
+| ratio | 1.95x | **1.34x** |
+
+The final winperf trace measured 22.87ms against 16.91ms. Combined samples
+fell from 21377 to 17159, while oriented output fell from 4540 self samples /
+21.2% to 560 / 3.3%. Across all 73 orientation corpus files, a separate
+best-of-ten sweep improved the aggregate ratio from about 1.50x to 1.41x.
+
+All 73 orientation outputs are byte-identical to a pre-change executable.
+The full libjxl oracle remains `1245/1245 ok`, all 115 fuzz reproducers are
+clean, and the amalgamation compiles without warnings under clang and MSVC.
 
 ### Specializing a weighted-predictor tree after channel folding
 The progressive Rec.2020 file's global MA tree has 121 nodes and reads the
