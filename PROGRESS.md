@@ -62,7 +62,8 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.37x libjxl** (2.74x before the SIMD work below;
+1245-file corpus we are **1.35x libjxl** (1.37x before the folded-predictor
+specialization below; 2.74x before the SIMD work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
 average up). libjxl is AVX2 throughout; our hot loops use runtime-selected
@@ -78,12 +79,45 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The worst ratio among files that take libjxl more than 5ms is
-`R2020-sRGB-blue.v_prog`; the `v_rs2` set follows, with an upsampling filter
-that is genuinely 25 taps per output sample. Modular is the strongest area.
-Files below ~1ms sit at much larger ratios purely on fixed setup cost.
+The worst ratio among files that take libjxl more than 5ms is now
+`R2020-sRGB-blue.v_orient` at 2.04x; the former worst,
+`R2020-sRGB-blue.v_prog`, fell from 2.51x to 1.45x with the folded-predictor
+specialization below. Files below ~1ms sit at much larger ratios purely on
+fixed setup cost.
 
-### Worst-ratio audit: the weighted predictor needs a larger specialization
+### Specializing a weighted-predictor tree after channel folding
+The progressive Rec.2020 file's global MA tree has 121 nodes and reads the
+weighted-predictor error, but specializing channel and stream-index properties
+collapses the large LF-group channels to a single non-self-correcting leaf.
+The fixed-leaf fast track was still guarded by the *global* tree's
+`need_sc`: those channels needlessly calculated and recorded five weighted
+errors per pixel even though their folded tree could no longer read one.
+
+The decoder now resolves a folded root leaf before allocating predictor state.
+If its predictor is not self-correcting, it uses the existing fixed-leaf loop
+and does not allocate, zero, predict or record weighted-error rows for that
+channel. A self-correcting leaf still takes the general path.
+
+Best of five over the full corpus:
+
+| measurement | before | after |
+|---|---:|---:|
+| `R2020-sRGB-blue.v_prog`, ours | 44.64ms | 24.82ms |
+| same file, ratio to libjxl | 2.51x | 1.45x |
+| all 1245 files, ours | 22714.87ms | 21876.16ms |
+| all 1245 files, ratio to libjxl | 1.37x | **1.35x** |
+
+A 100-run side-by-side winperf trace confirms that this is the intended work
+disappearing rather than a layout accident. Combined samples fell from 27848
+to 20552; `sc_predict` (5542 self samples) and `sc_record` (1310) disappeared
+from the report, and `jxl_modular_decode` self samples fell from 1689 to 455.
+The post-change trace measured 26.02ms against libjxl's 17.46ms.
+
+Correctness was checked byte-for-byte against a pre-branch executable on all
+1245 corpus files, then against libjxl (`1245/1245 ok`) and with all 115 fuzz
+reproducers. The amalgamation compiles cleanly under both clang and MSVC.
+
+### Worst-ratio audit that led to the folded-tree specialization
 The first stable 1.37x corpus sweep ranks `R2020-sRGB-blue.v_prog` as the
 slowest meaningful ratio (ignoring files where libjxl takes under 5ms):
 44.64ms against 17.76ms, **2.51x**. `flower_alpha.m_resp` remains the largest
@@ -117,9 +151,8 @@ error. Several plausible local changes were measured and rejected:
 
 All experiments were reverted. The row-storage prototype produced output
 byte-identical to the current decoder on the target before timing rejected
-it. The remaining gap is therefore unlikely to yield to another isolated
-instruction substitution; it needs the weighted predictor and its MA/entropy
-loop specialized together, as libjxl's templated decoder does.
+it. That audit led to the channel-folding specialization above; no arithmetic
+inside the weighted predictor had to change.
 
 ### Keeping the AVX2 sRGB power-table lookup in registers
 The post-EPF profile of `P3-sRGB-color-bars.v_d1` put `tf_srgb_x8` at 1350

@@ -1945,8 +1945,11 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
     for (ci = 0; ci < cl->n; ci++) {
         jxl_mchan *ch = &cl->chans[ci];
         const jxl_ma_config *cma;
+        const jxl_ma_leaf *fixed = NULL;
+        jxl_props pr0;
         uint32_t nprev = 0;
         uint32_t x, y;
+        int channel_need_sc;
 
         /* Last channel's specialised tree. Freeing here rather than at the
            end of the body means the tracks below can keep `continue`-ing out
@@ -1975,6 +1978,20 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
         }
         cma = spec_ok ? &spec : ma;
 
+        /* Folding can remove every dynamic property test from this channel
+           even when another branch of the original tree needed WP. Resolve
+           that leaf before allocating predictor state, so a non-WP leaf does
+           not pay to zero five error rows it will never read. */
+        memset(&pr0, 0, sizeof(pr0));
+        if (cma->flat[0].property < 0 ||
+            (!need_sc && !spec_ok && (props_mask & ~3u) == 0)) {
+            pr0.cache[0] = (int32_t)ci;
+            pr0.cache[1] = (int32_t)stream_idx;
+            fixed = ma_get_leaf(cma, &ps, &pr0);
+            if (fixed->predictor == JXL_PRED_SELF_CORRECTING) fixed = NULL;
+        }
+        channel_need_sc = need_sc && !fixed;
+
         if (max_prev) {
             /* Previously decoded channels with identical geometry, newest
                first -- what properties >= 16 address. */
@@ -1988,7 +2005,8 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
             }
         }
 
-        if (pred_state_reset(ctx, &ps, ch->w, need_sc ? &m->header.wp : NULL,
+        if (pred_state_reset(ctx, &ps, ch->w,
+                             channel_need_sc ? &m->header.wp : NULL,
                              prev, nprev) != 0)
             goto done;
 
@@ -1998,7 +2016,8 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
            the weighted predictor's state is sequential and both decoders have
            to do it -- but the tree walk and fifteen of the sixteen property
            slots drop out of the loop. */
-        if (wp_lut && (uint64_t)ch->w * ch->h >= 4 * JXL_WP_LUT_N) {
+        if (!fixed && wp_lut &&
+            (uint64_t)ch->w * ch->h >= 4 * JXL_WP_LUT_N) {
             jxl_props pr;
             uint32_t v;
             memset(&pr, 0, sizeof(pr));
@@ -2051,10 +2070,11 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
 
         /* Fast track: the leaf is the same for every sample in the channel,
            so resolve it once here instead of walking the tree a million
-           times. predict_sample only reads the property struct for the
-           self-correcting predictor, so with no weighted predictor in play
-           the whole per-sample property fill goes as well. libjxl
-           specialises the same way.
+           times. A folded tree whose root is already a leaf no longer needs
+           the weighted predictor even when some other channel's branch of
+           the original tree did: there is no decision left that can read its
+           error property. Only a self-correcting leaf itself still needs it.
+           libjxl specialises the same way.
 
            Once the constant tests have been folded out, "the tree only tests
            channel and stream index" is just "what is left is a single leaf",
@@ -2064,16 +2084,6 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
            The unspecialised condition stays for the channels too small to
            have been rebuilt. */
         {
-            jxl_props pr0;
-            const jxl_ma_leaf *fixed = NULL;
-            if (!need_sc && (spec_ok ? cma->flat[0].property < 0
-                                     : (props_mask & ~3u) == 0)) {
-                memset(&pr0, 0, sizeof(pr0));
-                pr0.cache[0] = (int32_t)ci;
-                pr0.cache[1] = (int32_t)stream_idx;
-                fixed = ma_get_leaf(cma, &ps, &pr0);
-                if (fixed->predictor == JXL_PRED_SELF_CORRECTING) fixed = NULL;
-            }
             if (fixed) {
                 uint32_t cluster = fixed->cluster;
                 uint32_t mult = fixed->multiplier;
