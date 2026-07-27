@@ -62,7 +62,7 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.26x libjxl** (1.37x before the folded-predictor
+1245-file corpus we are **1.25x libjxl** (1.37x before the folded-predictor
 specialization below; 2.74x before the SIMD work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
@@ -79,7 +79,11 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep, including the eight-wide RGB output below, measured
+The latest full sweep, including the one-block HF coefficient specialization
+below, measured 20364.70ms against libjxl's 16235.96ms, **1.25x** overall.
+Its slowest files taking libjxl at least 5ms were `hdr_room.m_e1` at 1.76x,
+`P3-sRGB-color-bars.v_e3` at 1.75x and `flower_small.ga.v_prog` at 1.73x.
+The preceding full sweep, including the eight-wide RGB output below, measured
 20736.79ms against libjxl's 16454.36ms, **1.26x** overall. Our summed time
 fell 149.88ms from the preceding sweep while libjxl's column fell 93.98ms;
 the ratio is unchanged after rounding, and the controlled target and
@@ -140,6 +144,45 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Specialize the one-block HF coefficient loop
+A fresh default-output sweep measured 21.568s against libjxl's 17.093s,
+1.26x. A controlled rerank initially selected `rgb-to-gbr-test.v_e3.jxl` at
+51.57ms against 31.71ms, but its side-by-side profile was the already-audited
+general Modular shape: `sc_predict`, the MA walk, ANS and `sc_record`.
+Unrolling `sc_record` and replacing its four-word copies with SSE2 were
+neutral under alternating runs and were reverted.
+
+The independent VarDCT gap was clearer on `flower.v_icc.jxl`. Its 220-run
+baseline measured 67.76ms against libjxl's 46.30ms. Our
+`jxl_write_hf_coeff` took 6775 self samples (6.4%) while libjxl selected a
+block-size-specific `DecodeACVarBlock` implementation. Our single generic
+loop instead recomputed the variable-block shifts and their bounds for every
+coefficient, even though the normal 8x8 case has exactly one block.
+
+One-block transforms now use a dedicated 63-coefficient loop. It preserves
+the same ANS reads, zero-density contexts, coefficient order and progressive
+integer accumulation, but folds `num_blocks_log` to zero. The coordinate
+transpose and output-plane base are resolved once per varblock/channel, and
+each adjacent `(dx,dy)` pair is loaded together. Larger transforms retain the
+generic loop unchanged.
+
+Alternating saved-executable timings reduced `flower.v_icc` from
+64.65-64.79ms to **63.51-63.78ms**, about 1.5-2.0%. Across all 73 `v_e3`
+files, our aggregate fell from 834.00-835.55ms to **832.49-833.36ms**;
+across 66 `v_icc` files it fell from 676.93-677.33ms to
+**675.80-675.95ms**. The post-change profile measured 65.72ms against
+libjxl's 46.00ms. `jxl_write_hf_coeff` fell from 6775 to **6351 self
+samples (-6.3%)**, and the complete trace fell from 105764 to
+**102330 samples (-3.2%)**.
+
+A final full sweep measured 20.365s against libjxl's 16.236s, **1.25x**.
+Two other profile-guided experiments were rejected: a min/max form of output
+quantization was neutral over alternating 400-run tests, and an eight-wide
+Gaborish plane kernel regressed the normalized ratio because that filter is
+bandwidth-bound. `bun cmd/tests.ts -all` is 1245/1245 and all 115 ASan fuzz
+reproducers are clean. The amalgamation compiles warning-free under clang and
+MSVC.
 
 ### Keep transposed BGRA32 in the tiled SIMD output path
 A fresh full BGRA sweep exposed four Rec.2020 orientation files as the

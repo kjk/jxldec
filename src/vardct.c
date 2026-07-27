@@ -936,7 +936,7 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
             uint32_t bw8, bh8, num_blocks, num_blocks_log, order_id;
             uint32_t lf_idx = 0, hf_idx = 0;
             int32_t qf;
-            int ci;
+            int ci, need_transpose;
 
             if (bi->dct_select >= JXL_TR_COUNT) continue;
             qf = bi->hf_mul;
@@ -944,6 +944,7 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
             num_blocks = bw8 * bh8;
             num_blocks_log = jxl_bitlen(num_blocks) - 1;
             order_id = (uint32_t)jxl_tr_order_id(bi->dct_select);
+            need_transpose = jxl_tr_need_transpose(bi->dct_select);
 
             if (p->lf_quant[0]) {
                 static const int order[3] = {0, 2, 1};
@@ -979,6 +980,8 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                 uint32_t dx8;
                 uint32_t is_prev_nonzero;
                 const uint16_t *ord;
+                int32_t *coeff_out = NULL;
+                size_t coeff_stride = 0;
                 uint32_t coeff_ctx_base;
                 uint32_t k;
 
@@ -1025,57 +1028,102 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                     ord = p->pass->order[order_id][cc];
                     if (!ord) ord = jxl_natural_order(ctx, p->no, (int)order_id);
                     if (!ord) goto done;
+                    coeff_stride = stride[cc];
+                    coeff_out = (int32_t *)out[cc] +
+                        (size_t)(sy * 8) * coeff_stride + sx * 8;
                 }
 
                 coeff_ctx_base = block_ctx * 458 + 37 * bc->num_block_clusters;
-                for (k = num_blocks; k < num_blocks * 64; k++) {
-                    uint32_t kk = k - num_blocks;
-                    uint32_t nzi = (non_zeros - 1) >> num_blocks_log;
-                    uint32_t fi = kk >> num_blocks_log;
-                    uint32_t coeff_ctx;
-                    uint32_t ucoeff;
-                    int32_t coeff;
-                    uint32_t dx, dy, px, py;
+                if (num_blocks == 1) {
+                    /* The overwhelmingly common 8x8 case. libjxl selects
+                       this shape at compile time; keeping it separate here
+                       likewise removes two variable shifts and their bounds
+                       checks from every coefficient. */
+                    for (k = 1; k < 64; k++) {
+                        uint32_t nzi = non_zeros - 1;
+                        uint32_t fi = k - 1;
+                        uint32_t coeff_ctx =
+                            (coeff_num_nonzero_context[nzi] +
+                             coeff_freq_context[fi]) * 2 + is_prev_nonzero;
+                        uint32_t ucoeff;
+                        int32_t coeff;
+                        uint32_t dx, dy, xy;
 
-                    if (nzi > 62 || fi > 62) {
-                        JXL_ERR(ctx, "vardct: coefficient context out of range");
-                        goto done;
-                    }
-                    coeff_ctx = (coeff_num_nonzero_context[nzi] +
-                                 coeff_freq_context[fi]) * 2 + is_prev_nonzero;
-                    if (coeff_ctx >= 458) {
-                        JXL_ERR(ctx, "vardct: too many zeros in varblock");
-                        goto done;
-                    }
-                    ucoeff = jxl_dec_read_clustered(
-                        dist, br,
-                        dist->clusters[cluster_base + coeff_ctx_base + coeff_ctx],
-                        0);
-                    if (ucoeff == 0) {
-                        is_prev_nonzero = 0;
-                        continue;
-                    }
-                    coeff = jxl_unpack_signed(ucoeff) << p->coeff_shift;
-                    if (!(p->discard_mask & (1u << cc))) {
-                        dx = ord[k * 2];
-                        dy = ord[k * 2 + 1];
-                        if (jxl_tr_need_transpose(bi->dct_select)) {
-                            uint32_t t = dx; dx = dy; dy = t;
+                        if (coeff_ctx >= 458) {
+                            JXL_ERR(ctx, "vardct: too many zeros in varblock");
+                            goto done;
                         }
-                        px = sx * 8 + dx;
-                        py = sy * 8 + dy;
-                        {
+                        ucoeff = jxl_dec_read_clustered(
+                            dist, br,
+                            dist->clusters[cluster_base + coeff_ctx_base +
+                                           coeff_ctx],
+                            0);
+                        if (ucoeff == 0) {
+                            is_prev_nonzero = 0;
+                            continue;
+                        }
+                        coeff = jxl_unpack_signed(ucoeff) << p->coeff_shift;
+                        if (ord) {
+                            memcpy(&xy, ord + k * 2, sizeof(xy));
+                            dx = xy & 0xffffu;
+                            dy = xy >> 16;
+                            if (need_transpose) {
+                                uint32_t t = dx; dx = dy; dy = t;
+                            }
+                            coeff_out[(size_t)dy * coeff_stride + dx] += coeff;
+                        }
+                        is_prev_nonzero = 1;
+                        non_zeros--;
+                        if (non_zeros == 0) break;
+                    }
+                } else {
+                    for (k = num_blocks; k < num_blocks * 64; k++) {
+                        uint32_t kk = k - num_blocks;
+                        uint32_t nzi = (non_zeros - 1) >> num_blocks_log;
+                        uint32_t fi = kk >> num_blocks_log;
+                        uint32_t coeff_ctx;
+                        uint32_t ucoeff;
+                        int32_t coeff;
+                        uint32_t dx, dy, xy;
+
+                        if (nzi > 62 || fi > 62) {
+                            JXL_ERR(ctx,
+                                    "vardct: coefficient context out of range");
+                            goto done;
+                        }
+                        coeff_ctx = (coeff_num_nonzero_context[nzi] +
+                                     coeff_freq_context[fi]) * 2 +
+                                    is_prev_nonzero;
+                        if (coeff_ctx >= 458) {
+                            JXL_ERR(ctx, "vardct: too many zeros in varblock");
+                            goto done;
+                        }
+                        ucoeff = jxl_dec_read_clustered(
+                            dist, br,
+                            dist->clusters[cluster_base + coeff_ctx_base +
+                                           coeff_ctx],
+                            0);
+                        if (ucoeff == 0) {
+                            is_prev_nonzero = 0;
+                            continue;
+                        }
+                        coeff = jxl_unpack_signed(ucoeff) << p->coeff_shift;
+                        if (ord) {
+                            memcpy(&xy, ord + k * 2, sizeof(xy));
+                            dx = xy & 0xffffu;
+                            dy = xy >> 16;
+                            if (need_transpose) {
+                                uint32_t t = dx; dx = dy; dy = t;
+                            }
                             /* Coefficients accumulate as integers, stored in
                                the float plane's bit pattern until
                                dequantization. */
-                            int32_t *slot = (int32_t *)&out[cc][
-                                (size_t)py * stride[cc] + px];
-                            *slot += coeff;
+                            coeff_out[(size_t)dy * coeff_stride + dx] += coeff;
                         }
+                        is_prev_nonzero = 1;
+                        non_zeros--;
+                        if (non_zeros == 0) break;
                     }
-                    is_prev_nonzero = 1;
-                    non_zeros--;
-                    if (non_zeros == 0) break;
                 }
                 if (br->err || dist->err) {
                     JXL_ERR(ctx, "vardct: truncated HF coefficients");
