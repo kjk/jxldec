@@ -184,6 +184,45 @@ static __m256i quantize8_255(const float *src) {
     return _mm256_and_si256(_mm256_castps_si256(pos), t);
 }
 
+/* Eight forward RGB(A) pixels. RGBA is already one packed dword per lane.
+   For RGB24, vpshufb removes the unused fourth byte independently in each
+   128-bit half, producing two 12-byte groups. Two overlapping 16-byte stores
+   write those groups; the next vector (or the existing four-pixel/scalar
+   tail) overwrites the four-byte overhang. */
+JXL_TARGET_AVX2
+static uint32_t write_rgb8_row_avx2(const float *r, const float *g,
+                                    const float *b, const float *a,
+                                    uint8_t *dst, uint32_t x, uint32_t w,
+                                    int ncomp) {
+    const __m256i opaque = _mm256_set1_epi32(255);
+    const __m256i rgb_shuffle = _mm256_setr_epi8(
+        0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1,
+        0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1);
+    uint32_t end = ncomp == 4 ? w : (w >= 8 ? w - 8 : 0);
+
+    for (; x + 8 <= end; x += 8) {
+        __m256i qr = quantize8_255(r + x);
+        __m256i qg = quantize8_255(g + x);
+        __m256i qb = quantize8_255(b + x);
+        __m256i packed = _mm256_or_si256(
+            _mm256_or_si256(qr, _mm256_slli_epi32(qg, 8)),
+            _mm256_slli_epi32(qb, 16));
+        if (ncomp == 4) {
+            __m256i qa = a ? quantize8_255(a + x) : opaque;
+            packed = _mm256_or_si256(packed, _mm256_slli_epi32(qa, 24));
+            _mm256_storeu_si256((__m256i *)(dst + (size_t)x * 4), packed);
+        } else {
+            __m256i rgb = _mm256_shuffle_epi8(packed, rgb_shuffle);
+            _mm_storeu_si128((__m128i *)(dst + (size_t)x * 3),
+                             _mm256_castsi256_si128(rgb));
+            _mm_storeu_si128((__m128i *)(dst + (size_t)x * 3 + 12),
+                             _mm256_extracti128_si256(rgb, 1));
+        }
+    }
+    _mm256_zeroupper();
+    return x;
+}
+
 /* Transpose eight rows of eight packed pixels. */
 JXL_TARGET_AVX2
 static void transpose8x8_i32(__m256i p[8]) {
@@ -365,6 +404,9 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
     int direct, reverse_x, transposed;
     uint32_t maxval;
     int bgr = ctx->bgr;
+#ifdef JXL_RENDER_SSE2
+    const int use_avx2 = jxl_has_avx2();
+#endif
 
     pick_planes(img, meta, &op);
     jxl_apply_orientation_dims(orientation, sw, sh, &ow, &oh);
@@ -403,7 +445,7 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
 #ifdef JXL_RENDER_SSE2
     if (direct && transposed && !wide && !gray && !bgr && ncomp == 4 &&
         (ow & 3u) == 0 && (oh & 3u) == 0) {
-        if (jxl_has_avx2() && (ow & 7u) == 0 && (oh & 7u) == 0) {
+        if (use_avx2 && (ow & 7u) == 0 && (oh & 7u) == 0) {
             write_transposed_rgba8_avx2(&op, orientation, sw, sh, dst, stride);
             return 0;
         }
@@ -466,6 +508,10 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
                 _mm_storeu_si128((__m128i *)(row8 + ox),
                                  _mm_packus_epi16(h0, h1));
             }
+        }
+        if (use_avx2 && direct && !wide && !gray && !bgr &&
+            !transposed && !reverse_x && (ncomp == 3 || ncomp == 4)) {
+            ox = write_rgb8_row_avx2(pr, pg, pb, pa, row8, ox, ow, ncomp);
         }
         /* The two common 8-bit RGB formats pack without any shuffling: each
            lane's three or four components are already 0..255 in separate

@@ -79,14 +79,21 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep, including the EPF row kernel below, measured
-20886.67ms against libjxl's 16548.34ms, **1.26x** overall. Both sides ran
-warmer than the preceding sweep, so the controlled 73-file `v_e3` result
-(1.5% less time in our decoder with libjxl flat) is the more useful
-comparison. The sweep's slowest files taking libjxl at least 5ms were
-`flower_small.ga.v_prog` at 1.75x, `P3-sRGB-color-bars.v_e3` at 1.74x and
-`splines.v_e3` at 1.73x. The preceding sweep, including the fixed DCT16
-leaves and AVX2 dequantization, measured 20838.95ms against libjxl's
+The latest full sweep, including the eight-wide RGB output below, measured
+20736.79ms against libjxl's 16454.36ms, **1.26x** overall. Our summed time
+fell 149.88ms from the preceding sweep while libjxl's column fell 93.98ms;
+the ratio is unchanged after rounding, and the controlled target and
+73-file results below are the cleaner comparison. Its slowest files taking
+libjxl at least 5ms were `P3-sRGB-color-bars.v_e3` and
+`flower_small.ga.v_prog`, both at 1.71x. The preceding sweep, including the
+EPF row kernel, measured 20886.67ms against libjxl's 16548.34ms, **1.26x**
+overall. Both sides ran warmer than the sweep before it, so its controlled
+73-file `v_e3` result (1.5% less time in our decoder with libjxl flat) is the
+more useful comparison. That sweep's slowest files taking libjxl at least
+5ms were `flower_small.ga.v_prog` at 1.75x,
+`P3-sRGB-color-bars.v_e3` at 1.74x and `splines.v_e3` at 1.73x. The sweep
+before that, including the fixed DCT16 leaves and AVX2 dequantization,
+measured 20838.95ms against libjxl's
 16403.28ms, **1.27x** overall. Its slowest files taking libjxl at least 5ms
 were `flower_small.ga.v_prog` at 1.76x and the color-bars effort/ICC
 variants at 1.74x; the controlled high-run target measurement reduced
@@ -133,6 +140,42 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Pack forward RGB24 and RGBA32 eight pixels at a time
+The post-EPF rerank put `flower_small.ga.v_prog` at 1.73x. Its 220-run
+side-by-side profile measured 20.70ms against libjxl's 12.12ms and was the
+already-audited general Modular shape: `ma_get_leaf`, `sc_predict`, the ANS
+read and `sc_record` dominate. The earlier threshold, fused-loop, row-storage,
+bit-scan and force-inline experiments cover that path, so it was left alone.
+
+The independent output gap remained on the RGB color-bars files. The
+committed profile had 658 self samples in `write_pixels` versus 316 in
+libjxl's write stage. Normal forward RGB24/RGBA32 output was still four-wide:
+eight RGB24 pixels took two SIMD quantization groups followed by eight
+overlapping scalar stores.
+
+The new AVX2 row kernel quantizes eight pixels from all planes together.
+RGBA32 is already eight packed 32-bit lanes and needs one 32-byte store.
+For RGB24, `vpshufb` removes the unused fourth byte in each 128-bit half,
+leaving two 12-byte groups; two overlapping 16-byte stores write them, and
+the next vector or existing tail overwrites the four-byte overhang. The
+runtime AVX2 check is now hoisted out of the row loop.
+
+Across `P3-sRGB-color-bars.v_e3` and `.v_icc`, alternating best-of-400
+timings reduced our total from 24.06ms to **23.40-23.66ms**, about
+1.7-2.7%; the in-process ratio moved from 1.70x to 1.68x. Across all 73
+`v_e3` files, 12 runs each, the aggregate ratio moved from 1.55x to
+**1.52-1.53x**, a 0.9-1.4% normalized reduction.
+
+The final 220-run target profile measured 12.23ms against libjxl's 7.89ms,
+**1.55x**. The `write_pixels` hot line fell from 658 to 322 samples,
+**51.1%**, and combined samples fell from 20290 to 19587, 3.5%. The
+five-run full sweep measured 20736.79ms against libjxl's 16454.36ms,
+**1.26x** overall.
+
+All 1245 corpus outputs are byte-identical to the pre-change executable, all
+115 ASan fuzz reproducers are clean, and the regenerated amalgamation
+compiles without warnings under clang and MSVC.
 
 ### Keep EPF pass 1 inside an AVX2 row kernel
 The stable rerank put `P3-sRGB-color-bars.v_e3` and `hdr_room.m_e1` at
