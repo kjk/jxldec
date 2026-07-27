@@ -412,6 +412,12 @@ uint32_t jxl_dec_read_mult(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx,
    tree stores cluster indices directly in its leaves). */
 uint32_t jxl_dec_read_clustered(jxl_dec *dec, jxl_br *br, uint32_t cluster,
                                 uint32_t dist_multiplier);
+/* Fast path for prefix-coded LZ77 streams whose distance histogram is the
+   constant one. The caller keeps the last value and remaining run, avoiding
+   the general 4 MB history window. */
+int jxl_dec_is_prefix_rle1(const jxl_dec *dec);
+uint32_t jxl_dec_read_prefix_rle1(jxl_dec *dec, jxl_br *br, uint32_t cluster,
+                                  uint32_t *last, uint32_t *run, int *have);
 int jxl_dec_finalize(jxl_dec *dec);
 
 int jxl_read_clusters(jxl_ctx *ctx, jxl_br *br, uint32_t num_dist,

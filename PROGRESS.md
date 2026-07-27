@@ -79,7 +79,12 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep's worst ratio among files that take libjxl more than 5ms
+The latest full sweep measured 22761.46ms against libjxl's 16867.43ms,
+**1.35x** overall. Its worst meaningful ratio was
+`500px_cvo9xd_keong_macan_srgb8.m_e1` at 2.06x; a longer finalist run put it
+at 1.93x. The distance-one RLE work below reduced it to 1.79x, leaving
+`cvo9xd_keong_macan_grayscale.lm_d1` at 1.92x as the next stable candidate.
+The preceding sweep's worst ratio among files that take libjxl more than 5ms
 was `flower.png.im_q85_gray.jpeg` at 2.14x. The grayscale JPEG work below
 reduced it to 1.70x. The next entry, `P3-sRGB-color-bars.v_noise`, was 2.00x
 in that sweep and is now 1.58x after the noise work below, leaving
@@ -94,6 +99,49 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Distance-one Modular RLE fast path
+A fresh best-of-five sweep over all 1245 files measured 22761.46ms against
+libjxl's 16867.43ms, **1.35x**, and moved the worst meaningful ratio to the
+effort-one Modular path. A best-of-50 finalist run measured
+`500px_cvo9xd_keong_macan_srgb8.m_e1.jxl` at 9.04ms against 4.70ms,
+**1.93x**. Its 100-run side-by-side winperf trace measured 9.28ms against
+4.87ms and split our work across `jxl_modular_decode` (1255 self samples),
+`read_uint` (865) and `pfx_read` (658). libjxl's complete
+`DecodeModularChannelMAANS<1>` took 1710 self samples.
+
+The file has exactly the stream shape covered by libjxl's
+`HuffRleOnly`/gradient fast track: the MA tree tests only the channel,
+every leaf is the identity gradient predictor, entropy coding is prefix
+based, and the LZ77 distance histogram is the constant value one. Repeats
+therefore need only the preceding residual and a remaining-run counter.
+The new guarded path carries those two values directly across rows and
+channels instead of sending every repeated residual through the generic
+4 MB LZ77 history window. Streams whose tree, predictor, transform, entropy
+mode or distance histogram differs still use the general decoder.
+
+Best release timings:
+
+| measurement | before | RLE1 fast path |
+|---|---:|---:|
+| ours | 9.04ms (50 runs) | **7.84ms** (100 runs) |
+| libjxl | 4.70ms | 4.39ms |
+| ratio | 1.93x | **1.79x** |
+
+That is a **13.3%** reduction in our decoder. The post-change 100-run trace
+measured 8.38ms against 4.85ms, **1.73x**; combined samples fell from 6107
+to 5741, and `jxl_modular_decode` fell from 1255 self samples to 1061.
+`pfx_read` and `read_uint` were essentially unchanged, confirming that the
+gain came from bypassing general LZ bookkeeping. Forcing those entropy
+helpers inline and skipping the fixed predictor's small scratch rows were
+both neutral in alternating saved-executable tests, so neither experiment
+was retained.
+
+All 73 `m_e1` corpus outputs are byte-identical to the pre-change
+executable, including the target's SHA-256. The full libjxl oracle remains
+`1245/1245 ok`; the clang/ASan fuzz harness builds without warnings and all
+115 reproducers are clean. The regenerated amalgamation also compiles
+without warnings under clang and MSVC.
 
 ### Direct eight-point SIMD DCT
 After the BT.709 work, a fresh best-of-50 baseline for

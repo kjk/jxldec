@@ -1014,6 +1014,46 @@ uint32_t jxl_dec_read(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx) {
     return jxl_dec_read_mult(dec, br, ctx_idx, 0);
 }
 
+int jxl_dec_is_prefix_rle1(const jxl_dec *dec) {
+    uint32_t cluster;
+    if (!dec->lz77_enabled || !dec->use_prefix || dec->num_dist == 0)
+        return 0;
+    cluster = dec->clusters[dec->num_dist - 1];
+    if (cluster >= dec->num_clusters) return 0;
+    return dec->pfx[cluster].single_symbol == 1 &&
+           dec->configs[cluster].split <= 1;
+}
+
+/* Read the next literal or begin a distance-one run. `run` counts repeats
+   remaining after the value returned for this sample, matching the state
+   kept by libjxl's HuffRleOnly fast path. */
+uint32_t jxl_dec_read_prefix_rle1(jxl_dec *dec, jxl_br *br, uint32_t cluster,
+                                  uint32_t *last, uint32_t *run, int *have) {
+    uint32_t token;
+    if (cluster >= dec->num_clusters) {
+        dec->err = 1;
+        return 0;
+    }
+    token = pfx_read(&dec->pfx[cluster], br);
+    if (token >= dec->min_symbol) {
+        uint32_t n;
+        if (!*have) {
+            dec->err = 1;
+            return 0;
+        }
+        n = read_uint(br, &dec->lz_len_conf, token - dec->min_symbol);
+        if (n > 0xffffffffu - dec->min_length) {
+            dec->err = 1;
+            return 0;
+        }
+        *run = n + dec->min_length - 1;
+    } else {
+        *last = read_uint(br, &dec->configs[cluster], token);
+        *have = 1;
+    }
+    return *last;
+}
+
 int jxl_dec_finalize(jxl_dec *dec) {
     if (dec->err) return -1;
     if (dec->use_prefix) return 0;

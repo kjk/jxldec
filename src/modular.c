@@ -1791,6 +1791,25 @@ static int ma_tests_const_props(const jxl_ma_config *ma) {
     return 0;
 }
 
+/* libjxl's HuffRleOnly shortcut shares one distance-one run across channels.
+   That is safe only when every channel is guaranteed to take a fixed,
+   identity gradient leaf after the channel/stream properties are folded. */
+static int ma_all_gradient_noop(const jxl_ma_config *ma) {
+    uint32_t i;
+    for (i = 0; i < ma->nraw; i++) {
+        const jxl_ma_node *n = &ma->raw[i];
+        if (n->property >= 0) {
+            if (n->property > 1) return 0;
+        } else {
+            const jxl_ma_leaf *leaf = &ma->leaves[n->child];
+            if (leaf->predictor != JXL_PRED_GRADIENT ||
+                leaf->offset != 0 || leaf->multiplier != 1)
+                return 0;
+        }
+    }
+    return 1;
+}
+
 /* The weighted-predictor error (property 15) is unbounded in principle, so a
    lookup table over it is only valid if clamping the index cannot change any
    decision. The walk tests `v > split`, so for a value above the range,
@@ -1876,6 +1895,9 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
     const jxl_ma_leaf **wp_lut = NULL;
     jxl_ma_config spec;
     int spec_ok = 0;
+    int rle1_fast;
+    uint32_t rle1_value = 0, rle1_run = 0;
+    int rle1_have = 0;
     int rc = -1;
 
     memset(&spec, 0, sizeof(spec));
@@ -1891,6 +1913,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
         if (cl->chans[i].w > dist_multiplier) dist_multiplier = cl->chans[i].w;
     }
     jxl_dec_begin(dec, br);
+    rle1_fast = jxl_dec_is_prefix_rle1(dec) && ma_all_gradient_noop(ma);
 
     memset(&ps, 0, sizeof(ps));
     need_sc = ma_needs_self_correcting(ma);
@@ -2089,6 +2112,48 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                 uint32_t mult = fixed->multiplier;
                 int32_t off = fixed->offset;
                 uint8_t predictor = fixed->predictor;
+
+                /* The fjxl effort-one stream is prefix-coded LZ77 with a
+                   constant distance of one. Its repeats are just runs of the
+                   preceding residual, so carrying that residual and the run
+                   count directly avoids allocating and touching the generic
+                   4 MB LZ window. The all-gradient/noop guard above ensures
+                   every channel in this stream reaches this loop, allowing a
+                   run to continue across channel boundaries exactly as the
+                   entropy stream specifies. */
+                if (rle1_fast) {
+                    for (y = 0; y < ch->h; y++) {
+                        int32_t *row = ch->data + (size_t)y * ch->stride;
+                        const int32_t *rtop =
+                            y ? row - ch->stride : row;
+                        for (x = 0; x < ch->w; x++) {
+                            int32_t left =
+                                x ? row[x - 1] : (y ? rtop[0] : 0);
+                            int32_t top = y ? rtop[x] : left;
+                            int32_t topleft =
+                                (x && y) ? rtop[x - 1] : left;
+                            uint32_t token;
+                            int32_t diff;
+                            if (rle1_run) {
+                                token = rle1_value;
+                                rle1_run--;
+                            } else {
+                                token = jxl_dec_read_prefix_rle1(
+                                    dec, br, cluster, &rle1_value, &rle1_run,
+                                    &rle1_have);
+                            }
+                            diff = jxl_unpack_signed(token);
+                            row[x] = (int32_t)((uint32_t)diff +
+                                (uint32_t)grad_clamped(top, left, topleft));
+                        }
+                        if (br->err || dec->err) {
+                            JXL_ERR(ctx, "modular: truncated stream %u",
+                                    (unsigned)stream_idx);
+                            goto done;
+                        }
+                    }
+                    continue;
+                }
 
 /* With the leaf fixed, what is left per sample is one entropy read and one
    predictor. Running that through predict_sample and pred_record costs a
