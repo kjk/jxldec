@@ -1109,9 +1109,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                               out->plane[2].data + (size_t)row * out->plane[2].stride,
                               rw, opsin, meta->opsin_bias,
                               meta->tone_mapping.intensity_target);
-        }
-        for (i = 0; i < 3; i++) {
-            for (row = 0; row < rows; row++) {
+            for (i = 0; i < 3; i++) {
                 jxl_linear_to_tf(out->plane[i].data +
                                      (size_t)row * out->plane[i].stride,
                                  rw, &meta->colour,

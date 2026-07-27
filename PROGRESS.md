@@ -62,8 +62,9 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.21x libjxl** (1.25x before the identity-WP and
-gradient-property specializations below; 1.37x before the folded-predictor
+1245-file corpus we are **1.16x libjxl** (1.21x before the small-error
+self-correcting-weight and max-error specializations below; 1.25x before the
+identity-WP and gradient-property specializations below; 1.37x before the folded-predictor
 specialization; 2.74x before the SIMD work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
@@ -80,9 +81,11 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep, including the identity-WP loop, reduced property
+The latest full sweep, including the self-correcting predictor work below,
+measured 19319.66ms against libjxl's 16651.20ms, **1.16x** overall.
+The preceding full sweep, including the identity-WP loop, reduced property
 builder and branchless packed-tree walk below, measured 20855.35ms against
-libjxl's 17197.58ms, **1.21x** overall. The preceding full sweep, including
+libjxl's 17197.58ms, **1.21x** overall. The sweep before that, including
 the folded-tree predictor and local-property walk below, measured 20192.10ms
 against libjxl's 16178.97ms, **1.25x**
 overall. Exact saved-executable A/B runs are cleaner than comparing those
@@ -157,6 +160,36 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Shorten self-correcting predictor dependencies
+`flower_alpha.m_e9` initially measured 1.12x in a 40-run side-by-side
+profile. Our `sc_predict` took 62997 samples, followed by ANS at 31017 and
+`sc_record` at 17295. For accumulated errors up to 62, the weight formula's
+log-derived shift is provably zero, so `sc_weight_one` now returns the
+identical table expression directly. The three-element absolute maximum in
+`sc_predict` is also written explicitly, removing the loop's select chain.
+
+Across all 219 effort-3/7/9 Modular files, the weight specialization reduced
+our summed time by 270-470ms in controlled saved-executable comparisons. On
+six representative `splines` and `flower_alpha` files, the explicit maximum
+reduced a further 1.3-2.3%. The post-change profile put `sc_predict` at 46478
+samples, down 26%. The full corpus moved from 1.21x to **1.16x**.
+
+The following alternatives were measured and reverted: extending the fixed
+weight ranges through error 254, caching no-edge predictor neighbours, merging
+the two default-WP branches, unrolling two packed-tree iterations, and growing
+the prefix root table from 8 to 10 bits.
+
+### Consume XYB rows while they are hot
+XYB-to-linear conversion used to finish all three image planes before the
+transfer-function pass reread them. The frame loop now applies the transfer
+function to each row immediately after conversion, preserving the exact
+per-sample arithmetic while keeping the newly written row cache-hot.
+
+Six representative VarDCT files pass the oracle with max difference one.
+Two alternating 12-run saved-executable comparisons measured 851-853ms for
+the interleaved loop against 861-866ms for the previous loop, a repeatable
+1-2% reduction on the set.
 
 ### Specialize identity weighted-predictor Modular trees
 A 24-run side-by-side profile of `splines.m_e3` measured 327.84ms against

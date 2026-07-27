@@ -560,6 +560,8 @@ static int32_t pred_ww(const jxl_pred_state *ps) {
    only so the four unrolled uses stay readable. */
 static JXL_INLINE_HINT uint32_t sc_weight_one(uint32_t err_sum, uint32_t wn,
                                               const uint32_t *dl) {
+    if (err_sum <= 62)
+        return 4 + wn * dl[err_sum + 1];
     uint64_t v = ((uint64_t)err_sum + 1) >> 5;
     uint32_t shift = v > 1 ? jxl_floor_log2_u64(v) : 0;
     uint32_t idx = (err_sum >> shift) + 1;
@@ -660,16 +662,16 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
     out->prediction = pred;
 
     {
-        /* Unrolled for the same reason as the weight lanes above: three
-           elements out of a stack array, compared against a running max. */
         int64_t max_error = te_w;
-        int64_t i;
-        for (i = 0; i < 3; i++) {
-            int64_t e = i == 0 ? te_n : (i == 1 ? te_nw : te_ne);
-            int64_t a = e < 0 ? -e : e;
-            int64_t b = max_error < 0 ? -max_error : max_error;
-            if (a > b) max_error = e;
-        }
+        int64_t a = te_n < 0 ? -te_n : te_n;
+        int64_t b = max_error < 0 ? -max_error : max_error;
+        if (a > b) max_error = te_n;
+        a = te_nw < 0 ? -te_nw : te_nw;
+        b = max_error < 0 ? -max_error : max_error;
+        if (a > b) max_error = te_nw;
+        a = te_ne < 0 ? -te_ne : te_ne;
+        b = max_error < 0 ? -max_error : max_error;
+        if (a > b) max_error = te_ne;
         out->max_error = (int32_t)max_error;
     }
 }
