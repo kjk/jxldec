@@ -83,6 +83,44 @@ The worst ratio among files that take libjxl more than 5ms is
 that is genuinely 25 taps per output sample. Modular is the strongest area.
 Files below ~1ms sit at much larger ratios purely on fixed setup cost.
 
+### Worst-ratio audit: the weighted predictor needs a larger specialization
+The first stable 1.37x corpus sweep ranks `R2020-sRGB-blue.v_prog` as the
+slowest meaningful ratio (ignoring files where libjxl takes under 5ms):
+44.64ms against 17.76ms, **2.51x**. `flower_alpha.m_resp` remains the largest
+absolute gap (+142.80ms), but at a much lower 1.39x ratio.
+
+A 100-run side-by-side winperf trace of the Rec.2020 file measured 45.04ms
+against 16.32ms. Its dominant difference is not color conversion:
+
+| function | self samples | combined share |
+|---|---:|---:|
+| our `sc_predict` | 5542 | 19.9% |
+| our `sc_record` | 1310 | 4.7% |
+| libjxl complete `DecodeModularChannelMAANS` | 477 | 1.7% |
+
+The progressive LF frames use a Modular tree driven by the weighted-predictor
+error. Several plausible local changes were measured and rejected:
+
+- Switching to libjxl-style padded two-row error storage removed
+  `sc_record` from the hot list, but raised `sc_predict` to 6186 samples and
+  `jxl_modular_decode` to 2593; total time regressed to 45.75ms.
+- Forcing predictor/update inlining lowered the caller's own samples, but
+  enlarged the hot loop. In alternating standalone runs, the compiler's
+  outlined version completed 100 decodes in 4.64--4.79s versus 4.84--5.01s
+  forced inline.
+- Keeping the maximum-error magnitude explicitly regressed 44.64ms to
+  46.96ms. Combining the two default-parameter branches was neutral
+  (45.23ms), meaning MSVC already folds that invariant effectively.
+- Replacing the five 64-bit bit scans with 32-bit scans also lost in paired
+  runs: the best-four mean for 50 decodes was 2.363s versus 2.317s for the
+  original.
+
+All experiments were reverted. The row-storage prototype produced output
+byte-identical to the current decoder on the target before timing rejected
+it. The remaining gap is therefore unlikely to yield to another isolated
+instruction substitution; it needs the weighted predictor and its MA/entropy
+loop specialized together, as libjxl's templated decoder does.
+
 ### Keeping the AVX2 sRGB power-table lookup in registers
 The post-EPF profile of `P3-sRGB-color-bars.v_d1` put `tf_srgb_x8` at 1350
 self samples, **6.7%** of the combined trace, while libjxl's equivalent
