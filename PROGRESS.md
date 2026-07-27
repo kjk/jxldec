@@ -79,15 +79,18 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep, including the 2x upsampling work below, measured
-20864.90ms against libjxl's 16304.27ms, **1.28x** overall. Our summed time
-fell another 384.91ms while the rounded ratio held. `colorful_chessboards.v_rs2`
-left the leading group; the worst stable ratios are now `hdr_room.m_e1` at
-1.86x and `flower.v_rs4` at 1.81x. The preceding sweep, after the prefix work,
-measured 21249.81ms against libjxl's 16540.57ms, also **1.28x**; its leaders
-were `hdr_room.m_e1` at 1.89x and `colorful_chessboards.v_rs2` at 1.86x. The
-sweep before that, after the bit-reader work, measured 21020.73ms against
-libjxl's 16345.67ms, **1.29x**;
+The latest full sweep, including the 16-bit output packing below, measured
+20833.65ms against libjxl's 16333.30ms, **1.28x** overall. Our summed time
+fell another 31.25ms while the rounded ratio held. Stable 150-run timings put
+the remaining leaders at `hdr_room.m_e1` (1.77x), `flower.v_rs4` (1.75x),
+and `P3-sRGB-color-bars.v_icc` (1.74x). The preceding sweep, after the 2x
+upsampling work, measured 20864.90ms against libjxl's 16304.27ms, also
+**1.28x**; our summed time had fallen 384.91ms and
+`colorful_chessboards.v_rs2` left the leading group. The sweep before that,
+after the prefix work, measured 21249.81ms against libjxl's 16540.57ms, also
+**1.28x**; its leaders were `hdr_room.m_e1` at 1.89x and
+`colorful_chessboards.v_rs2` at 1.86x. The sweep before that, after the
+bit-reader work, measured 21020.73ms against libjxl's 16345.67ms, **1.29x**;
 the target was 10.22ms against 4.99ms, 2.05x. The sweep before that measured
 21868.50ms against libjxl's 16861.19ms, **1.30x**;
 that target was 12.06ms against 5.31ms, 2.27x, and a 100-run finalist measured
@@ -114,6 +117,42 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Pack direct 16-bit RGB/RGBA output into 64-bit stores
+After the 2x upsampling work, `hdr_room.m_e1` was again the worst stable
+ratio: 9.16ms against libjxl's 5.14ms in a 150-run rerank. A 240-run
+side-by-side winperf trace measured 9.33ms against 5.08ms, **1.84x**. The
+prefix-coded gradient loop remained the main difference, but the independent
+`write_pixels` tail took 809 self samples, 5.3%, versus libjxl's AVX2
+8-bit output stage taking about 2%.
+
+Native output for this image is RGB48. Quantization was already four-wide,
+but the generic interleave wrote twelve separate 16-bit components for every
+four pixels. The new direct, forward-row path combines each pixel into one
+64-bit value. RGB48 stores six useful bytes and deliberately overlaps the
+first two bytes of the next pixel, which that pixel immediately overwrites;
+four scalar tail pixels keep the final overhang inside the row. RGBA64 fills
+all eight bytes without overlap.
+
+Alternating saved-executable timings, best of 300, reduced the target from
+8.97-9.04ms to **8.67-8.74ms**, about 3-4%. Across all 17 `hdr_room`
+variants, 50 runs each, our aggregate fell from 330.24ms to
+**323.14-323.22ms**, 2.1%.
+
+The post-change 240-run profile measured 8.92ms against libjxl's 5.18ms,
+**1.72x**. `write_pixels` fell from 809 to 442 self samples, **45.4%**, and
+combined samples fell from 15136 to 14702. The full sweep reduced our summed
+time another 31.25ms; the corpus ratio remains **1.28x** after rounding.
+
+Two entropy-loop experiments were rejected before taking this independent
+win. Forcing the shared `pfx_read` routine inline grew the hot decoder and
+regressed the target from about 9.0ms to 9.6ms. Consuming RLE residuals in
+branch-free spans added enough control flow to regress it to 9.4ms. Both were
+reverted.
+
+All 1245 corpus outputs are byte-identical to the pre-change executable, all
+115 ASan fuzz reproducers are clean, and the regenerated amalgamation
+compiles without warnings under clang and MSVC.
 
 ### Reuse 2x upsampling taps across all four outputs
 Once effort-one prefix decoding approached the VarDCT ratios,

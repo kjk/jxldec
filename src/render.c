@@ -515,6 +515,33 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
                 }
             }
         }
+        /* The same overlapping-store trick is particularly useful for
+           16-bit RGB: one 64-bit store writes all three components and two
+           bytes of the next pixel, which that pixel immediately overwrites.
+           RGBA64 fills the whole store without overlap. Keep four scalar
+           tail pixels for RGB48 so the final overhang cannot cross the row. */
+        if (direct && wide && !gray && !bgr && !transposed && !reverse_x &&
+            (ncomp == 3 || ncomp == 4)) {
+            uint32_t lim = ncomp == 4 ? ow : (ow >= 4 ? ow - 4 : 0);
+            for (; ox + 4 <= lim; ox += 4) {
+                uint32_t qr[4], qg[4], qb[4], qa[4], j;
+                quantize4(pr + ox, maxval, qr);
+                quantize4(pg + ox, maxval, qg);
+                quantize4(pb + ox, maxval, qb);
+                if (pa && ncomp == 4) quantize4(pa + ox, maxval, qa);
+                for (j = 0; j < 4; j++) {
+                    uint64_t packed = (uint64_t)qr[j] |
+                                      ((uint64_t)qg[j] << 16) |
+                                      ((uint64_t)qb[j] << 32);
+                    if (ncomp == 4) {
+                        uint32_t a = pa ? qa[j] : maxval;
+                        packed |= (uint64_t)a << 48;
+                    }
+                    memcpy(row8 + (size_t)(ox + j) * ncomp * 2,
+                           &packed, sizeof(packed));
+                }
+            }
+        }
         if (direct) {
             uint32_t qr[4], qg[4], qb[4], qa[4];
             for (; ox + 4 <= ow; ox += 4) {
