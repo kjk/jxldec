@@ -363,6 +363,78 @@ static __m128 fast_pow2f_x4(__m128 x) {
     return _mm_div_ps(_mm_mul_ps(num, ex), den);
 }
 
+JXL_TARGET_AVX2
+static __m256 fast_log2f_x8(__m256 x) {
+    const __m256 one = _mm256_set1_ps(1.0f);
+    __m256i xb = _mm256_castps_si256(x);
+    __m256i es = _mm256_srai_epi32(
+        _mm256_sub_epi32(xb, _mm256_set1_epi32(0x3f2aaaab)), 23);
+    __m256 m = _mm256_castsi256_ps(
+        _mm256_sub_epi32(xb, _mm256_slli_epi32(es, 23)));
+    __m256 t = _mm256_sub_ps(m, one);
+    __m256 yp = _mm256_add_ps(
+        _mm256_mul_ps(_mm256_set1_ps(7.4245873327820566E-01f), t),
+        _mm256_set1_ps(1.4287160470083755E+00f));
+    __m256 yq = _mm256_add_ps(
+        _mm256_mul_ps(_mm256_set1_ps(1.7409343003366853E-01f), t),
+        _mm256_set1_ps(1.0096718572241148E+00f));
+    yp = _mm256_add_ps(
+        _mm256_mul_ps(yp, t), _mm256_set1_ps(-1.8503833400518310E-06f));
+    yq = _mm256_add_ps(
+        _mm256_mul_ps(yq, t), _mm256_set1_ps(9.9032814277590719E-01f));
+    return _mm256_add_ps(_mm256_div_ps(yp, yq), _mm256_cvtepi32_ps(es));
+}
+
+JXL_TARGET_AVX2
+static __m256 fast_pow2f_x8(__m256 x) {
+    const __m256 one = _mm256_set1_ps(1.0f);
+    __m256 tf = _mm256_cvtepi32_ps(_mm256_cvttps_epi32(x));
+    __m256 fl = _mm256_sub_ps(
+        tf, _mm256_and_ps(_mm256_cmp_ps(x, tf, _CMP_LT_OQ), one));
+    __m256 ex = _mm256_castsi256_ps(_mm256_slli_epi32(
+        _mm256_add_epi32(_mm256_cvttps_epi32(fl), _mm256_set1_epi32(127)),
+        23));
+    __m256 frac = _mm256_sub_ps(x, fl);
+    __m256 num = _mm256_add_ps(frac, _mm256_set1_ps(1.01749063e+01f));
+    __m256 den = _mm256_sub_ps(
+        _mm256_mul_ps(frac, _mm256_set1_ps(2.10242958e-01f)),
+        _mm256_set1_ps(2.22328856e-02f));
+    num = _mm256_add_ps(
+        _mm256_mul_ps(num, frac), _mm256_set1_ps(4.88687798e+01f));
+    den = _mm256_sub_ps(
+        _mm256_mul_ps(den, frac), _mm256_set1_ps(1.94414990e+01f));
+    num = _mm256_add_ps(
+        _mm256_mul_ps(num, frac), _mm256_set1_ps(9.85506591e+01f));
+    den = _mm256_add_ps(
+        _mm256_mul_ps(den, frac), _mm256_set1_ps(9.85506633e+01f));
+    return _mm256_div_ps(_mm256_mul_ps(num, ex), den);
+}
+
+JXL_TARGET_AVX2
+static void tf_bt709_x8(float *v, size_t n, size_t *pos) {
+    const __m256 thresh = _mm256_set1_ps(0.018053968510807f);
+    const __m256 mul_low = _mm256_set1_ps(4.5f);
+    const __m256 mul_hi = _mm256_set1_ps(1.09929682680944f);
+    const __m256 sub = _mm256_set1_ps(0.09929682680944f);
+    const __m256 e = _mm256_set1_ps(0.45f);
+    size_t i = *pos;
+    for (; i + 8 <= n; i += 8) {
+        __m256 x = _mm256_loadu_ps(v + i);
+        __m256 low = _mm256_mul_ps(mul_low, x);
+        __m256 hi = _mm256_sub_ps(
+            _mm256_mul_ps(
+                mul_hi,
+                fast_pow2f_x8(_mm256_mul_ps(fast_log2f_x8(x), e))),
+            sub);
+        __m256 m = _mm256_cmp_ps(x, thresh, _CMP_LE_OQ);
+        _mm256_storeu_ps(
+            v + i, _mm256_or_ps(_mm256_and_ps(m, low),
+                                _mm256_andnot_ps(m, hi)));
+    }
+    _mm256_zeroupper();
+    *pos = i;
+}
+
 /* The lanes at or below the threshold take the linear leg, so the pow is
    computed for them too and thrown away -- it is a bitwise select, so a
    garbage or NaN lane cannot leak into the result. */
@@ -406,6 +478,7 @@ void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
         case JXL_TF_709:
             i = 0;
 #ifdef JXL_COLOR_SSE2
+            if (jxl_has_avx2()) tf_bt709_x8(v, n, &i);
             tf_bt709_x4(v, n, &i);
 #endif
             for (; i < n; i++) v[i] = tf_bt709(v[i]);

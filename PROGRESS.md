@@ -83,12 +83,49 @@ The latest full sweep's worst ratio among files that take libjxl more than 5ms
 was `flower.png.im_q85_gray.jpeg` at 2.14x. The grayscale JPEG work below
 reduced it to 1.70x. The next entry, `P3-sRGB-color-bars.v_noise`, was 2.00x
 in that sweep and is now 1.58x after the noise work below, leaving
-`P3-sRGB-color-bars.v_2020` at 1.98x as the next target. The two Rec.2020
-files that preceded them have also been reduced:
+`P3-sRGB-color-bars.v_2020` at 1.98x. The eight-wide BT.709 work below
+reduced that file to 1.62x; the next unchanged entry from the sweep is
+`P3-sRGB-color-bars.v_e3` at 1.89x. The two Rec.2020 files that preceded
+them have also been reduced:
 `R2020-sRGB-blue.v_prog` fell from 2.51x to 1.45x with the folded-predictor
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Eight-wide BT.709 transfer function
+After noise synthesis stopped dominating its preset, the next slowest
+meaningful file was `P3-sRGB-color-bars.v_2020.jxl`. A fresh best-of-50
+baseline measured 16.10ms against libjxl's 8.79ms, **1.83x**. Its 100-run
+side-by-side winperf trace measured 16.51ms against 10.15ms and put
+`jxl_linear_to_tf` at 1284 self samples / 10.8% of the entire combined
+trace. libjxl's complete eight-wide FromLinear stage occupied 7.4%
+inclusively.
+
+The existing BT.709 path evaluated libjxl's rational `FastLog2f` and
+`FastPow2f` approximations four lanes at a time. It now has an AVX2 twin:
+eight lanes perform the same integer range reduction, polynomial operations,
+floor correction and divisions in the same order, without FMA. SSE2 remains
+the fallback and handles the four-sample tail.
+
+Matched best of 50:
+
+| measurement | before | AVX2 |
+|---|---:|---:|
+| ours | 16.10ms | **14.90ms** |
+| libjxl | 8.79ms | 9.18ms |
+| ratio | 1.83x | **1.62x** |
+
+That is a **7.5%** reduction in our decoder. The post-change 100-run trace
+measured 14.92ms against 9.83ms. Combined samples fell from 11855 to 10840,
+and `jxl_linear_to_tf` fell from 1284 self samples / 10.8% to 654 / 6.0%.
+Inverse DCT is now the largest self-time function on the file; the remaining
+gap is distributed across DCT, EPF, entropy decoding and output.
+
+All 66 `v_2020` corpus outputs are byte-identical to the pre-change
+executable, including the target's SHA-256. A separate `JXL_NO_AVX2` build
+matches as well. The full libjxl oracle remains `1245/1245 ok`, all 115 fuzz
+reproducers are clean, and the amalgamation compiles without warnings under
+clang and MSVC.
 
 ### AVX2 noise synthesis and application
 After the grayscale JPEG optimization, the next slowest meaningful file was
