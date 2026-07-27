@@ -62,7 +62,7 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.40x libjxl** (2.74x before the SIMD work below;
+1245-file corpus we are **1.37x libjxl** (2.74x before the SIMD work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
 average up). libjxl is AVX2 throughout; our hot loops use runtime-selected
@@ -82,6 +82,44 @@ The worst ratio among files that take libjxl more than 5ms is
 `R2020-sRGB-blue.v_prog`; the `v_rs2` set follows, with an upsampling filter
 that is genuinely 25 taps per output sample. Modular is the strongest area.
 Files below ~1ms sit at much larger ratios purely on fixed setup cost.
+
+### Keeping the AVX2 sRGB power-table lookup in registers
+The post-EPF profile of `P3-sRGB-color-bars.v_d1` put `tf_srgb_x8` at 1350
+self samples, **6.7%** of the combined trace, while libjxl's equivalent
+`FromLinear` stage used 620 samples / 3.1%. The polynomial was already eight
+lanes wide, but its exponent-dependent 16-entry lookup spilled all eight
+indices to the stack, performed the lookups scalar, then rebuilt a vector.
+
+AVX2 byte shuffles cannot cross their 128-bit lane boundary, but a 16-byte
+table fits in either lane. Broadcasting each of the two byte tables and
+shuffling with an index in the low byte of every 32-bit lane performs the
+whole lookup in registers. The floating-point instructions and their order
+are unchanged.
+
+Best of 30:
+
+| file | scalar table lookup | byte shuffle |
+|---|---:|---:|
+| `P3-sRGB-color-bars.v_d1` | 14.46ms | **13.40ms** |
+| `flower.v_d1` | 79.33ms | **74.31ms** |
+| `flower.v_e3` | 76.99ms | **71.78ms** |
+| `flower.v_2020` | 86.45ms | **84.01ms** |
+| `R2020-sRGB-blue.v_prog` | 46.28ms | **43.77ms** |
+| total | 303.52ms | **287.27ms (-5.4%)** |
+
+In the follow-up side-by-side profile our complete transfer stage fell to
+675 self samples / **3.2%**, essentially level with libjxl's 658 / 3.1%.
+The first stable whole-corpus sweep after this and the preceding EPF handoff
+measured 22.715s against libjxl's 16.576s: **1.37x**, down from the last
+stable 23.025s / 1.40x sweep. That aggregate includes both changes because
+the EPF-only corpus sweeps were throttled; the focused table-lookup numbers
+above isolate this change.
+
+`-DJXL_COLOR_FORCE_SRGB_X4` restores the previous SSE2 lookup path while
+leaving the rest of color SIMD enabled. It and the AVX2 path produced
+byte-identical output on all 1245 corpus files. `bun cmd/tests.ts -all`:
+1245/1245 ok. All 115 fuzz reproducers clean; the amalgamation compiles
+cleanly with clang and MSVC.
 
 ### Handing the final EPF scratch plane over
 A fresh profile of `P3-sRGB-color-bars.v_d1` was broad: the already-vectorized

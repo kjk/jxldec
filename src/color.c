@@ -12,6 +12,8 @@
 
 /* SSE2 is baseline on x64. -DJXL_COLOR_FORCE_SCALAR builds the scalar path
    alone so the bit-identical claim can be diffed rather than asserted.
+   -DJXL_COLOR_FORCE_SRGB_X4 retains color SIMD but disables the AVX2 sRGB
+   kernel, allowing a direct output comparison with its SSE2 predecessor.
    Nothing here approximates anything the scalar code does not already
    approximate: tf_srgb is libjxl's polynomial-plus-table, not a powf, and
    the cbrt in the XYB inverse is already hoisted out of the loop. */
@@ -267,16 +269,22 @@ static void tf_srgb_x4(float *v, size_t n, size_t *pos) {
    equivalent stage at 2.2%, and the difference is width -- libjxl runs its
    render pipeline eight wide on AVX2.
 
-   The sixteen-entry power table is the one part that does not widen: SSE2 and
-   AVX2 both have to leave the vector to index it, so the eight indices are
-   spilled and read back as scalars. Everything either side of that is twice
-   as wide, and no FMA, so the result matches the four-lane path bit for bit. */
+   AVX2's byte shuffle is lane-local, so broadcast each 16-byte power table to
+   both halves. A shuffle mask keeps one table byte in the low byte of each
+   32-bit lane and zeros the other three, avoiding the scalar spill/rebuild
+   that the four-lane SSE2 path needs. No FMA is used, so the result still
+   matches that path bit for bit. */
 JXL_TARGET_AVX2
 static void tf_srgb_x8(float *v, size_t n, size_t *pos) {
     const __m256i signmask = _mm256_set1_epi32((int)0x80000000u);
     const __m256i absmask = _mm256_set1_epi32(0x7fffffff);
     const __m256i adj_or = _mm256_set1_epi32(0x3e800000);
     const __m256i adj_and = _mm256_set1_epi32(0x3effffff);
+    const __m256i shuffle_zero = _mm256_set1_epi32((int)0x80808000u);
+    const __m256i table_upper = _mm256_broadcastsi128_si256(
+        _mm_loadu_si128((const __m128i *)srgb_powtable_upper));
+    const __m256i table_lower = _mm256_broadcastsi128_si256(
+        _mm_loadu_si128((const __m128i *)srgb_powtable_lower));
     const __m256 k3 = _mm256_set1_ps(0.059914046f);
     const __m256 k2 = _mm256_set1_ps(-0.10889456f);
     const __m256 k1 = _mm256_set1_ps(0.107963754f);
@@ -295,23 +303,17 @@ static void tf_srgb_x8(float *v, size_t n, size_t *pos) {
         __m256i idx = _mm256_and_si256(
             _mm256_sub_epi32(_mm256_srli_epi32(vi, 23), _mm256_set1_epi32(118)),
             _mm256_set1_epi32(0xf));
-        int ix[8];
-        __m256i mul_bits;
+        __m256i shuffle, upper, lower, mul_bits;
         __m256 small, acc, out, m;
-        int j;
         pw = _mm256_add_ps(_mm256_mul_ps(pw, v_adj), k1);
         pw = _mm256_add_ps(_mm256_mul_ps(pw, v_adj), k0);
-        _mm256_storeu_si256((__m256i *)ix, idx);
-        /* Rebuilt in registers rather than written back and reloaded: eight
-           narrow stores followed by a 32-byte load of the same buffer cannot
-           store-forward, and that stall cost more than the extra width won. */
-        for (j = 0; j < 8; j++) {
-            ix[j] = (int)(0x40000000u |
-                    ((uint32_t)srgb_powtable_upper[ix[j] & 0xf] << 18) |
-                    ((uint32_t)srgb_powtable_lower[ix[j] & 0xf] << 10));
-        }
-        mul_bits = _mm256_setr_epi32(ix[0], ix[1], ix[2], ix[3],
-                                     ix[4], ix[5], ix[6], ix[7]);
+        shuffle = _mm256_or_si256(idx, shuffle_zero);
+        upper = _mm256_shuffle_epi8(table_upper, shuffle);
+        lower = _mm256_shuffle_epi8(table_lower, shuffle);
+        mul_bits = _mm256_or_si256(
+            _mm256_set1_epi32(0x40000000),
+            _mm256_or_si256(_mm256_slli_epi32(upper, 18),
+                            _mm256_slli_epi32(lower, 10)));
         small = _mm256_mul_ps(fv, c1292);
         acc = _mm256_sub_ps(_mm256_mul_ps(pw, _mm256_castsi256_ps(mul_bits)),
                             c055);
@@ -423,7 +425,9 @@ void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
         default:
             i = 0;
 #ifdef JXL_COLOR_SSE2
+#ifndef JXL_COLOR_FORCE_SRGB_X4
             if (jxl_has_avx2()) tf_srgb_x8(v, n, &i);
+#endif
             tf_srgb_x4(v, n, &i);
 #endif
             for (; i < n; i++) v[i] = tf_srgb(v[i]);
