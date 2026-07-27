@@ -515,10 +515,12 @@ typedef struct {
     jxl_ma_node *raw;
     uint32_t nraw, root;
     jxl_ma_leaf *leaves;
-    /* Cached WP-error lookup table, built lazily and only when no node tests
-       the channel or stream index -- then it is the same for every channel of
-       every stream, and its leaf pointers into `flat` stay valid. */
+    /* Cached WP-error lookup tables, built lazily and only when no node tests
+       the channel or stream index -- then they are the same for every channel
+       of every stream, and the leaf pointers into `flat` stay valid. The
+       compact cluster table is present only when all leaves use identity WP. */
     const jxl_ma_leaf **wp_lut;
+    uint8_t *wp_cluster_lut;
     jxl_dec dec;          /* histograms for the sample stream */
     int valid;
 } jxl_ma_config;

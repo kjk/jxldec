@@ -435,6 +435,8 @@ void jxl_ma_config_free(jxl_ctx *ctx, jxl_ma_config *ma) {
     ma->leaves = NULL;
     jxl_free(ctx, (void *)ma->wp_lut);
     ma->wp_lut = NULL;
+    jxl_free(ctx, ma->wp_cluster_lut);
+    ma->wp_cluster_lut = NULL;
     ma->nraw = 0;
     ma->root = 0;
     jxl_dec_free(&ma->dec);
@@ -503,14 +505,19 @@ static void pred_state_free(jxl_ctx *ctx, jxl_pred_state *ps) {
 }
 
 static int pred_state_reset(jxl_ctx *ctx, jxl_pred_state *ps, uint32_t width,
+                            int need_neighbor_rows,
                             const jxl_wp_header *wp,
                             const jxl_mchan **prev_chans, uint32_t nprev) {
     pred_state_free(ctx, ps);
 
     ps->width = width;
-    ps->prev_row = (int32_t *)jxl_calloc(ctx, width ? width : 1, sizeof(int32_t));
-    ps->curr_row = (int32_t *)jxl_calloc(ctx, width ? width : 1, sizeof(int32_t));
-    if (!ps->prev_row || !ps->curr_row) return -1;
+    if (need_neighbor_rows) {
+        ps->prev_row =
+            (int32_t *)jxl_calloc(ctx, width ? width : 1, sizeof(int32_t));
+        ps->curr_row =
+            (int32_t *)jxl_calloc(ctx, width ? width : 1, sizeof(int32_t));
+        if (!ps->prev_row || !ps->curr_row) return -1;
+    }
     ps->prev_chans = prev_chans;
     ps->nprev = nprev;
     if (wp) {
@@ -761,6 +768,32 @@ static void props_compute(const jxl_pred_state *ps, jxl_props *pr,
     pr->cache[12] = (int32_t)((uint32_t)ps->n - (uint32_t)pred_ne(ps));
     pr->cache[13] = (int32_t)((uint32_t)ps->n - (uint32_t)pred_nn(ps));
     pr->cache[14] = (int32_t)((uint32_t)ps->w - (uint32_t)pred_ww(ps));
+    pr->cache[15] = pr->sc.max_error;
+}
+
+/* Effort-7/9 Modular trees commonly retain only the four local-gradient
+   properties and the weighted-predictor error after channel folding. Avoid
+   materialising location, magnitude and the three unused neighbour deltas
+   when the tree mask proves they cannot be read. */
+static JXL_INLINE_HINT void
+props_compute_grad_wp(const jxl_pred_state *ps, jxl_props *pr,
+                      int32_t channel, int32_t stream_idx) {
+    int32_t ne = pred_ne(ps);
+    int32_t w_nw = (int32_t)((uint32_t)ps->w - (uint32_t)ps->nw);
+    if (ps->use_sc) {
+        sc_predict(&ps->sc, ps->n, ps->nw, ne, ps->w, pred_nn(ps), &pr->sc);
+        pr->has_sc = 1;
+    } else {
+        pr->has_sc = 0;
+        pr->sc.prediction = 0;
+        pr->sc.max_error = 0;
+    }
+    pr->cache[0] = channel;
+    pr->cache[1] = stream_idx;
+    pr->cache[9] = (int32_t)((uint32_t)w_nw + (uint32_t)ps->n);
+    pr->cache[10] = w_nw;
+    pr->cache[11] = (int32_t)((uint32_t)ps->nw - (uint32_t)ps->n);
+    pr->cache[12] = (int32_t)((uint32_t)ps->n - (uint32_t)ne);
     pr->cache[15] = pr->sc.max_error;
 }
 
@@ -1821,7 +1854,7 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
         for (c = 0; c < num_c; c++) {
             const jxl_wp_header *wp =
                 (tr->d_pred == JXL_PRED_SELF_CORRECTING) ? wp_header : NULL;
-            if (pred_state_reset(ctx, &ps, width, wp, NULL, 0) != 0) {
+            if (pred_state_reset(ctx, &ps, width, 1, wp, NULL, 0) != 0) {
                 pred_state_free(ctx, &ps);
                 goto done;
             }
@@ -2105,21 +2138,26 @@ static const jxl_ma_leaf *ma_get_leaf(const jxl_ma_config *ma,
     const jxl_ma_flat *flat = ma->flat;
     const jxl_ma_flat *f = flat;
     while (f->property >= 0) {
-        int32_t p0 = f->property, p1 = f->u.dec.prop1, p2 = f->u.dec.prop2;
+        int32_t prop0 = f->property;
+        int32_t prop1 = f->u.dec.prop1;
+        int32_t prop2 = f->u.dec.prop2;
         int32_t v0, v1, v2;
-        uint32_t o0, o1;
+        uint32_t p0, off0, off1;
 
         /* All three tests are read up front rather than picking the second
            one after the first has decided. The three loads are independent,
            so they issue together; selecting first would make the second
            address depend on the first result and serialise them. */
-        v0 = p0 < 16 ? pr->cache[p0] : props_get_extra(ps, (uint32_t)p0 - 16);
-        v1 = p1 < 16 ? pr->cache[p1] : props_get_extra(ps, (uint32_t)p1 - 16);
-        v2 = p2 < 16 ? pr->cache[p2] : props_get_extra(ps, (uint32_t)p2 - 16);
-        o0 = v0 > f->u.dec.split0 ? 0u : 1u;
-        o1 = o0 ? (v2 > f->u.dec.split2 ? 0u : 1u)
-                : (v1 > f->u.dec.split1 ? 0u : 1u);
-        f = &flat[f->u.dec.child + 2 * o0 + o1];
+        v0 = prop0 < 16 ? pr->cache[prop0]
+                        : props_get_extra(ps, (uint32_t)prop0 - 16);
+        v1 = prop1 < 16 ? pr->cache[prop1]
+                        : props_get_extra(ps, (uint32_t)prop1 - 16);
+        v2 = prop2 < 16 ? pr->cache[prop2]
+                        : props_get_extra(ps, (uint32_t)prop2 - 16);
+        p0 = v0 <= f->u.dec.split0;
+        off0 = v1 <= f->u.dec.split1;
+        off1 = 2u | (uint32_t)(v2 <= f->u.dec.split2);
+        f = &flat[f->u.dec.child + (p0 ? off1 : off0)];
     }
     return &f->u.leaf;
 }
@@ -2132,14 +2170,14 @@ static const jxl_ma_leaf *ma_get_leaf_local(const jxl_ma_config *ma,
     const jxl_ma_flat *flat = ma->flat;
     const jxl_ma_flat *f = flat;
     while (f->property >= 0) {
-        uint32_t o0, o1;
+        uint32_t p0, off0, off1;
         int32_t v0 = pr->cache[f->property];
         int32_t v1 = pr->cache[f->u.dec.prop1];
         int32_t v2 = pr->cache[f->u.dec.prop2];
-        o0 = v0 > f->u.dec.split0 ? 0u : 1u;
-        o1 = o0 ? (v2 > f->u.dec.split2 ? 0u : 1u)
-                : (v1 > f->u.dec.split1 ? 0u : 1u);
-        f = &flat[f->u.dec.child + 2 * o0 + o1];
+        p0 = v0 <= f->u.dec.split0;
+        off0 = v1 <= f->u.dec.split1;
+        off1 = 2u | (uint32_t)(v2 <= f->u.dec.split2);
+        f = &flat[f->u.dec.child + (p0 ? off1 : off0)];
     }
     return &f->u.leaf;
 }
@@ -2202,6 +2240,22 @@ static int ma_all_gradient_noop(const jxl_ma_config *ma) {
                 leaf->offset != 0 || leaf->multiplier != 1)
                 return 0;
         }
+    }
+    return 1;
+}
+
+/* libjxl's WP-only track also requires every leaf to use the weighted
+   predictor without transforming its residual. Once the constant channel and
+   stream decisions have been folded, checking the inline leaves establishes
+   the same invariant for this channel. */
+static int ma_all_wp_noop(const jxl_ma_config *ma) {
+    uint32_t i;
+    for (i = 0; i < ma->nflat; i++) {
+        const jxl_ma_flat *f = &ma->flat[i];
+        if (f->property >= 0) continue;
+        if (f->u.leaf.predictor != JXL_PRED_SELF_CORRECTING ||
+            f->u.leaf.offset != 0 || f->u.leaf.multiplier != 1)
+            return 0;
     }
     return 1;
 }
@@ -2289,6 +2343,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
     int wp_lut_ready = 0;   /* table contents already valid                 */
     int wp_lut_local = 0;   /* we allocated it and still own it             */
     const jxl_ma_leaf **wp_lut = NULL;
+    const uint8_t *wp_cluster_lut = NULL;
     jxl_ma_config spec;
     int spec_ok = 0;
     int rle1_fast;
@@ -2335,6 +2390,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
            cached table held would dangle. */
         if (!can_fold && ma->wp_lut) {
             wp_lut = ma->wp_lut;
+            wp_cluster_lut = ma->wp_cluster_lut;
             wp_lut_ready = 1;
         } else {
             wp_lut = (const jxl_ma_leaf **)jxl_calloc(ctx, JXL_WP_LUT_N,
@@ -2370,6 +2426,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
         uint32_t nprev = 0;
         uint32_t x, y;
         int channel_need_sc;
+        int wp_only_fast;
 
         /* Last channel's specialised tree. Freeing here rather than at the
            end of the body means the tracks below can keep `continue`-ing out
@@ -2413,6 +2470,10 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
         channel_need_sc =
             need_sc && !fixed &&
             (!spec_ok || ma_needs_self_correcting(cma));
+        wp_only_fast =
+            !fixed && wp_lut && !dec->lz77_enabled && ch->w > 8 &&
+            (uint64_t)ch->w * ch->h >= 4 * JXL_WP_LUT_N &&
+            ma_all_wp_noop(cma);
 
         if (max_prev) {
             /* Previously decoded channels with identical geometry, newest
@@ -2427,7 +2488,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
             }
         }
 
-        if (pred_state_reset(ctx, &ps, ch->w,
+        if (pred_state_reset(ctx, &ps, ch->w, !wp_only_fast,
                              channel_need_sc ? &m->header.wp : NULL,
                              prev, nprev) != 0)
             goto done;
@@ -2457,6 +2518,73 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                     wp_lut_local = 0;
                     wp_lut_ready = 1;
                 }
+            }
+            if (wp_only_fast) {
+                if (!can_fold && !wp_cluster_lut) {
+                    uint8_t *clusters =
+                        (uint8_t *)jxl_malloc(ctx, JXL_WP_LUT_N);
+                    if (clusters) {
+                        for (v = 0; v < JXL_WP_LUT_N; v++)
+                            clusters[v] = wp_lut[v]->cluster;
+                        ma->wp_cluster_lut = clusters;
+                        wp_cluster_lut = clusters;
+                    }
+                }
+#define JXL_DECODE_WP_SAMPLE(n_, nw_, ne_, w_, nn_) do {                   \
+                    jxl_sc_result pred;                                    \
+                    uint32_t token, lut_idx;                               \
+                    uint8_t cluster;                                       \
+                    int32_t value, me;                                     \
+                    sc_predict(&ps.sc, (n_), (nw_), (ne_), (w_), (nn_),    \
+                               &pred);                                     \
+                    me = pred.max_error;                                   \
+                    if (me < JXL_WP_LUT_LO) me = JXL_WP_LUT_LO;            \
+                    else if (me > JXL_WP_LUT_HI) me = JXL_WP_LUT_HI;       \
+                    lut_idx = (uint32_t)(me - JXL_WP_LUT_LO);              \
+                    cluster = wp_cluster_lut                               \
+                                  ? wp_cluster_lut[lut_idx]                 \
+                                  : wp_lut[lut_idx]->cluster;               \
+                    token = jxl_dec_read_clustered(dec, br, cluster,       \
+                                                   dist_multiplier);       \
+                    value = (int32_t)(                                     \
+                        (uint32_t)jxl_unpack_signed(token) +                \
+                        (uint32_t)(int32_t)((pred.prediction + 3) >> 3));   \
+                    row[x] = value;                                        \
+                    sc_record(&ps.sc, &pred, value);                       \
+                } while (0)
+                for (y = 0; y < ch->h; y++) {
+                    int32_t *row = ch->data + (size_t)y * ch->stride;
+                    if (y == 0) {
+                        for (x = 0; x < ch->w; x++) {
+                            int32_t left = x ? row[x - 1] : 0;
+                            JXL_DECODE_WP_SAMPLE(left, left, left, left, left);
+                        }
+                    } else {
+                        const int32_t *top =
+                            ch->data + (size_t)(y - 1) * ch->stride;
+                        const int32_t *toptop =
+                            y > 1 ? top - ch->stride : top;
+                        int32_t n = top[0];
+                        x = 0;
+                        JXL_DECODE_WP_SAMPLE(n, n, top[1], n, toptop[0]);
+                        for (x = 1; x + 1 < ch->w; x++) {
+                            JXL_DECODE_WP_SAMPLE(
+                                top[x], top[x - 1], top[x + 1], row[x - 1],
+                                toptop[x]);
+                        }
+                        x = ch->w - 1;
+                        n = top[x];
+                        JXL_DECODE_WP_SAMPLE(
+                            n, top[x - 1], n, row[x - 1], toptop[x]);
+                    }
+                    if (br->err || dec->err) {
+                        JXL_ERR(ctx, "modular: truncated stream %u",
+                                (unsigned)stream_idx);
+                        goto done;
+                    }
+                }
+#undef JXL_DECODE_WP_SAMPLE
+                continue;
             }
             pr.has_sc = 1;
             for (y = 0; y < ch->h; y++) {
@@ -2672,7 +2800,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
             }
         }
 
-#define JXL_GENERAL_LOOP(GET_LEAF)                                           \
+#define JXL_GENERAL_LOOP(GET_LEAF, COMPUTE_PROPS)                            \
         for (y = 0; y < ch->h; y++) {                                        \
             int32_t *row = ch->data + (size_t)y * ch->stride;                \
             for (x = 0; x < ch->w; x++) {                                    \
@@ -2681,7 +2809,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                 uint32_t token;                                               \
                 int32_t diff, value;                                          \
                                                                               \
-                props_compute(&ps, &pr, (int32_t)ci, (int32_t)stream_idx);    \
+                COMPUTE_PROPS;                                                \
                 leaf = (GET_LEAF);                                            \
                 token = jxl_dec_read_clustered(dec, br, leaf->cluster,        \
                                                dist_multiplier);              \
@@ -2701,9 +2829,21 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
         }
 
         if (max_prev == 0) {
-            JXL_GENERAL_LOOP(ma_get_leaf_local(cma, &pr))
+            if ((props_mask & ~0x9e03u) == 0) {
+                JXL_GENERAL_LOOP(
+                    ma_get_leaf_local(cma, &pr),
+                    props_compute_grad_wp(
+                        &ps, &pr, (int32_t)ci, (int32_t)stream_idx))
+            } else {
+                JXL_GENERAL_LOOP(
+                    ma_get_leaf_local(cma, &pr),
+                    props_compute(
+                        &ps, &pr, (int32_t)ci, (int32_t)stream_idx))
+            }
         } else {
-            JXL_GENERAL_LOOP(ma_get_leaf(cma, &ps, &pr))
+            JXL_GENERAL_LOOP(
+                ma_get_leaf(cma, &ps, &pr),
+                props_compute(&ps, &pr, (int32_t)ci, (int32_t)stream_idx))
         }
 #undef JXL_GENERAL_LOOP
     }

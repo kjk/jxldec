@@ -62,8 +62,9 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.25x libjxl** (1.37x before the folded-predictor
-specialization below; 2.74x before the SIMD work below;
+1245-file corpus we are **1.21x libjxl** (1.25x before the identity-WP and
+gradient-property specializations below; 1.37x before the folded-predictor
+specialization; 2.74x before the SIMD work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
 average up). libjxl is AVX2 throughout; our hot loops use runtime-selected
@@ -79,8 +80,11 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep, including the folded-tree predictor and local-property
-walk below, measured 20192.10ms against libjxl's 16178.97ms, **1.25x**
+The latest full sweep, including the identity-WP loop, reduced property
+builder and branchless packed-tree walk below, measured 20855.35ms against
+libjxl's 17197.58ms, **1.21x** overall. The preceding full sweep, including
+the folded-tree predictor and local-property walk below, measured 20192.10ms
+against libjxl's 16178.97ms, **1.25x**
 overall. Exact saved-executable A/B runs are cleaner than comparing those
 temperature-sensitive sweeps: all 73 `v_prog` files fell from 761.40ms to
 693.23ms (-9.0%), and all 73 `lm_d1` files fell from 1159.39ms to 1132.30ms
@@ -153,6 +157,51 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Specialize identity weighted-predictor Modular trees
+A 24-run side-by-side profile of `splines.m_e3` measured 327.84ms against
+libjxl's 249.83ms, 1.31x. libjxl spent 44687 self samples in its
+`DecodeModularChannelMAANS` specialization, while our equivalent work was
+split across `sc_predict` (31004), `sc_record` (9557),
+`jxl_modular_decode` (6159), `ans_read_symbol` (4560),
+`jxl_dec_read_clustered` (2558), `predict_sample` (1076) and
+`ma_get_leaf` (946).
+
+When every surviving leaf uses the self-correcting predictor with offset zero
+and multiplier one, and the stream does not use LZ77, decoding now takes a
+dedicated identity-WP loop. It reads neighbours directly from the completed
+output rows, so it avoids the generic predictor dispatch and two shadow row
+buffers. A lazily cached 16 KiB cluster table replaces the 128 KiB leaf-pointer
+table lookup in that loop. The generic effort-7 shape also gets a reduced
+property builder when its folded tree only reads the four local gradients and
+WP error, and both packed tree walkers evaluate their three independent
+comparisons before selecting the next node, matching libjxl's dependency
+shape.
+
+The final 20-run focused benchmark measured:
+
+| file | libjxl | jxldec | ratio |
+|---|---:|---:|---:|
+| `splines.m_e3` | 228.83ms | 279.57ms | 1.22x |
+| `flower.m_e3` | 267.37ms | 289.56ms | 1.08x |
+| `flower_alpha.m_e3` | 357.19ms | 386.80ms | 1.08x |
+| total | 853.40ms | **955.94ms** | **1.12x** |
+
+The same three-file total was 1050.74ms before this work. On the more general
+trees, repeated three-file aggregates measured effort 7 at 1420.93ms against
+1259.66ms (1.13x), and effort 9 at 1579.94ms against 1390.45ms (1.14x).
+The final `flower_alpha.m_e7` profile measured 711.07ms against 646.45ms,
+1.10x; its remaining large self-time buckets are the Modular loop,
+`sc_predict`, ANS and `sc_record`.
+
+Scoped inlining of the entropy read was neutral. Forcing private inline
+copies of `sc_predict` and `sc_record` into the WP loop regressed the focused
+total by 8.1%, so both were reverted. An eight-wide XYB inverse and a fused
+three-channel dequant/CfL loop also produced no saved-executable improvement
+and were reverted. The full corpus now measures 20.855s against libjxl's
+17.198s, **1.21x**. 1245/1245 oracle comparisons pass, all 115 malformed-input
+reproducers are clean under ASan, and the distribution amalgamation compiles
+cleanly with clang and MSVC.
 
 ### Use the folded tree's weighted-predictor requirement
 A controlled rerank selected `flower_small.ga.v_prog.jxl` at 20.17ms against
