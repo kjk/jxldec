@@ -267,6 +267,40 @@ static void dct_1d_v4(__m128 *io, int n, __m128 *scratch, int inverse) {
         for (i = 0; i < 4; i++) io[i] = out[i];
         return;
     }
+    if (n == 8) {
+        __m128 in0[4], in1[4], out0[4], out1[4];
+        if (!inverse) {
+            for (i = 0; i < 4; i++) {
+                in0[i] = _mm_mul_ps(_mm_add_ps(io[i], io[7 - i]), half_v);
+                in1[i] = _mm_mul_ps(
+                    _mm_mul_ps(_mm_sub_ps(io[i], io[7 - i]),
+                               _mm_set1_ps(sec_half_8[i])),
+                    half_v);
+            }
+            dct4_v4(in0, out0, 0);
+            dct4_v4(in1, out1, 0);
+            for (i = 0; i < 4; i++) io[i * 2] = out0[i];
+            out1[0] = _mm_mul_ps(out1[0], sqrt2);
+            for (i = 0; i < 3; i++)
+                io[i * 2 + 1] = _mm_add_ps(out1[i], out1[i + 1]);
+            io[7] = out1[3];
+        } else {
+            in0[0] = io[0]; in0[1] = io[2];
+            in0[2] = io[4]; in0[3] = io[6];
+            in1[0] = _mm_mul_ps(io[1], sqrt2);
+            in1[1] = _mm_add_ps(io[3], io[1]);
+            in1[2] = _mm_add_ps(io[5], io[3]);
+            in1[3] = _mm_add_ps(io[7], io[5]);
+            dct4_v4(in0, out0, 1);
+            dct4_v4(in1, out1, 1);
+            for (i = 0; i < 4; i++) {
+                __m128 r = _mm_mul_ps(out1[i], _mm_set1_ps(sec_half_8[i]));
+                io[i] = _mm_add_ps(out0[i], r);
+                io[7 - i] = _mm_sub_ps(out0[i], r);
+            }
+        }
+        return;
+    }
     {
         const float *sec = sec_half(n);
         int hn = n / 2;
@@ -365,6 +399,42 @@ static void dct_1d_v8(__m256 *io, int n, __m256 *scratch, int inverse) {
         for (i = 0; i < 4; i++) in[i] = io[i];
         dct4_v8(in, out, inverse);
         for (i = 0; i < 4; i++) io[i] = out[i];
+        return;
+    }
+    if (n == 8) {
+        __m256 in0[4], in1[4], out0[4], out1[4];
+        if (!inverse) {
+            for (i = 0; i < 4; i++) {
+                in0[i] = _mm256_mul_ps(
+                    _mm256_add_ps(io[i], io[7 - i]), half_v);
+                in1[i] = _mm256_mul_ps(
+                    _mm256_mul_ps(_mm256_sub_ps(io[i], io[7 - i]),
+                                  _mm256_set1_ps(sec_half_8[i])),
+                    half_v);
+            }
+            dct4_v8(in0, out0, 0);
+            dct4_v8(in1, out1, 0);
+            for (i = 0; i < 4; i++) io[i * 2] = out0[i];
+            out1[0] = _mm256_mul_ps(out1[0], sqrt2);
+            for (i = 0; i < 3; i++)
+                io[i * 2 + 1] = _mm256_add_ps(out1[i], out1[i + 1]);
+            io[7] = out1[3];
+        } else {
+            in0[0] = io[0]; in0[1] = io[2];
+            in0[2] = io[4]; in0[3] = io[6];
+            in1[0] = _mm256_mul_ps(io[1], sqrt2);
+            in1[1] = _mm256_add_ps(io[3], io[1]);
+            in1[2] = _mm256_add_ps(io[5], io[3]);
+            in1[3] = _mm256_add_ps(io[7], io[5]);
+            dct4_v8(in0, out0, 1);
+            dct4_v8(in1, out1, 1);
+            for (i = 0; i < 4; i++) {
+                __m256 r = _mm256_mul_ps(
+                    out1[i], _mm256_set1_ps(sec_half_8[i]));
+                io[i] = _mm256_add_ps(out0[i], r);
+                io[7 - i] = _mm256_sub_ps(out0[i], r);
+            }
+        }
         return;
     }
     {

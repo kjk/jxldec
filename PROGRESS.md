@@ -85,12 +85,52 @@ reduced it to 1.70x. The next entry, `P3-sRGB-color-bars.v_noise`, was 2.00x
 in that sweep and is now 1.58x after the noise work below, leaving
 `P3-sRGB-color-bars.v_2020` at 1.98x. The eight-wide BT.709 work below
 reduced that file to 1.62x; the next unchanged entry from the sweep is
-`P3-sRGB-color-bars.v_e3` at 1.89x. The two Rec.2020 files that preceded
-them have also been reduced:
+`P3-sRGB-color-bars.v_e3` at 1.89x. The direct eight-point DCT below reduced
+a fresh measurement of that file from 1.76x to 1.69x. A post-change spot
+check put the nearby `P3-sRGB-color-bars.v_p3` and `.v_d1` files at 1.74x
+and 1.72x respectively. The two Rec.2020 files that preceded them have also
+been reduced:
 `R2020-sRGB-blue.v_prog` fell from 2.51x to 1.45x with the folded-predictor
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Direct eight-point SIMD DCT
+After the BT.709 work, a fresh best-of-50 baseline for
+`P3-sRGB-color-bars.v_e3.jxl` measured 13.51ms against libjxl's 7.67ms,
+**1.76x**. Its 100-run side-by-side winperf trace measured 14.36ms against
+8.16ms. EPF was the largest aggregate cost, but batching a whole row through
+its AVX2 kernel did not produce a reliable release-build gain and increased
+the kernel's profile samples from 1043 to 1171. Substituting the approximate
+reciprocal used by libjxl changed pixels and regressed 13.51ms to 13.59ms.
+Both experiments were discarded.
+
+The next isolated gap was the generic SIMD inverse DCT recursion.
+`dct_1d_v8` occupied 382 self samples / 4.0% of the combined trace. Both the
+four-wide and eight-wide implementations now handle the overwhelmingly
+common eight-point transform directly with the existing four-point kernel,
+avoiding the generic split plus two recursive calls. The arithmetic and its
+order are unchanged.
+
+Matched best of 50:
+
+| measurement | before | direct DCT8 |
+|---|---:|---:|
+| ours | 13.51ms | **12.99ms** |
+| libjxl | 7.67ms | 7.70ms |
+| ratio | 1.76x | **1.69x** |
+
+That is a **3.8%** reduction in our decoder. The post-change 100-run trace
+measured 13.31ms against 8.18ms; combined samples fell from 9649 to 9399,
+and `dct_1d_v8` fell from 382 self samples to 216, a 43.5% reduction.
+EPF remains the largest cost, but the two rejected experiments above show
+that its remaining gap needs a different approach.
+
+All 782 generated VarDCT corpus outputs are byte-identical to the pre-change
+executable, including the target's SHA-256. A separate `JXL_NO_AVX2` clang
+build matches as well. The full libjxl oracle remains `1245/1245 ok`, all
+115 fuzz reproducers are clean, and the amalgamation compiles without
+warnings under clang and MSVC.
 
 ### Eight-wide BT.709 transfer function
 After noise synthesis stopped dominating its preset, the next slowest
