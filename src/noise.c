@@ -80,7 +80,35 @@ static uint32_t noise_mirror(int64_t v, uint32_t len) {
 #if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
     (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #define JXL_NOISE_SSE2 1
-#include <emmintrin.h>
+#include <immintrin.h>
+#endif
+
+#ifdef JXL_NOISE_SSE2
+/* Advance all eight XorShift lanes together. Storing each 64-bit result as
+   two little-endian 32-bit words produces the exact scalar output order;
+   turning those words into [1, 2) floats is then just an integer shift and
+   exponent-bit OR. */
+JXL_TARGET_AVX2
+static void xorshift_batch_x8(jxl_xorshift *r, float out[NOISE_LANES * 2]) {
+    const __m256i exp = _mm256_set1_epi32(0x3f800000u);
+    int i;
+    for (i = 0; i < NOISE_LANES; i += 4) {
+        __m256i s1 = _mm256_loadu_si256((const __m256i *)(r->s0 + i));
+        __m256i s0 = _mm256_loadu_si256((const __m256i *)(r->s1 + i));
+        __m256i ret = _mm256_add_epi64(s1, s0);
+        __m256i next;
+        _mm256_storeu_si256((__m256i *)(r->s0 + i), s0);
+        s1 = _mm256_xor_si256(s1, _mm256_slli_epi64(s1, 23));
+        next = _mm256_xor_si256(
+            s1, _mm256_xor_si256(
+                s0, _mm256_xor_si256(_mm256_srli_epi64(s1, 18),
+                                     _mm256_srli_epi64(s0, 5))));
+        _mm256_storeu_si256((__m256i *)(r->s1 + i), next);
+        ret = _mm256_or_si256(_mm256_srli_epi32(ret, 9), exp);
+        _mm256_storeu_ps(out + i * 2, _mm256_castsi256_ps(ret));
+    }
+    _mm256_zeroupper();
+}
 #endif
 
 /* One row of the 5-wide horizontal box, mirrored at both ends. Splitting the
@@ -147,6 +175,72 @@ static void noise_vbox5(const float *const rows[5], const float *centre,
     }
 }
 
+#ifdef JXL_NOISE_SSE2
+JXL_TARGET_AVX2
+static __m256 noise_strength_x8(__m256 v, const float *lut) {
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 seven = _mm256_set1_ps(7.0f);
+    __m256i idx;
+    __m256 frac, lo, hi;
+    /* Match the scalar path: clamp only negative inputs, then clamp the LUT
+       index rather than the value. lut[8] repeats lut[7], so values above the
+       table range still interpolate to that final value. */
+    v = _mm256_blendv_ps(v, zero,
+                         _mm256_cmp_ps(v, zero, _CMP_LT_OQ));
+    /* Clamp the conversion operand as well as the resulting integer so a
+       corrupt, enormous coefficient cannot turn into a negative gather
+       index. Keep the original v for frac: above-range values must retain
+       the scalar path's v - 7, although the repeated last LUT entry then
+       makes that fraction immaterial. */
+    idx = _mm256_cvttps_epi32(_mm256_min_ps(v, seven));
+    frac = _mm256_sub_ps(v, _mm256_cvtepi32_ps(idx));
+    lo = _mm256_i32gather_ps(lut, idx, 4);
+    hi = _mm256_i32gather_ps(lut, _mm256_add_epi32(idx,
+                                                   _mm256_set1_epi32(1)), 4);
+    return _mm256_add_ps(_mm256_mul_ps(_mm256_sub_ps(hi, lo), frac), lo);
+}
+
+JXL_TARGET_AVX2
+static void noise_apply_x8(float *rx, float *ry, float *rb,
+                           const float *nxr, const float *nyr,
+                           const float *nbr, const float *lut,
+                           float corr_x, float corr_b, uint32_t n,
+                           uint32_t *idx) {
+    const __m256 three = _mm256_set1_ps(3.0f);
+    const __m256 k22 = _mm256_set1_ps(0.22f);
+    const __m256 k1 = _mm256_set1_ps(0.0078125f);
+    const __m256 k127 = _mm256_set1_ps(0.9921875f);
+    const __m256 kx = _mm256_set1_ps(corr_x);
+    const __m256 kb = _mm256_set1_ps(corr_b);
+    uint32_t x = *idx;
+    for (; x + 8 <= n; x += 8) {
+        __m256 vx = _mm256_loadu_ps(rx + x);
+        __m256 vy = _mm256_loadu_ps(ry + x);
+        __m256 sx = noise_strength_x8(
+            _mm256_mul_ps(_mm256_add_ps(vx, vy), three), lut);
+        __m256 sy = noise_strength_x8(
+            _mm256_mul_ps(_mm256_sub_ps(vy, vx), three), lut);
+        __m256 nxmix = _mm256_add_ps(
+            _mm256_mul_ps(k1, _mm256_loadu_ps(nxr + x)),
+            _mm256_mul_ps(k127, _mm256_loadu_ps(nbr + x)));
+        __m256 nymix = _mm256_add_ps(
+            _mm256_mul_ps(k1, _mm256_loadu_ps(nyr + x)),
+            _mm256_mul_ps(k127, _mm256_loadu_ps(nbr + x)));
+        __m256 nx = _mm256_mul_ps(_mm256_mul_ps(k22, sx), nxmix);
+        __m256 ny = _mm256_mul_ps(_mm256_mul_ps(k22, sy), nymix);
+        __m256 sum = _mm256_add_ps(nx, ny);
+        __m256 dx = _mm256_sub_ps(
+            _mm256_add_ps(_mm256_mul_ps(kx, sum), nx), ny);
+        _mm256_storeu_ps(rx + x, _mm256_add_ps(vx, dx));
+        _mm256_storeu_ps(ry + x, _mm256_add_ps(vy, sum));
+        _mm256_storeu_ps(rb + x, _mm256_add_ps(
+            _mm256_loadu_ps(rb + x), _mm256_mul_ps(kb, sum)));
+    }
+    _mm256_zeroupper();
+    *idx = x;
+}
+#endif
+
 int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
                      const jxl_frame_header *fh, uint32_t visible_frames,
                      uint32_t invisible_frames, float corr_x, float corr_b) {
@@ -160,6 +254,9 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
     float lut[9];
     uint32_t x, y;
     int c, rc = -1;
+#ifdef JXL_NOISE_SSE2
+    int use_avx2 = jxl_has_avx2();
+#endif
 
     if (img->ncolor < 3 || width == 0 || height == 0) return 0;
     for (c = 0; c < 8; c++) lut[c] = np->lut[c];
@@ -202,14 +299,28 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
                 uint32_t row, b;
                 for (row = 0; row < gh; row++) {
                     for (b = 0; b < blocks; b++) {
-                        uint32_t bits[NOISE_LANES * 2];
+                        uint32_t bx = b * NOISE_LANES * 2;
+                        uint32_t valid = JXL_MIN(NOISE_LANES * 2, gw - bx);
+                        float *dst = raw[c] +
+                            (size_t)(y0 + row) * width + x0 + bx;
                         uint32_t k;
-                        xorshift_batch(&rng, bits);
-                        for (k = 0; k < NOISE_LANES * 2; k++) {
-                            uint32_t px = x0 + b * NOISE_LANES * 2 + k;
-                            if (px >= x0 + gw) continue;
-                            raw[c][(size_t)(y0 + row) * width + px] =
-                                bits_to_unit(bits[k]);
+#ifdef JXL_NOISE_SSE2
+                        if (use_avx2) {
+                            if (valid == NOISE_LANES * 2) {
+                                xorshift_batch_x8(&rng, dst);
+                            } else {
+                                float values[NOISE_LANES * 2];
+                                xorshift_batch_x8(&rng, values);
+                                memcpy(dst, values, valid * sizeof(float));
+                            }
+                            continue;
+                        }
+#endif
+                        {
+                            uint32_t bits[NOISE_LANES * 2];
+                            xorshift_batch(&rng, bits);
+                            for (k = 0; k < valid; k++)
+                                dst[k] = bits_to_unit(bits[k]);
                         }
                     }
                 }
@@ -258,7 +369,14 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
         const float *nxr = raw[0] + (size_t)y * width;
         const float *nyr = raw[1] + (size_t)y * width;
         const float *nbr = raw[2] + (size_t)y * width;
-        for (x = 0; x < width && x < img->plane[0].w; x++) {
+        uint32_t n = JXL_MIN(width, img->plane[0].w);
+        x = 0;
+#ifdef JXL_NOISE_SSE2
+        if (use_avx2)
+            noise_apply_x8(rx, ry, rb, nxr, nyr, nbr, lut, corr_x, corr_b,
+                           n, &x);
+#endif
+        for (; x < n; x++) {
             float gx_ = rx[x], gy_ = ry[x];
             float in_x = gx_ + gy_;
             float in_y = gy_ - gx_;

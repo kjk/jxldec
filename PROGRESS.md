@@ -81,13 +81,52 @@ the report format are the same.
 
 The latest full sweep's worst ratio among files that take libjxl more than 5ms
 was `flower.png.im_q85_gray.jpeg` at 2.14x. The grayscale JPEG work below
-reduced it to 1.70x; the next entry in that sweep is now
-`P3-sRGB-color-bars.v_noise` at 2.00x. The two Rec.2020 files that preceded
-them have also been reduced:
+reduced it to 1.70x. The next entry, `P3-sRGB-color-bars.v_noise`, was 2.00x
+in that sweep and is now 1.58x after the noise work below, leaving
+`P3-sRGB-color-bars.v_2020` at 1.98x as the next target. The two Rec.2020
+files that preceded them have also been reduced:
 `R2020-sRGB-blue.v_prog` fell from 2.51x to 1.45x with the folded-predictor
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### AVX2 noise synthesis and application
+After the grayscale JPEG optimization, the next slowest meaningful file was
+`P3-sRGB-color-bars.v_noise.jxl`. A stable best-of-50 baseline measured
+19.68ms against libjxl's 10.64ms, **1.85x**. A 100-run side-by-side winperf
+trace measured 20.22ms against 11.59ms and put `jxl_render_noise` at 2305
+self samples / 16.8% of the combined trace, versus 520 / 3.8% for libjxl's
+noise convolution stage.
+
+Most of our samples were in two scalar loops. Noise-strength interpolation
+and the correlated three-plane update now run eight pixels at a time; AVX2
+gathers the two LUT entries for each lane, then retains the scalar
+multiply/add order without FMA. The eight independent XorShift128+ lanes now
+advance together with 64-bit AVX2 operations, convert all 16 resulting
+32-bit words to `[1, 2)` floats by editing their exponent bits, and store full
+batches directly into the raw-noise plane. Partial batches keep a small
+temporary so they cannot overwrite the end of a group.
+
+Best timings:
+
+| measurement | before | after |
+|---|---:|---:|
+| ours | 19.68ms (50 runs) | **15.59ms** (100 runs) |
+| libjxl | 10.64ms | 9.87ms |
+| ratio | 1.85x | **1.58x** |
+
+That is a **20.8%** reduction in our decoder. The final 100-run profile
+measured 16.39ms against 11.45ms; combined samples fell from 13724 to 12398.
+`jxl_render_noise` fell from 2305 self samples / 16.8% to 828 / 6.7%, and its
+inclusive share fell from 21.6% to 12.1%. The inverse DCT is now the largest
+self-time function in our decoder on this file, so there is no longer a
+single noise loop dominating the libjxl gap.
+
+All 73 `v_noise` corpus outputs are byte-identical to the pre-change
+executable, including the target's SHA-256. A separate `JXL_NO_AVX2` build
+matches as well. The full libjxl oracle remains `1245/1245 ok`, all 115 fuzz
+reproducers are clean, and the amalgamation compiles without warnings under
+clang and MSVC.
 
 ### Skip discarded grayscale JPEG channels
 A fresh best-of-five corpus sweep measured 22181.15ms against libjxl's
