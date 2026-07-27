@@ -62,7 +62,7 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.27x libjxl** (1.37x before the folded-predictor
+1245-file corpus we are **1.26x libjxl** (1.37x before the folded-predictor
 specialization below; 2.74x before the SIMD work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
@@ -79,13 +79,19 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep, including the fixed DCT16 leaves and AVX2
-dequantization below, measured 20838.95ms against libjxl's 16403.28ms,
-**1.27x** overall. Its slowest files taking libjxl at least 5ms were
-`flower_small.ga.v_prog` at 1.76x and the color-bars effort/ICC variants at
-1.74x; the controlled high-run target measurement reduced
-`P3-sRGB-color-bars.v_icc` from 12.23-12.31ms to 11.79-11.82ms. The
-preceding sweep, including the 4x upsampling work, measured 20841.47ms
+The latest full sweep, including the EPF row kernel below, measured
+20886.67ms against libjxl's 16548.34ms, **1.26x** overall. Both sides ran
+warmer than the preceding sweep, so the controlled 73-file `v_e3` result
+(1.5% less time in our decoder with libjxl flat) is the more useful
+comparison. The sweep's slowest files taking libjxl at least 5ms were
+`flower_small.ga.v_prog` at 1.75x, `P3-sRGB-color-bars.v_e3` at 1.74x and
+`splines.v_e3` at 1.73x. The preceding sweep, including the fixed DCT16
+leaves and AVX2 dequantization, measured 20838.95ms against libjxl's
+16403.28ms, **1.27x** overall. Its slowest files taking libjxl at least 5ms
+were `flower_small.ga.v_prog` at 1.76x and the color-bars effort/ICC
+variants at 1.74x; the controlled high-run target measurement reduced
+`P3-sRGB-color-bars.v_icc` from 12.23-12.31ms to 11.79-11.82ms. The sweep
+before that, including the 4x upsampling work, measured 20841.47ms
 against libjxl's 16312.48ms, **1.28x** overall. Its five-run aggregate was
 statistically flat with the preceding sweep (+7.82ms, 0.04%) despite the
 controlled 73-file `v_rs4` set falling by 27-28ms. Stable high-run timings
@@ -127,6 +133,39 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Keep EPF pass 1 inside an AVX2 row kernel
+The stable rerank put `P3-sRGB-color-bars.v_e3` and `hdr_room.m_e1` at
+1.80x. The latter's prefix-coded gradient loop has already resisted several
+focused experiments, while a 220-run side-by-side winperf trace of the
+color-bars file put our `epf_row8_pass1` at 2611 self samples versus 1428
+for libjxl's complete AVX2 EPF1 stage. The profile measured 13.09ms against
+libjxl's 7.92ms, **1.65x**.
+
+The old dispatcher called the AVX2 kernel once per eight pixels. Pass 1 now
+crosses the runtime-selected AVX2 boundary once per interior row and inlines
+the octet body into that row loop. This removes the repeated call and
+AVX/SSE handoff. The four distance vectors and three output sums also have
+names rather than small indexed arrays, and the four weight steps are
+explicit. That prevents MSVC from spilling the seven vectors into a
+600-byte stack frame. Tap order, channel order, and every floating-point
+operation are unchanged.
+
+Alternating saved-executable timings, best of 400, reduced the target from
+12.43ms to **11.99-12.15ms**, about 2.3-3.5%. Across all 73 `v_e3` files,
+12 runs each, our aggregate fell from 859.63ms to **846.44-846.86ms**,
+1.5%, while libjxl held at 550-552ms.
+
+The final 220-run profile measured 12.51ms against libjxl's 7.91ms,
+**1.58x**. The pass-1 kernel fell from 2611 to 2210 self samples,
+**15.4%**, and combined samples fell from 20605 to 20290. The five-run full
+sweep measured 20886.67ms against libjxl's 16548.34ms, **1.26x** overall.
+
+A separate attempt to shorten vector live ranges by reloading four shared
+positions was neutral in release timings and was reverted. All 782 generated
+VarDCT corpus outputs are byte-identical to the pre-change executable, all
+115 ASan fuzz reproducers are clean, and the regenerated amalgamation
+compiles without warnings under clang and MSVC.
 
 ### Inline fixed DCT16 leaves and widen VarDCT dequantization
 After the 4x upsampling work, `P3-sRGB-color-bars.v_icc` was one of the

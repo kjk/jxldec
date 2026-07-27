@@ -205,16 +205,16 @@ static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
    differences, while adding every SAD in the generic loop's
    top,centre,bottom,left,right order so the result stays bit-identical. */
 JXL_TARGET_AVX2
-static void epf_row8_pass1(float *in[3], float *out[3], size_t row, uint32_t x,
-                           size_t stride, const float cscale[3],
-                           float sigma_val, float step_mul, float border_mul,
-                           int is_y_border) {
+static JXL_INLINE_HINT void epf_row8_pass1(
+    float *in[3], float *out[3], size_t row, uint32_t x, size_t stride,
+    const float cscale[3], float sigma_val, float step_mul, float border_mul,
+    int is_y_border) {
     const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
     const __m256 zero = _mm256_setzero_ps();
     const __m256 one = _mm256_set1_ps(1.0f);
-    __m256 dist8[4] = {zero, zero, zero, zero};
-    __m256 sum8[3], sw, nis, smv;
-    int c, k;
+    __m256 dist0 = zero, dist1 = zero, dist2 = zero, dist3 = zero;
+    __m256 sum0, sum1, sum2, sw, nis, smv, wgt;
+    int c;
 
     if (is_y_border) {
         smv = _mm256_set1_ps(border_mul);
@@ -282,30 +282,86 @@ static void epf_row8_pass1(float *in[3], float *out[3], size_t row, uint32_t x,
         acc3 = _mm256_add_ps(acc3,
             _mm256_and_ps(absmask, _mm256_sub_ps(p42, p32)));
 
-        dist8[0] = _mm256_add_ps(dist8[0], _mm256_mul_ps(cs, acc0));
-        dist8[1] = _mm256_add_ps(dist8[1], _mm256_mul_ps(cs, acc1));
-        dist8[2] = _mm256_add_ps(dist8[2], _mm256_mul_ps(cs, acc2));
-        dist8[3] = _mm256_add_ps(dist8[3], _mm256_mul_ps(cs, acc3));
+        dist0 = _mm256_add_ps(dist0, _mm256_mul_ps(cs, acc0));
+        dist1 = _mm256_add_ps(dist1, _mm256_mul_ps(cs, acc1));
+        dist2 = _mm256_add_ps(dist2, _mm256_mul_ps(cs, acc2));
+        dist3 = _mm256_add_ps(dist3, _mm256_mul_ps(cs, acc3));
     }
 
-    for (c = 0; c < 3; c++) sum8[c] = _mm256_loadu_ps(in[c] + row + x);
+    sum0 = _mm256_loadu_ps(in[0] + row + x);
+    sum1 = _mm256_loadu_ps(in[1] + row + x);
+    sum2 = _mm256_loadu_ps(in[2] + row + x);
     sw = one;
-    for (k = 0; k < 4; k++) {
-        const ptrdiff_t off = k == 0 ? -(ptrdiff_t)stride :
-                              k == 1 ?  (ptrdiff_t)stride :
-                              k == 2 ? -1 : 1;
-        __m256 wgt = _mm256_add_ps(one, _mm256_mul_ps(dist8[k], nis));
-        wgt = _mm256_max_ps(wgt, zero);
-        sw = _mm256_add_ps(sw, wgt);
-        for (c = 0; c < 3; c++) {
-            sum8[c] = _mm256_add_ps(sum8[c], _mm256_mul_ps(wgt,
-                _mm256_loadu_ps(in[c] + row + x + off)));
+
+    wgt = _mm256_add_ps(one, _mm256_mul_ps(dist0, nis));
+    wgt = _mm256_max_ps(wgt, zero);
+    sw = _mm256_add_ps(sw, wgt);
+    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(
+        wgt, _mm256_loadu_ps(in[0] + row + x - (ptrdiff_t)stride)));
+    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(
+        wgt, _mm256_loadu_ps(in[1] + row + x - (ptrdiff_t)stride)));
+    sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(
+        wgt, _mm256_loadu_ps(in[2] + row + x - (ptrdiff_t)stride)));
+
+    wgt = _mm256_add_ps(one, _mm256_mul_ps(dist1, nis));
+    wgt = _mm256_max_ps(wgt, zero);
+    sw = _mm256_add_ps(sw, wgt);
+    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(
+        wgt, _mm256_loadu_ps(in[0] + row + x + stride)));
+    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(
+        wgt, _mm256_loadu_ps(in[1] + row + x + stride)));
+    sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(
+        wgt, _mm256_loadu_ps(in[2] + row + x + stride)));
+
+    wgt = _mm256_add_ps(one, _mm256_mul_ps(dist2, nis));
+    wgt = _mm256_max_ps(wgt, zero);
+    sw = _mm256_add_ps(sw, wgt);
+    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(
+        wgt, _mm256_loadu_ps(in[0] + row + x - 1)));
+    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(
+        wgt, _mm256_loadu_ps(in[1] + row + x - 1)));
+    sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(
+        wgt, _mm256_loadu_ps(in[2] + row + x - 1)));
+
+    wgt = _mm256_add_ps(one, _mm256_mul_ps(dist3, nis));
+    wgt = _mm256_max_ps(wgt, zero);
+    sw = _mm256_add_ps(sw, wgt);
+    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(
+        wgt, _mm256_loadu_ps(in[0] + row + x + 1)));
+    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(
+        wgt, _mm256_loadu_ps(in[1] + row + x + 1)));
+    sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(
+        wgt, _mm256_loadu_ps(in[2] + row + x + 1)));
+
+    sw = _mm256_div_ps(one, sw);
+    _mm256_storeu_ps(out[0] + row + x, _mm256_mul_ps(sum0, sw));
+    _mm256_storeu_ps(out[1] + row + x, _mm256_mul_ps(sum1, sw));
+    _mm256_storeu_ps(out[2] + row + x, _mm256_mul_ps(sum2, sw));
+}
+
+/* Keep the AVX2 target boundary outside the hot x loop. Besides avoiding one
+   call and one AVX/SSE handoff per octet, this lets the compiler keep the
+   channel scales and fixed border pattern live for a whole interior row. */
+JXL_TARGET_AVX2
+static uint32_t epf_row_pass1_avx2(
+    float *in[3], float *out[3], size_t row, uint32_t x, uint32_t w,
+    size_t stride, const float *sigma_row, const float cscale[3],
+    float step_mul, float border_mul, int is_y_border) {
+    for (; x + 9 < w; x += 8) {
+        float sigma_val = sigma_row[x / 8];
+        if (sigma_val < 0.3f) {
+            int c;
+            for (c = 0; c < 3; c++) {
+                _mm256_storeu_ps(out[c] + row + x,
+                                 _mm256_loadu_ps(in[c] + row + x));
+            }
+        } else {
+            epf_row8_pass1(in, out, row, x, stride, cscale, sigma_val,
+                           step_mul, border_mul, is_y_border);
         }
     }
-    sw = _mm256_div_ps(one, sw);
-    for (c = 0; c < 3; c++)
-        _mm256_storeu_ps(out[c] + row + x, _mm256_mul_ps(sum8[c], sw));
     _mm256_zeroupper();
+    return x;
 }
 #endif
 
@@ -368,6 +424,13 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
             float sigma_val = sigma_row[x / 8];
 
 #ifdef JXL_EPF_SSE2
+            if (use_avx2 && step == 1 && y_inside && (x & 7u) == 0 &&
+                x >= 2 && x + 9 < w) {
+                x = epf_row_pass1_avx2(in, out, row, x, w, stride, sigma_row,
+                                       cscale, step_mul, border_mul,
+                                       is_y_border);
+                continue;
+            }
             /* Four samples at a time down the row. Vectorising across x (not
                across taps) means every lane runs the same operations in the
                same order as the scalar path below, so the output is
@@ -385,14 +448,9 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                     x += 8;
                     continue;
                 }
-                if (step == 1) {
-                    epf_row8_pass1(in, out, row, x, stride, cscale, sigma_val,
-                                   step_mul, border_mul, is_y_border);
-                } else {
-                    epf_row8(in, out, row, x, koff, doff, nkernel, ndist,
-                             cscale, sigma_val, step_mul, border_mul,
-                             is_y_border);
-                }
+                epf_row8(in, out, row, x, koff, doff, nkernel, ndist,
+                         cscale, sigma_val, step_mul, border_mul,
+                         is_y_border);
                 x += 8;
                 continue;
             }
