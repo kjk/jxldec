@@ -1365,6 +1365,41 @@ void jxl_cfl_lf(float *x, float *y, float *b, uint32_t w, uint32_t h,
 
 /* Turns the accumulated integer coefficients of one varblock into floats,
    applying the quantization bias, the dequant matrix and the global scale. */
+#ifdef JXL_VARDCT_SSE2
+JXL_TARGET_AVX2
+static void dequant_varblock8(float *coeff, size_t stride, uint32_t w,
+                              uint32_t h, const float *matrix, float mul,
+                              float quant_bias,
+                              float quant_bias_numerator) {
+    const __m256 vbias = _mm256_set1_ps(quant_bias);
+    const __m256 vnum = _mm256_set1_ps(quant_bias_numerator);
+    const __m256 vmul = _mm256_set1_ps(mul);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 absmask =
+        _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    uint32_t x, y;
+
+    for (y = 0; y < h; y++) {
+        float *row = coeff + (size_t)y * stride;
+        const float *mrow = matrix + (size_t)y * w;
+        for (x = 0; x < w; x += 8) {
+            __m256 v = _mm256_cvtepi32_ps(
+                _mm256_loadu_si256((const __m256i *)(row + x)));
+            __m256 small = _mm256_mul_ps(v, vbias);
+            __m256 large = _mm256_sub_ps(v, _mm256_div_ps(vnum, v));
+            __m256 m = _mm256_cmp_ps(
+                _mm256_and_ps(absmask, v), one, _CMP_LE_OQ);
+            v = _mm256_or_ps(_mm256_and_ps(m, small),
+                             _mm256_andnot_ps(m, large));
+            v = _mm256_mul_ps(v, _mm256_loadu_ps(mrow + x));
+            v = _mm256_mul_ps(v, vmul);
+            _mm256_storeu_ps(row + x, v);
+        }
+    }
+    _mm256_zeroupper();
+}
+#endif
+
 void jxl_dequant_varblock(float *coeff, size_t stride, int tr, int32_t hf_mul,
                           int channel, const jxl_dequant_matrices *dm,
                           const jxl_quantizer *q, float qm_scale,
@@ -1380,6 +1415,14 @@ void jxl_dequant_varblock(float *coeff, size_t stride, int tr, int32_t hf_mul,
     mul = 65536.0f / ((float)q->global_scale * (float)hf_mul) * qm_scale;
     matrix = jxl_tr_need_transpose(tr) ? dm->matrix_tr[slot][channel]
                                        : dm->matrix[slot][channel];
+
+#ifdef JXL_VARDCT_SSE2
+    if (jxl_has_avx2()) {
+        dequant_varblock8(coeff, stride, w, h, matrix, mul, quant_bias,
+                          quant_bias_numerator);
+        return;
+    }
+#endif
 
     for (y = 0; y < h; y++) {
         float *row = coeff + (size_t)y * stride;

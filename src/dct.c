@@ -379,6 +379,51 @@ static void dct4_v8(const __m256 in[4], __m256 out[4], int inverse) {
     }
 }
 
+/* Fixed eight-point leaf shared by direct 8-point transforms and the
+   16-point specialization below. Keeping it separate from the runtime-sized
+   recursion lets the compiler inline the leaf without a second dispatch
+   through dct_1d_v8. */
+JXL_TARGET_AVX2
+static JXL_INLINE_HINT void dct8_v8(__m256 *io, int inverse) {
+    const __m256 sqrt2 = _mm256_set1_ps(JXL_SQRT2);
+    const __m256 half_v = _mm256_set1_ps(0.5f);
+    __m256 in0[4], in1[4], out0[4], out1[4];
+    int i;
+
+    if (!inverse) {
+        for (i = 0; i < 4; i++) {
+            in0[i] = _mm256_mul_ps(
+                _mm256_add_ps(io[i], io[7 - i]), half_v);
+            in1[i] = _mm256_mul_ps(
+                _mm256_mul_ps(_mm256_sub_ps(io[i], io[7 - i]),
+                              _mm256_set1_ps(sec_half_8[i])),
+                half_v);
+        }
+        dct4_v8(in0, out0, 0);
+        dct4_v8(in1, out1, 0);
+        for (i = 0; i < 4; i++) io[i * 2] = out0[i];
+        out1[0] = _mm256_mul_ps(out1[0], sqrt2);
+        for (i = 0; i < 3; i++)
+            io[i * 2 + 1] = _mm256_add_ps(out1[i], out1[i + 1]);
+        io[7] = out1[3];
+    } else {
+        in0[0] = io[0]; in0[1] = io[2];
+        in0[2] = io[4]; in0[3] = io[6];
+        in1[0] = _mm256_mul_ps(io[1], sqrt2);
+        in1[1] = _mm256_add_ps(io[3], io[1]);
+        in1[2] = _mm256_add_ps(io[5], io[3]);
+        in1[3] = _mm256_add_ps(io[7], io[5]);
+        dct4_v8(in0, out0, 1);
+        dct4_v8(in1, out1, 1);
+        for (i = 0; i < 4; i++) {
+            __m256 r = _mm256_mul_ps(
+                out1[i], _mm256_set1_ps(sec_half_8[i]));
+            io[i] = _mm256_add_ps(out0[i], r);
+            io[7 - i] = _mm256_sub_ps(out0[i], r);
+        }
+    }
+}
+
 JXL_TARGET_AVX2
 static void dct_1d_v8(__m256 *io, int n, __m256 *scratch, int inverse) {
     const __m256 sqrt2 = _mm256_set1_ps(JXL_SQRT2);
@@ -402,37 +447,47 @@ static void dct_1d_v8(__m256 *io, int n, __m256 *scratch, int inverse) {
         return;
     }
     if (n == 8) {
-        __m256 in0[4], in1[4], out0[4], out1[4];
+        dct8_v8(io, inverse);
+        return;
+    }
+    if (n == 16) {
+        __m256 *in0 = scratch;
+        __m256 *in1 = scratch + 8;
         if (!inverse) {
-            for (i = 0; i < 4; i++) {
+            for (i = 0; i < 8; i++) {
                 in0[i] = _mm256_mul_ps(
-                    _mm256_add_ps(io[i], io[7 - i]), half_v);
+                    _mm256_add_ps(io[i], io[15 - i]), half_v);
                 in1[i] = _mm256_mul_ps(
-                    _mm256_mul_ps(_mm256_sub_ps(io[i], io[7 - i]),
-                                  _mm256_set1_ps(sec_half_8[i])),
-                    half_v);
+                    _mm256_sub_ps(io[i], io[15 - i]), half_v);
             }
-            dct4_v8(in0, out0, 0);
-            dct4_v8(in1, out1, 0);
-            for (i = 0; i < 4; i++) io[i * 2] = out0[i];
-            out1[0] = _mm256_mul_ps(out1[0], sqrt2);
-            for (i = 0; i < 3; i++)
-                io[i * 2 + 1] = _mm256_add_ps(out1[i], out1[i + 1]);
-            io[7] = out1[3];
+            for (i = 0; i < 8; i++)
+                in1[i] = _mm256_mul_ps(
+                    in1[i], _mm256_set1_ps(sec_half_16[i]));
+            dct8_v8(in0, 0);
+            dct8_v8(in1, 0);
+            in1[0] = _mm256_mul_ps(in1[0], sqrt2);
+            for (i = 0; i < 7; i++)
+                in1[i] = _mm256_add_ps(in1[i], in1[i + 1]);
+            for (i = 0; i < 8; i++) io[i * 2] = in0[i];
+            for (i = 0; i < 8; i++) io[i * 2 + 1] = in1[i];
         } else {
-            in0[0] = io[0]; in0[1] = io[2];
-            in0[2] = io[4]; in0[3] = io[6];
-            in1[0] = _mm256_mul_ps(io[1], sqrt2);
-            in1[1] = _mm256_add_ps(io[3], io[1]);
-            in1[2] = _mm256_add_ps(io[5], io[3]);
-            in1[3] = _mm256_add_ps(io[7], io[5]);
-            dct4_v8(in0, out0, 1);
-            dct4_v8(in1, out1, 1);
-            for (i = 0; i < 4; i++) {
-                __m256 r = _mm256_mul_ps(
-                    out1[i], _mm256_set1_ps(sec_half_8[i]));
-                io[i] = _mm256_add_ps(out0[i], r);
-                io[7 - i] = _mm256_sub_ps(out0[i], r);
+            for (i = 0; i < 8; i++) {
+                in0[i] = io[i * 2];
+                in1[i] = io[i * 2 + 1];
+            }
+            for (i = 1; i < 8; i++)
+                in1[8 - i] = _mm256_add_ps(in1[8 - i], in1[7 - i]);
+            in1[0] = _mm256_mul_ps(in1[0], sqrt2);
+            dct8_v8(in0, 1);
+            dct8_v8(in1, 1);
+            for (i = 0; i < 8; i++)
+                in1[i] = _mm256_mul_ps(
+                    in1[i], _mm256_set1_ps(sec_half_16[i]));
+            for (i = 0; i < 8; i++) {
+                __m256 a = scratch[i];
+                __m256 b = scratch[i + 8];
+                io[i] = _mm256_add_ps(a, b);
+                io[15 - i] = _mm256_sub_ps(a, b);
             }
         }
         return;

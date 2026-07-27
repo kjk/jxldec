@@ -62,7 +62,7 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **1.28x libjxl** (1.37x before the folded-predictor
+1245-file corpus we are **1.27x libjxl** (1.37x before the folded-predictor
 specialization below; 2.74x before the SIMD work below;
 2.33x over the smaller 821-file corpus that predates the `v_noise`, `v_rs*`,
 `v_orient`, `v_p3` and `v_2020` presets, which are lossy paths and pull the
@@ -79,13 +79,19 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep, including the 4x upsampling work below, measured
-20841.47ms against libjxl's 16312.48ms, **1.28x** overall. The five-run
-aggregate is statistically flat with the preceding sweep (+7.82ms, 0.04%)
-despite the controlled 73-file `v_rs4` set falling by 27-28ms. Stable
-high-run timings leave `hdr_room.m_e1` (1.77x) and
-`P3-sRGB-color-bars.v_icc` (1.74x) at the front; `flower.v_rs4` fell from
-1.77x to about 1.55x. The preceding sweep, after the 16-bit output packing,
+The latest full sweep, including the fixed DCT16 leaves and AVX2
+dequantization below, measured 20838.95ms against libjxl's 16403.28ms,
+**1.27x** overall. Its slowest files taking libjxl at least 5ms were
+`flower_small.ga.v_prog` at 1.76x and the color-bars effort/ICC variants at
+1.74x; the controlled high-run target measurement reduced
+`P3-sRGB-color-bars.v_icc` from 12.23-12.31ms to 11.79-11.82ms. The
+preceding sweep, including the 4x upsampling work, measured 20841.47ms
+against libjxl's 16312.48ms, **1.28x** overall. Its five-run aggregate was
+statistically flat with the preceding sweep (+7.82ms, 0.04%) despite the
+controlled 73-file `v_rs4` set falling by 27-28ms. Stable high-run timings
+left `hdr_room.m_e1` (1.77x) and `P3-sRGB-color-bars.v_icc` (1.74x) at the
+front; `flower.v_rs4` fell from 1.77x to about 1.55x. The sweep before that,
+after the 16-bit output packing,
 measured 20833.65ms against libjxl's 16333.30ms, also **1.28x**; our summed
 time had fallen 31.25ms. The sweep before that, after the 2x upsampling work,
 measured 20864.90ms against libjxl's 16304.27ms, also **1.28x**; our summed
@@ -121,6 +127,38 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Inline fixed DCT16 leaves and widen VarDCT dequantization
+After the 4x upsampling work, `P3-sRGB-color-bars.v_icc` was one of the
+remaining stable high-ratio files. A 220-run side-by-side winperf baseline
+measured 12.76ms against libjxl's 7.95ms, **1.61x**. `dct_1d_v8` took 1453
+self samples (7.0%) and `jxl_dequant_varblock` took 707 (3.4%). EPF was
+larger in aggregate, but the earlier exact-operation-order batching and
+reciprocal experiments had both regressed it.
+
+The eight-point AVX2 DCT body is now a fixed inline leaf. A new fixed
+sixteen-point branch calls that leaf directly for its two halves, avoiding
+two runtime-sized recursive dispatches; larger transforms also reach this
+branch recursively. Dequantization now processes eight coefficients per
+iteration on AVX2 machines, with one runtime dispatch per varblock. Its
+comparison/select and two final multiplies preserve the scalar/SSE2
+operation order.
+
+Alternating saved-executable timings, best of 300, reduced the target from
+12.23-12.31ms to **11.79-11.82ms**, about 3.4-4.2%. The DCT-only
+intermediate measured 12.06-12.09ms. Across all 66 `v_icc` files, 15 runs
+each, our aggregate fell from 697.24ms to **686.37-686.53ms**, 1.5-1.6%;
+the DCT-only build measured 692.57ms.
+
+The final 220-run profile measured 12.60ms against libjxl's 8.04ms,
+**1.57x**. `dct_1d_v8` fell from 1453 to 1192 self samples, **18.0%**, and
+`jxl_dequant_varblock` fell from 707 to 464, **34.4%**. Combined samples
+fell from 20696 to 19975, 3.5%. The five-run full sweep measured 20838.95ms
+against libjxl's 16403.28ms, **1.27x** overall.
+
+All 1245 corpus outputs are byte-identical to the pre-change executable, all
+115 ASan fuzz reproducers are clean, and the regenerated amalgamation
+compiles without warnings under clang and MSVC.
 
 ### Share 4x upsampling taps by output row
 After the 16-bit output work, `flower.v_rs4` measured 34.64ms against
