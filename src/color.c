@@ -25,6 +25,65 @@
 #include <immintrin.h>
 #endif
 
+#ifdef JXL_COLOR_SSE2
+JXL_TARGET_AVX2
+static size_t xyb_to_linear_x8(float *x, float *y, float *b, size_t i,
+                               size_t n, const float opsin_inv[9],
+                               const float opsin_bias[3],
+                               const float cbrt_ob[3], float itscale) {
+    const __m256 c0 = _mm256_set1_ps(cbrt_ob[0]);
+    const __m256 c1 = _mm256_set1_ps(cbrt_ob[1]);
+    const __m256 c2 = _mm256_set1_ps(cbrt_ob[2]);
+    const __m256 b0 = _mm256_set1_ps(opsin_bias[0]);
+    const __m256 b1 = _mm256_set1_ps(opsin_bias[1]);
+    const __m256 b2 = _mm256_set1_ps(opsin_bias[2]);
+    const __m256 its = _mm256_set1_ps(itscale);
+    __m256 oi[9];
+    int k;
+
+    for (k = 0; k < 9; k++) oi[k] = _mm256_set1_ps(opsin_inv[k]);
+    for (; i + 8 <= n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vy = _mm256_loadu_ps(y + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        __m256 gl = _mm256_sub_ps(_mm256_add_ps(vy, vx), c0);
+        __m256 gm = _mm256_sub_ps(_mm256_sub_ps(vy, vx), c1);
+        __m256 gs = _mm256_sub_ps(vb, c2);
+        __m256 l =
+            _mm256_add_ps(_mm256_mul_ps(_mm256_mul_ps(gl, gl), gl), b0);
+        __m256 m =
+            _mm256_add_ps(_mm256_mul_ps(_mm256_mul_ps(gm, gm), gm), b1);
+        __m256 s =
+            _mm256_add_ps(_mm256_mul_ps(_mm256_mul_ps(gs, gs), gs), b2);
+        if (itscale != 1.0f) {
+            l = _mm256_mul_ps(l, its);
+            m = _mm256_mul_ps(m, its);
+            s = _mm256_mul_ps(s, its);
+        }
+        _mm256_storeu_ps(
+            x + i,
+            _mm256_add_ps(
+                _mm256_add_ps(_mm256_mul_ps(oi[0], l),
+                              _mm256_mul_ps(oi[1], m)),
+                _mm256_mul_ps(oi[2], s)));
+        _mm256_storeu_ps(
+            y + i,
+            _mm256_add_ps(
+                _mm256_add_ps(_mm256_mul_ps(oi[3], l),
+                              _mm256_mul_ps(oi[4], m)),
+                _mm256_mul_ps(oi[5], s)));
+        _mm256_storeu_ps(
+            b + i,
+            _mm256_add_ps(
+                _mm256_add_ps(_mm256_mul_ps(oi[6], l),
+                              _mm256_mul_ps(oi[7], m)),
+                _mm256_mul_ps(oi[8], s)));
+    }
+    _mm256_zeroupper();
+    return i;
+}
+#endif
+
 
 void jxl_xyb_to_linear(float *x, float *y, float *b, size_t n,
                        const float opsin_inv[9], const float opsin_bias[3],
@@ -38,10 +97,14 @@ void jxl_xyb_to_linear(float *x, float *y, float *b, size_t n,
 
     i = 0;
 #ifdef JXL_COLOR_SSE2
+    if (jxl_has_avx2()) {
+        i = xyb_to_linear_x8(x, y, b, i, n, opsin_inv, opsin_bias, cbrt_ob,
+                             itscale);
+    }
     {
-        /* Straight four-at-a-time: the loop body is pure arithmetic, so each
-           lane runs the identical sequence and the result is bit-identical.
-           The multiply-adds keep the scalar left-to-right association. */
+        /* The vector loops are pure lane-wise arithmetic, so each sample runs
+           the identical sequence at either width. The multiply-adds keep the
+           scalar left-to-right association. */
         const __m128 c0 = _mm_set1_ps(cbrt_ob[0]), c1 = _mm_set1_ps(cbrt_ob[1]);
         const __m128 c2 = _mm_set1_ps(cbrt_ob[2]);
         const __m128 b0 = _mm_set1_ps(opsin_bias[0]), b1 = _mm_set1_ps(opsin_bias[1]);
@@ -59,9 +122,11 @@ void jxl_xyb_to_linear(float *x, float *y, float *b, size_t n,
             __m128 l = _mm_add_ps(_mm_mul_ps(_mm_mul_ps(gl, gl), gl), b0);
             __m128 m = _mm_add_ps(_mm_mul_ps(_mm_mul_ps(gm, gm), gm), b1);
             __m128 s = _mm_add_ps(_mm_mul_ps(_mm_mul_ps(gs, gs), gs), b2);
-            l = _mm_mul_ps(l, its);
-            m = _mm_mul_ps(m, its);
-            s = _mm_mul_ps(s, its);
+            if (itscale != 1.0f) {
+                l = _mm_mul_ps(l, its);
+                m = _mm_mul_ps(m, its);
+                s = _mm_mul_ps(s, its);
+            }
             _mm_storeu_ps(x + i, _mm_add_ps(_mm_add_ps(
                 _mm_mul_ps(oi[0], l), _mm_mul_ps(oi[1], m)), _mm_mul_ps(oi[2], s)));
             _mm_storeu_ps(y + i, _mm_add_ps(_mm_add_ps(
@@ -78,9 +143,11 @@ void jxl_xyb_to_linear(float *x, float *y, float *b, size_t n,
         float l = gl * gl * gl + opsin_bias[0];
         float m = gm * gm * gm + opsin_bias[1];
         float s = gs * gs * gs + opsin_bias[2];
-        l *= itscale;
-        m *= itscale;
-        s *= itscale;
+        if (itscale != 1.0f) {
+            l *= itscale;
+            m *= itscale;
+            s *= itscale;
+        }
         x[i] = opsin_inv[0] * l + opsin_inv[1] * m + opsin_inv[2] * s;
         y[i] = opsin_inv[3] * l + opsin_inv[4] * m + opsin_inv[5] * s;
         b[i] = opsin_inv[6] * l + opsin_inv[7] * m + opsin_inv[8] * s;
