@@ -87,9 +87,10 @@ for (let i = 0; i < args.length; i++) {
   else usage();
 }
 
-// Every artifact kind libFuzzer writes on a finding; all replay the same way.
+// Every artifact kind libFuzzer writes on a finding, plus AFL imports
+// (content-hashed names with an afl- prefix from cmd/fuzz-afl.ts -import).
 const isArtifact = (name: string) =>
-  /^(crash|timeout|oom|leak|slow-unit)-/.test(name);
+  /^(crash|timeout|oom|leak|slow-unit|afl)-/.test(name);
 
 const listArtifacts = () =>
   existsSync(CRASHES) ? readdirSync(CRASHES).filter(isArtifact) : [];

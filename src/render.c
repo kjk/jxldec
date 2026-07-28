@@ -403,7 +403,11 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
                         jxl_format fmt, uint8_t *dst, int stride) {
     const jxl_image_metadata *meta = &doc->meta;
     jxl_out_planes op;
-    uint32_t sw = img->w, sh = img->h;
+    /* Output size is the SizeHeader (optionally orientation-swapped), which is
+       also what jxl_frame_render allocates for. The float canvas is normally
+       the same size; when a corrupt stream leaves it larger we still only
+       emit the image rectangle so the destination buffer is not overrun. */
+    uint32_t sw = doc->size.width, sh = doc->size.height;
     uint32_t ow, oh, ox, oy;
     uint32_t orientation = ctx->keep_orientation ? 1 : meta->orientation;
     int ncomp = 0, wide = 0, has_alpha = 0, gray = 0;
@@ -827,8 +831,8 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
             }
         } else {
             uint32_t src = fh.blending.source;
-            int cropped = fh.have_crop || tmp.w != doc->size.width ||
-                          tmp.h != doc->size.height;
+            uint32_t iw = doc->size.width, ih = doc->size.height;
+            int cropped = fh.have_crop || tmp.w != iw || tmp.h != ih;
             int needs_canvas = cropped || fh.blending.mode != JXL_BLEND_REPLACE;
             int failed = 0;
 
@@ -837,16 +841,22 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
                 canvas = tmp;
                 memset(&tmp, 0, sizeof(tmp));
             } else {
+                /* The output canvas is always the SizeHeader dimensions.
+                   Reference frames (and prior canvases from corrupt files)
+                   can be larger or smaller; adopting their size would make
+                   write_pixels overflow the buffer jxl_frame_render allocates
+                   from jxl_doc_info. Only image-sized bases are reused;
+                   anything else starts from a blank full-size canvas and the
+                   blend clips the frame into it. */
                 jxl_fimage base;
                 memset(&base, 0, sizeof(base));
-                if (src < 4 && st.refs_valid[src]) {
+                if (src < 4 && st.refs_valid[src] &&
+                    st.refs[src].w == iw && st.refs[src].h == ih) {
                     failed = jxl_fimage_copy(ctx, &base, &st.refs[src]) != 0;
-                } else if (canvas_valid) {
+                } else if (canvas_valid && canvas.w == iw && canvas.h == ih) {
                     failed = jxl_fimage_copy(ctx, &base, &canvas) != 0;
                 } else {
-                    failed = jxl_fimage_blank_like(ctx, &base, &tmp,
-                                                   doc->size.width,
-                                                   doc->size.height) != 0;
+                    failed = jxl_fimage_blank_like(ctx, &base, &tmp, iw, ih) != 0;
                 }
                 if (!failed) {
                     jxl_blend_frame(ctx, &base, &tmp, &fh, &doc->meta);

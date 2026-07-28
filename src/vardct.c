@@ -1581,6 +1581,27 @@ void jxl_dequant_dct8_plane(float *coeff, size_t stride,
     }
     _mm256_zeroupper();
 }
+#else
+/* Declared for the batched VarDCT path in decode.c. That path is gated on
+   jxl_has_avx2_fma(), which is always 0 without x86, so this is never called. */
+void jxl_dequant_dct8_plane(float *coeff, size_t stride,
+                            const jxl_block_info *blocks,
+                            uint32_t blocks_w, uint32_t blocks_h,
+                            int channel, const jxl_dequant_matrices *dm,
+                            const jxl_quantizer *q, float qm_scale,
+                            float quant_bias, float quant_bias_numerator) {
+    (void)coeff;
+    (void)stride;
+    (void)blocks;
+    (void)blocks_w;
+    (void)blocks_h;
+    (void)channel;
+    (void)dm;
+    (void)q;
+    (void)qm_scale;
+    (void)quant_bias;
+    (void)quant_bias_numerator;
+}
 #endif
 
 void jxl_dequant_varblock(float *coeff, size_t stride, int tr, int32_t hf_mul,
