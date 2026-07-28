@@ -1079,14 +1079,15 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                             dist, br,
                             dist->clusters[cluster_base + coeff_ctx_base +
                                            coeff_ctx]);
-                        if (ucoeff == 0) {
-                            is_prev_nonzero = 0;
-                            continue;
-                        }
-                        coeff = jxl_unpack_signed(ucoeff);
+                        /* Match libjxl's branchless hot loop: adding zero is
+                           cheaper than a hard-to-predict branch on sparse
+                           coefficients, and the boolean updates both state
+                           variables without a second branch. */
+                        coeff = (int32_t)((ucoeff >> 1) ^
+                                          (((~ucoeff) & 1u) - 1u));
                         coeff_out[coeff_offsets[k]] += coeff;
-                        is_prev_nonzero = 1;
-                        non_zeros--;
+                        is_prev_nonzero = ucoeff != 0;
+                        non_zeros -= is_prev_nonzero;
                         if (non_zeros == 0) break;
                     }
                 } else if (coeff_offsets) {

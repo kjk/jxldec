@@ -203,7 +203,13 @@ static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
    pixel is the left-neighbour SAD of the next. Consecutive active octets
    carry the last right-edge value in a scalar, and the other seven left
    values are a lane shift of the current right-edge vector. */
-static JXL_INLINE_HINT float epf_hsad_one(
+#if defined(_MSC_VER)
+#define JXL_EPF_NOINLINE __declspec(noinline)
+#else
+#define JXL_EPF_NOINLINE __attribute__((noinline))
+#endif
+
+static JXL_EPF_NOINLINE float epf_hsad_one(
     float *in[3], size_t row, uint32_t x, size_t stride,
     const float cscale[3]) {
     float dist = 0.0f;
@@ -221,6 +227,7 @@ static JXL_INLINE_HINT float epf_hsad_one(
     }
     return dist;
 }
+#undef JXL_EPF_NOINLINE
 
 JXL_TARGET_AVX2
 static JXL_INLINE_HINT float epf_row8_pass1(
@@ -279,43 +286,42 @@ static JXL_INLINE_HINT float epf_row8_pass1(
     for (c = 0; c < 3; c++) {
         const float *p = in[c] + row + x;
         const __m256 p21 = _mm256_loadu_ps(p - (ptrdiff_t)stride);
-        const __m256 p31 =
-            _mm256_loadu_ps(p - (ptrdiff_t)stride + 1);
-        const __m256 p12 = _mm256_loadu_ps(p - 1);
         const __m256 p22 = _mm256_loadu_ps(p);
-        const __m256 p32 = _mm256_loadu_ps(p + 1);
-        const __m256 p42 = _mm256_loadu_ps(p + 2);
-        const __m256 p13 =
-            _mm256_loadu_ps(p + (ptrdiff_t)stride - 1);
         const __m256 p23 = _mm256_loadu_ps(p + (ptrdiff_t)stride);
-        const __m256 p33 =
-            _mm256_loadu_ps(p + (ptrdiff_t)stride + 1);
-        const __m256 p24 =
-            _mm256_loadu_ps(p + 2 * (ptrdiff_t)stride);
-        const __m256 ct = _mm256_and_ps(absmask, _mm256_sub_ps(p21, p22));
-        const __m256 cb = _mm256_and_ps(absmask, _mm256_sub_ps(p22, p23));
-        const __m256 cl = _mm256_and_ps(absmask, _mm256_sub_ps(p12, p22));
-        const __m256 cr = _mm256_and_ps(absmask, _mm256_sub_ps(p32, p22));
         const __m256 cs = _mm256_set1_ps(cscale[c]);
         __m256 acc1, acc3;
 
-        acc1 = _mm256_add_ps(zero, ct);
-        acc1 = _mm256_add_ps(acc1, cb);
+        acc1 = _mm256_add_ps(zero, _mm256_and_ps(
+            absmask, _mm256_sub_ps(p21, p22)));
+        acc1 = _mm256_add_ps(acc1, _mm256_and_ps(
+            absmask, _mm256_sub_ps(p22, p23)));
         acc1 = _mm256_add_ps(acc1,
-            _mm256_and_ps(absmask, _mm256_sub_ps(p24, p23)));
+            _mm256_and_ps(absmask, _mm256_sub_ps(
+                _mm256_loadu_ps(p + 2 * (ptrdiff_t)stride), p23)));
         acc1 = _mm256_add_ps(acc1,
-            _mm256_and_ps(absmask, _mm256_sub_ps(p13, p12)));
+            _mm256_and_ps(absmask, _mm256_sub_ps(
+                _mm256_loadu_ps(p + (ptrdiff_t)stride - 1),
+                _mm256_loadu_ps(p - 1))));
         acc1 = _mm256_add_ps(acc1,
-            _mm256_and_ps(absmask, _mm256_sub_ps(p33, p32)));
+            _mm256_and_ps(absmask, _mm256_sub_ps(
+                _mm256_loadu_ps(p + (ptrdiff_t)stride + 1),
+                _mm256_loadu_ps(p + 1))));
 
         acc3 = _mm256_add_ps(zero,
-            _mm256_and_ps(absmask, _mm256_sub_ps(p31, p21)));
-        acc3 = _mm256_add_ps(acc3, cr);
+            _mm256_and_ps(absmask, _mm256_sub_ps(
+                _mm256_loadu_ps(p - (ptrdiff_t)stride + 1), p21)));
         acc3 = _mm256_add_ps(acc3,
-            _mm256_and_ps(absmask, _mm256_sub_ps(p33, p23)));
-        acc3 = _mm256_add_ps(acc3, cl);
+            _mm256_and_ps(absmask, _mm256_sub_ps(
+                _mm256_loadu_ps(p + 1), p22)));
         acc3 = _mm256_add_ps(acc3,
-            _mm256_and_ps(absmask, _mm256_sub_ps(p42, p32)));
+            _mm256_and_ps(absmask, _mm256_sub_ps(
+                _mm256_loadu_ps(p + (ptrdiff_t)stride + 1), p23)));
+        acc3 = _mm256_add_ps(acc3,
+            _mm256_and_ps(absmask, _mm256_sub_ps(
+                _mm256_loadu_ps(p - 1), p22)));
+        acc3 = _mm256_add_ps(acc3,
+            _mm256_and_ps(absmask, _mm256_sub_ps(
+                _mm256_loadu_ps(p + 2), _mm256_loadu_ps(p + 1))));
 
         dist1 = _mm256_add_ps(dist1, _mm256_mul_ps(cs, acc1));
         dist3 = _mm256_add_ps(dist3, _mm256_mul_ps(cs, acc3));
@@ -413,7 +419,6 @@ static uint32_t epf_row_pass1_avx2(
             prev_valid = 1;
         }
     }
-    _mm256_zeroupper();
     return x;
 }
 #endif

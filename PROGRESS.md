@@ -62,8 +62,9 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **about 1.16x libjxl** (recent full sweeps range from
-1.15x to 1.17x with machine temperature; 1.21x before the small-error
+1245-file corpus we are **about 1.13x libjxl** (the latest full sweep measured
+1.131x; 1.16x before the recent RCT, Modular-property and noise work; 1.21x
+before the small-error
 self-correcting-weight and max-error specializations below; 1.25x before the
 identity-WP and gradient-property specializations below; 1.37x before the folded-predictor
 specialization; 2.74x before the SIMD work below;
@@ -81,6 +82,29 @@ hot source lines, heaviest call path). That is how the numbers below were
 found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
+
+### Shorten the HF coefficient and EPF dependency chains
+The common DCT8, literal-only HF coefficient loop now unpacks every symbol
+and adds zero branchlessly, matching libjxl's hot-loop shape. The coefficient
+island is sparse, but the zero/nonzero branch was sufficiently unpredictable
+that skipping the zero store cost more than the unconditional add. A
+160-region side-by-side profile of `flower.v_e3` reduced
+`jxl_write_hf_coeff` from 4258 to 3988 self samples (-6.3%); alternating
+saved-executable runs measured about 0.1-0.8% less normalized decode time.
+
+EPF pass 1 now loads the second channel's neighbours in accumulation order
+instead of keeping every input vector live across both patch distances. This
+preserves the exact scalar floating-point operation order while shrinking
+MSVC's AVX2 kernel from 897 to 675 assembly lines and its YMM stack accesses
+from 12 to 5. A 160-region profile reduced EPF self time from 5554 to 5435
+samples (-2.1%); focused release A/B runs were neutral to about 0.4% faster.
+The scalar horizontal-SAD boundary helper is kept out of line so it does not
+inflate the vector row kernel.
+
+The preceding clean full-corpus rerank measured 18237.85ms against libjxl's
+16119.94ms, **1.131x** overall; these two smaller changes have not yet had a
+new full performance rerank. All 1245 oracle comparisons pass, all 115 fuzz
+reproducers are clean, and the amalgamation compiles with Clang and MSVC.
 
 The latest clean-checkpoint full sweep, including the chroma-upsample and HF
 coefficient work below, measured 22753.13ms against libjxl's 19595.57ms,
