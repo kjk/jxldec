@@ -2,7 +2,7 @@
 // our decoder and libjxl's djxl, and compare the PAM output.
 //
 //   bun cmd/tests.ts <-all | -rand N | file.jxl ...> [-clang] [-cpu N]
-//                    [-preset a,b] [-asan] [-v] [-tol N] [-rms X]
+//                    [-preset a,b] [-asan] [-tol N] [-rms X]
 //
 // Modular (integer) paths must be byte-identical. VarDCT paths are float, so
 // a small per-sample difference is expected; a file passes when it is under
@@ -10,19 +10,21 @@
 // 8-bit steps. See the note above PEAK_TOL for why both are needed.
 //
 // Files are tested in parallel, one worker per CPU, each with private temp
-// files. Per-file lines print in completion order.
+// files. Per-file lines print in completion order. Output is bench-style:
+// directory header when the dir changes, then
+//   time max rms mean basename [status] : size bytes : n/m
+// Status (FAIL / DIFF / skip) is only printed when the file is not a pass.
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "fs";
 import { cpus, tmpdir } from "os";
-import { dirname, join } from "path";
+import { basename, dirname, isAbsolute, join, relative } from "path";
 import { build, buildAsan, defaultUseClang } from "./build";
-import { corpusSummary, fileLabel, selectFiles } from "./corpus";
+import { corpusSummary, selectFiles } from "./corpus";
 import { getDeps, refTool } from "./get-deps";
 
 const ROOT = dirname(import.meta.dir);
 const argv = process.argv.slice(2);
 const useClang = argv.includes("-clang") || defaultUseClang;
 const useAsan = argv.includes("-asan");
-const verbose = argv.includes("-v");
 // Two thresholds, both required, in the shape libjxl's own conformance
 // checker uses (tools/conformance/conformance.py CompareNPY: an RMSE limit
 // and a peak limit, never peak alone).
@@ -68,7 +70,6 @@ options:
   -rms X          max allowed RMS difference, 8-bit steps (default 0.6);
                   a file must pass both. 16-bit output is normalised, so
                   either threshold means the same thing at either depth
-  -v              print per-file detail even when they match
 
 ${corpusSummary()}`,
   // Every flag that takes a value, so its value is not mistaken for a
@@ -159,7 +160,17 @@ function compare(ours: Uint8Array, ref: Uint8Array): Cmp {
   };
 }
 
-type Result = { file: string; ok: boolean; msg: string; ms: number };
+type Result = {
+  file: string;
+  ok: boolean;
+  ms: number;
+  /** Peak / RMS / mean abs sample diff in 8-bit steps; omitted if no compare. */
+  max8?: number;
+  rms8?: number;
+  mean8?: number;
+  /** Only set when not a pass (FAIL / DIFF / skip). */
+  status?: string;
+};
 
 async function testOne(file: string, slot: number): Promise<Result> {
   const tmp = join(tmpdir(), "jxldec-tests", String(slot));
@@ -187,34 +198,89 @@ async function testOne(file: string, slot: number): Promise<Result> {
 
   if (!refOk) {
     // libjxl itself can't decode it: not our problem, count as a skip.
-    return { file, ok: true, msg: "skip (djxl failed)", ms };
+    return { file, ok: true, ms, status: "skip (djxl failed)" };
   }
-  if (!ourOk) return { file, ok: false, msg: `FAIL ${ourErr}`, ms };
+  if (!ourOk) return { file, ok: false, ms, status: `FAIL ${ourErr}` };
 
   const cmp = compare(new Uint8Array(readFileSync(ourPam)),
                       new Uint8Array(readFileSync(refPam)));
-  if (cmp.same) return { file, ok: true, msg: "same", ms };
-  if (cmp.note) return { file, ok: false, msg: `diff ${cmp.note}`, ms };
+  if (cmp.same) {
+    return { file, ok: true, ms, max8: 0, rms8: 0, mean8: 0 };
+  }
+  if (cmp.note) {
+    return { file, ok: false, ms, status: `DIFF ${cmp.note}` };
+  }
   // Tolerances are expressed in 8-bit steps regardless of the output depth.
   const max8 = cmp.maxDiff / cmp.scale;
   const mean8 = cmp.meanDiff / cmp.scale;
   const rms8 = cmp.rmsDiff / cmp.scale;
-  const stats = `rms ${rms8.toFixed(3)}, mean ${mean8.toFixed(3)}`;
-  const detail =
-    cmp.scale === 1
-      ? `max ${cmp.maxDiff}, ${stats}`
-      : `max ${max8.toFixed(2)}/8bit (${cmp.maxDiff}/16bit), ${stats}`;
   if (rms8 <= RMS_TOL && max8 <= PEAK_TOL) {
-    return { file, ok: true, msg: `close (${detail})`, ms };
+    return { file, ok: true, ms, max8, rms8, mean8 };
   }
   const why = rms8 > RMS_TOL ? `rms>${RMS_TOL}` : `peak>${PEAK_TOL}`;
-  return { file, ok: false, msg: `DIFF ${why} (${detail})`, ms };
+  return { file, ok: false, ms, max8, rms8, mean8, status: `DIFF ${why}` };
+}
+
+/** Path relative to ROOT with forward slashes (absolute if outside the tree). */
+function displayPath(file: string): string {
+  const rel = relative(ROOT, file);
+  return (rel.startsWith("..") || isAbsolute(rel) ? file : rel).replaceAll(
+    "\\",
+    "/",
+  );
+}
+
+function pathDir(file: string): string {
+  const d = dirname(displayPath(file));
+  return d === "" ? "." : d;
+}
+
+function pathBase(file: string): string {
+  return basename(displayPath(file));
+}
+
+function colNum(n: number | undefined, width: number, digits: number): string {
+  if (n === undefined) return "-".padStart(width);
+  return n.toFixed(digits).padStart(width);
+}
+
+/** Exact byte count with thousands separators (e.g. 13,234). */
+function formatBytesExact(n: number): string {
+  return n.toLocaleString("en-US");
+}
+
+let lastDir = "";
+
+function printResult(r: Result, n: number, total: number) {
+  const dir = pathDir(r.file);
+  if (dir !== lastDir) {
+    console.log(dir);
+    lastDir = dir;
+  }
+  const time = `${r.ms.toFixed(0)} ms`.padStart(8);
+  const max = colNum(r.max8, 6, 2);
+  const rms = colNum(r.rms8, 6, 2);
+  const mean = colNum(r.mean8, 6, 2);
+  const name = pathBase(r.file);
+  const status = r.status ? ` ${r.status}` : "";
+  const size = formatBytesExact(statSync(r.file).size);
+  console.log(
+    `${time} ${max} ${rms} ${mean} ${name}${status} : ${size} bytes : ${n}/${total}`,
+  );
 }
 
 let nextIndex = 0;
 let done = 0;
 let failures = 0;
 const failed: string[] = [];
+
+console.log(
+  `max = peak |sample diff| (8-bit steps); rms/mean = over all samples` +
+    `  (pass: max<=${PEAK_TOL} and rms<=${RMS_TOL})`,
+);
+console.log(
+  `${"time".padStart(8)} ${"max".padStart(6)} ${"rms".padStart(6)} ${"mean".padStart(6)} file`,
+);
 
 async function worker(slot: number) {
   for (;;) {
@@ -226,13 +292,7 @@ async function worker(slot: number) {
       failures++;
       failed.push(files[i]);
     }
-    if (!r.ok || verbose || r.msg !== "same") {
-      console.log(
-        `[${done}/${files.length}] ${fileLabel(r.file, ROOT)} — ${r.ms.toFixed(0)} ms — ${r.msg}`,
-      );
-    } else if (done % 50 === 0) {
-      console.log(`[${done}/${files.length}] ...`);
-    }
+    printResult(r, done, files.length);
   }
 }
 

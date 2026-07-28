@@ -9,8 +9,10 @@
 // 8-bit interleaved samples of the first frame; libjxl runs single-threaded,
 // the only configuration we implement. The best of -runs decodes is reported
 // per decoder, since the fastest run is the least perturbed one.
-// Output follows the sibling decoders: libjxl, jxldec, signed millisecond
-// difference, signed percentage difference, then path and file size.
+//
+// Default output (from jxl_bench): directory header lines, then
+//   libjxl   jxldec     diff    %diff basename.jxl : N bytes
+// (+ = jxldec slower). Last data line is sum of best times, label "total".
 //
 // Windows/MSVC only: libjxl is C++ and links against the MSVC runtime.
 import { mkdtempSync, rmSync, writeFileSync } from "fs";
@@ -44,7 +46,8 @@ options:
   -preset a,b     restrict the generated corpus to these presets
   -bgra           request BGRA8 from ours and RGBA8 from libjxl
 
-Output columns: libjxl jxldec diff %diff file (+ = jxldec slower).
+Default: dir headers, then libjxl jxldec diff %diff basename (+ = jxldec slower);
+  ends with a "total" line (sum of best libjxl vs sum of best jxldec).
 
 ${corpusSummary()}`,
   ["-rand", "-runs", "-preset"],

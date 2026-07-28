@@ -12,9 +12,9 @@
  *
  * Each file is decoded `runs` times per decoder and the best time is
  * reported: the fastest run is the one least perturbed by the scheduler.
- * Output is one line per file plus a total, in the compact sibling-decoder
- * shape: libjxl, jxldec, signed difference, signed percentage difference,
- * then the file path and size.
+ * Output matches sibling decoders: directory header lines when the dir
+ * changes, then compact columns (libjxl jxldec diff %diff basename : size),
+ * ending with a "total" line (sum of best times).
  */
 #include "jxl.h"
 
@@ -82,14 +82,55 @@ static void format_bytes_exact(size_t bytes, char out[64]) {
     out[j] = 0;
 }
 
+/* Basename after the last / or \. */
+static const char *path_basename(const char *path) {
+    const char *b = path, *p;
+    for (p = path; *p; p++)
+        if (*p == '/' || *p == '\\') b = p + 1;
+    return b;
+}
+
+/* Directory of path into out (forward slashes; "." if none). */
+static void path_dirname(const char *path, char *out, size_t outsz) {
+    const char *b = path_basename(path);
+    size_t n = (size_t)(b - path);
+    size_t i;
+    if (n > 0 && (path[n - 1] == '/' || path[n - 1] == '\\')) n--;
+    if (n == 0) {
+        if (outsz > 1) {
+            out[0] = '.';
+            out[1] = 0;
+        } else if (outsz)
+            out[0] = 0;
+        return;
+    }
+    if (n >= outsz) n = outsz - 1;
+    memcpy(out, path, n);
+    out[n] = 0;
+    for (i = 0; out[i]; i++)
+        if (out[i] == '\\') out[i] = '/';
+}
+
+/* Print directory once when it changes (must run before the number columns). */
+static void enter_dir(const char *path) {
+    static char last_dir[4096];
+    static int have_last_dir;
+    char dir[4096];
+
+    path_dirname(path, dir, sizeof(dir));
+    if (!have_last_dir || strcmp(dir, last_dir) != 0) {
+        printf("%s\n", dir);
+        snprintf(last_dir, sizeof(last_dir), "%s", dir);
+        have_last_dir = 1;
+    }
+}
+
+/* Basename + exact size (columns already printed on this line). */
 static void print_file_label(const char *path, size_t len) {
     char exact[64];
-    const char *display = path;
-    if (strncmp(display, "deps/corpus/", 12) == 0 ||
-        strncmp(display, "deps\\corpus\\", 12) == 0)
-        display += 12;
+    const char *name = path_basename(path);
     format_bytes_exact(len, exact);
-    printf("%s %s b", display, exact);
+    printf("%s : %s bytes", name && name[0] ? name : path, exact);
 }
 
 /* Returns the decode time in ms, or -1 on failure. */
@@ -189,6 +230,7 @@ static void bench_one(const char *path, int runs, double *tot_ref,
     }
     free(data);
 
+    enter_dir(path);
     if (best_ours < 0 || best_ref < 0) {
         printf("%8s %8s %8s %8s ", best_ref < 0 ? "ERROR" : "-",
                best_ours < 0 ? "ERROR" : "-", "ERROR", "ERROR");
@@ -271,7 +313,7 @@ int main(int argc, char **argv) {
         double pct = tot_ref > 0 ? diff * 100.0 / tot_ref : 0.0;
         char pct_text[32];
         snprintf(pct_text, sizeof(pct_text), "%+.1f%%", pct);
-        printf("%8.2f %8.2f %+8.2f %8s TOTAL\n", tot_ref, tot_ours, diff,
+        printf("%8.2f %8.2f %+8.2f %8s total\n", tot_ref, tot_ours, diff,
                pct_text);
         printf("%d file(s), %.1f MB\n", nfiles, (double)tot_bytes / (1024 * 1024));
     }
