@@ -7336,8 +7336,6 @@ done:
     return rc;
 }
 
-
-
 void jxl_patches_free(jxl_ctx *ctx, jxl_patches *p) {
     uint32_t i, j;
     if (!p || !p->refs) return;
@@ -7469,8 +7467,6 @@ done:
     return rc;
 }
 
-
-
 static float clamp01(float v) {
     if (v < 0.0f) return 0.0f;
     if (v > 1.0f) return 1.0f;
@@ -7486,7 +7482,6 @@ static float plane_at(const jxl_fplane *p, uint32_t x, uint32_t y) {
     if (!p || !p->data || x >= p->w || y >= p->h) return 0.0f;
     return p->data[(size_t)y * p->stride + x];
 }
-
 
 static void blend_channel(jxl_fplane *base, const jxl_fplane *ref,
                           const jxl_fplane *base_alpha,
@@ -7585,7 +7580,6 @@ static void blend_channel(jxl_fplane *base, const jxl_fplane *ref,
     }
 }
 
-
 int jxl_apply_patches(jxl_ctx *ctx, jxl_fimage *img, const jxl_patches *p,
                       const jxl_image_metadata *meta, jxl_fimage refs[4],
                       const int refs_valid[4]) {
@@ -7654,9 +7648,6 @@ int jxl_apply_patches(jxl_ctx *ctx, jxl_fimage *img, const jxl_patches *p,
     return 0;
 }
 
-
-
-
 static uint8_t frame_mode_to_patch(jxl_blend_mode m) {
     switch (m) {
         case JXL_BLEND_REPLACE: return JXL_PATCH_REPLACE;
@@ -7666,7 +7657,6 @@ static uint8_t frame_mode_to_patch(jxl_blend_mode m) {
         default: return JXL_PATCH_MUL;
     }
 }
-
 
 int jxl_blend_frame(jxl_ctx *ctx, jxl_fimage *canvas, const jxl_fimage *frame,
                     const jxl_frame_header *fh,
@@ -7720,7 +7710,6 @@ int jxl_blend_frame(jxl_ctx *ctx, jxl_fimage *canvas, const jxl_fimage *frame,
     (void)ctx;
     return 0;
 }
-
 
 int jxl_fimage_blank_like(jxl_ctx *ctx, jxl_fimage *out, const jxl_fimage *like,
                           uint32_t w, uint32_t h) {
