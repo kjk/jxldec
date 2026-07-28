@@ -82,12 +82,13 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
-The latest full sweep, including the chroma-upsample and HF coefficient work
-below, measured 21459.18ms against libjxl's 18409.24ms, **1.17x** overall.
-Both columns were 10-12% slower than a compact rerun of the immediately
-preceding checkpoint (19188.79ms against 16676.89ms, **1.151x**), so the
-alternating saved-executable comparisons below are the better measure of
-these small changes.
+The latest clean-checkpoint full sweep, including the chroma-upsample and HF
+coefficient work below, measured 22753.13ms against libjxl's 19595.57ms,
+**1.161x** overall. The preceding sweep measured 21459.18ms against libjxl's
+18409.24ms, **1.17x** overall. Both columns were 10-12% slower than a compact
+rerun of the immediately preceding checkpoint (19188.79ms against
+16676.89ms, **1.151x**), so the alternating saved-executable comparisons
+below are the better measure of these small changes.
 The preceding full sweep, including the self-correcting predictor work below,
 measured 19319.66ms against libjxl's 16651.20ms, **1.16x** overall.
 The preceding full sweep, including the identity-WP loop, reduced property
@@ -167,6 +168,36 @@ been reduced:
 specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
+
+### Reuse symmetric EPF pass-1 patch distances
+Pass 1 evaluates five-sample patch distances to the four axial neighbours.
+Two kinds of work were symmetric but repeated: a pixel's right-neighbour SAD
+is the next pixel's left-neighbour SAD, and a row's downward SAD is the next
+row's upward SAD. The AVX2 row kernel now shifts the right-distance vector to
+form seven of the eight left distances and carries the eighth between
+octets. One temporary float row carries downward distances between image
+rows. Inactive sigma blocks break horizontal reuse, and upward reuse requires
+both the current and previous sigma blocks to be active.
+
+The accumulation order within every SAD and weighted output remains the
+scalar top/centre/bottom/left/right order. Six representative outputs were
+byte-identical to the pre-change executable, and seven selected VarDCT oracle
+comparisons passed. On `flower.v_e3`, a 100-run side-by-side profile reduced
+`epf_row_pass1_avx2` from 8029 to 6299 samples (-21.5%); timing moved from
+61.45ms against 46.02ms to 59.68ms against 45.35ms. Alternating
+saved-executable comparisons over seven EPF-heavy files measured
+345.10-347.65ms after against 352.72-352.92ms before, about 1.5-1.8%.
+Across all 782 generated VarDCT files the normalized aggregate gain is only
+about 0.2-0.5%, because many files spend little time in pass 1.
+
+Three related experiments were measured and reverted. Caching all four
+pass-1 edge fields in three rows made the edge preparation plus pass slower
+than recomputing the remaining distances. Packing the effort-one prefix
+decoder's `(run,residual)` result into a 64-bit return regressed a four-file
+set from about 320ms to 339-348ms. A direct, no-weighted-predictor Modular
+loop modeled on libjxl's `PredictTreeNoWPNEC` was byte-identical on six
+representative files, but all 73 responsive Modular files ranged from neutral
+to about 1% slower after normalization, so it was also removed.
 
 ### Vectorize JPEG chroma upsampling and specialize common HF reads
 A 220-run side-by-side profile of the 4:2:2 JPEG-transcode
