@@ -1508,7 +1508,7 @@ void jxl_cfl_lf(float *x, float *y, float *b, uint32_t w, uint32_t h,
 /* Turns the accumulated integer coefficients of one varblock into floats,
    applying the quantization bias, the dequant matrix and the global scale. */
 #ifdef JXL_VARDCT_SSE2
-JXL_TARGET_AVX2
+JXL_TARGET_AVX2_FMA
 static JXL_INLINE_HINT void
 dequant_varblock8_core(float *coeff, size_t stride, uint32_t w, uint32_t h,
                        const float *matrix, float mul, float quant_bias,
@@ -1528,7 +1528,11 @@ dequant_varblock8_core(float *coeff, size_t stride, uint32_t w, uint32_t h,
             __m256 v = _mm256_cvtepi32_ps(
                 _mm256_loadu_si256((const __m256i *)(row + x)));
             __m256 small = _mm256_mul_ps(v, vbias);
-            __m256 large = _mm256_sub_ps(v, _mm256_div_ps(vnum, v));
+            /* Match libjxl's AdjustQuantBias: the AVX reciprocal estimate is
+               sufficient for quantized integers, and one fused subtraction
+               avoids both a full vector divide and an extra rounding. */
+            __m256 large =
+                _mm256_fnmadd_ps(vnum, _mm256_rcp_ps(v), v);
             __m256 m = _mm256_cmp_ps(
                 _mm256_and_ps(absmask, v), one, _CMP_LE_OQ);
             v = _mm256_or_ps(_mm256_and_ps(m, small),
@@ -1540,7 +1544,7 @@ dequant_varblock8_core(float *coeff, size_t stride, uint32_t w, uint32_t h,
     }
 }
 
-JXL_TARGET_AVX2
+JXL_TARGET_AVX2_FMA
 static void dequant_varblock8(float *coeff, size_t stride, uint32_t w,
                               uint32_t h, const float *matrix, float mul,
                               float quant_bias,
@@ -1553,7 +1557,7 @@ static void dequant_varblock8(float *coeff, size_t stride, uint32_t w,
 /* As with the batched 8x8 IDCT, enter the AVX2 kernel once per plane rather
    than once per block. Besides amortizing the ABI prologue, this leaves the
    matrix and bias constants available to the optimizer across blocks. */
-JXL_TARGET_AVX2
+JXL_TARGET_AVX2_FMA
 void jxl_dequant_dct8_plane(float *coeff, size_t stride,
                             const jxl_block_info *blocks,
                             uint32_t blocks_w, uint32_t blocks_h,
@@ -1596,7 +1600,7 @@ void jxl_dequant_varblock(float *coeff, size_t stride, int tr, int32_t hf_mul,
                                        : dm->matrix[slot][channel];
 
 #ifdef JXL_VARDCT_SSE2
-    if (jxl_has_avx2()) {
+    if (jxl_has_avx2_fma()) {
         dequant_varblock8(coeff, stride, w, h, matrix, mul, quant_bias,
                           quant_bias_numerator);
         return;

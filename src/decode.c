@@ -424,8 +424,11 @@ static void merge_hf_meta(jxl_vardct_state *v, const jxl_hf_meta *m,
         for (x = 0; x < m->bw && base_bx + x < v->bw; x++) {
             v->block_info[(size_t)(base_by + y) * v->bw + base_bx + x] =
                 m->block_info[(size_t)y * m->bw + x];
-            v->epf_sigma[(size_t)(base_by + y) * v->bw + base_bx + x] =
-                m->epf_sigma[(size_t)y * m->bw + x];
+            {
+                float sigma = m->epf_sigma[(size_t)y * m->bw + x];
+                v->epf_sigma[(size_t)(base_by + y) * v->bw + base_bx + x] =
+                    sigma >= 0.3f ? JXL_EPF_INV_SIGMA_NUM / sigma : 0.0f;
+            }
         }
     }
     for (y = 0; y < m->cfl_h; y++) {

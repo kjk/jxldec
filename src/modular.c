@@ -926,6 +926,33 @@ props_compute_grad_wp(const jxl_pred_state *ps, jxl_props *pr,
     pr->cache[15] = pr->sc.max_error;
 }
 
+/* Same reduced property set for libjxl's no-edge-case interior. The alpha
+   groups in ordinary VarDCT files spend most of their modular decode here;
+   direct row loads avoid three bounds/row-availability tests per sample. */
+static JXL_INLINE_HINT void
+props_compute_grad_wp_nec(const jxl_pred_state *ps, jxl_props *pr,
+                          int32_t channel, int32_t stream_idx) {
+    uint32_t x = ps->x;
+    int32_t ne = ps->prev_row[x + 1];
+    int32_t w_nw = (int32_t)((uint32_t)ps->w - (uint32_t)ps->nw);
+    if (ps->use_sc) {
+        sc_predict(&ps->sc, ps->n, ps->nw, ne, ps->w, ps->curr_row[x],
+                   &pr->sc);
+        pr->has_sc = 1;
+    } else {
+        pr->has_sc = 0;
+        pr->sc.prediction = 0;
+        pr->sc.max_error = 0;
+    }
+    pr->cache[0] = channel;
+    pr->cache[1] = stream_idx;
+    pr->cache[9] = (int32_t)((uint32_t)w_nw + (uint32_t)ps->n);
+    pr->cache[10] = w_nw;
+    pr->cache[11] = (int32_t)((uint32_t)ps->nw - (uint32_t)ps->n);
+    pr->cache[12] = (int32_t)((uint32_t)ps->n - (uint32_t)ne);
+    pr->cache[15] = pr->sc.max_error;
+}
+
 static int32_t props_get_extra(const jxl_pred_state *ps, uint32_t prop_extra) {
     uint32_t idx = prop_extra / 4;
     uint32_t sub = prop_extra % 4;
@@ -2683,6 +2710,65 @@ modular_decode_general_nec(jxl_mchan *ch, jxl_pred_state *ps,
 #undef JXL_NEC_SAMPLE
     return 0;
 }
+
+/* libjxl instantiates a separate no-LZ77, no-edge-case loop for this track.
+   Besides the direct neighbours and predictor-state update, resolving LZ77
+   once here removes its branch and the redundant cluster range check from
+   every literal in the large 256x256 alpha groups. */
+static JXL_MODULAR_NOINLINE int
+modular_decode_grad_wp_nec(jxl_mchan *ch, jxl_pred_state *ps,
+                           const jxl_ma_config *ma, jxl_dec *dec, jxl_br *br,
+                           int32_t channel, int32_t stream_idx) {
+    uint32_t x, y;
+
+#define JXL_GRAD_WP_SAMPLE(COMPUTE_PROPS, PREDICT_SAMPLE, RECORD_SAMPLE) do { \
+        jxl_props pr;                                                         \
+        const jxl_ma_leaf *leaf;                                              \
+        uint32_t token;                                                       \
+        int32_t diff, value;                                                  \
+                                                                              \
+        COMPUTE_PROPS;                                                        \
+        leaf = ma_get_leaf_local(ma, &pr);                                    \
+        token = jxl_dec_read_clustered_no_lz77(dec, br, leaf->cluster);       \
+        diff = jxl_unpack_signed(token);                                      \
+        diff = (int32_t)((uint32_t)diff * leaf->multiplier +                  \
+                         (uint32_t)leaf->offset);                              \
+        value = (int32_t)((uint32_t)diff + (uint32_t)(PREDICT_SAMPLE));       \
+        row[x] = value;                                                       \
+        RECORD_SAMPLE;                                                        \
+    } while (0)
+
+    for (y = 0; y < ch->h; y++) {
+        int32_t *row = ch->data + (size_t)y * ch->stride;
+        x = 0;
+        if (y > 1 && ch->w > 8) {
+            for (; x < 2; x++) {
+                JXL_GRAD_WP_SAMPLE(
+                    props_compute_grad_wp(
+                        ps, &pr, channel, stream_idx),
+                    predict_sample(ps, &pr, leaf->predictor),
+                    pred_record(ps, &pr, value));
+            }
+            for (; x + 2 < ch->w; x++) {
+                JXL_GRAD_WP_SAMPLE(
+                    props_compute_grad_wp_nec(
+                        ps, &pr, channel, stream_idx),
+                    predict_sample_nec(ps, &pr, leaf->predictor),
+                    pred_record_nec(ps, &pr, value));
+            }
+        }
+        for (; x < ch->w; x++) {
+            JXL_GRAD_WP_SAMPLE(
+                props_compute_grad_wp(ps, &pr, channel, stream_idx),
+                predict_sample(ps, &pr, leaf->predictor),
+                pred_record(ps, &pr, value));
+        }
+        if (br->err || dec->err) return -1;
+    }
+#undef JXL_GRAD_WP_SAMPLE
+    return 0;
+}
+
 #undef JXL_MODULAR_NOINLINE
 
 int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
@@ -3193,10 +3279,20 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                     props_compute_nw(
                         &ps, &pr, (int32_t)ci, (int32_t)stream_idx))
             } else if ((props_mask & ~0x9e03u) == 0) {
-                JXL_GENERAL_LOOP(
-                    ma_get_leaf_local(cma, &pr),
-                    props_compute_grad_wp(
-                        &ps, &pr, (int32_t)ci, (int32_t)stream_idx))
+                if (!dec->lz77_enabled) {
+                    if (modular_decode_grad_wp_nec(
+                            ch, &ps, cma, dec, br, (int32_t)ci,
+                            (int32_t)stream_idx) != 0) {
+                        JXL_ERR(ctx, "modular: truncated stream %u",
+                                (unsigned)stream_idx);
+                        goto done;
+                    }
+                } else {
+                    JXL_GENERAL_LOOP(
+                        ma_get_leaf_local(cma, &pr),
+                        props_compute_grad_wp(
+                            &ps, &pr, (int32_t)ci, (int32_t)stream_idx))
+                }
             } else {
                 if (modular_decode_general_nec(
                         ch, &ps, cma, dec, br, dist_multiplier, (int32_t)ci,

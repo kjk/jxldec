@@ -685,6 +685,12 @@ typedef struct {
     float sigma_for_modular;
 } jxl_epf;
 
+/* Numerator of the EPF inverse-sigma map. Keep the per-block division at
+   metadata merge time; the filter then only multiplies this already-scaled
+   inverse by its per-pass and block-border factors. */
+#define JXL_EPF_INV_SIGMA_NUM \
+    (6.6f * (0.70710678118654752f - 1.0f))
+
 typedef struct {
     uint32_t num_passes;
     uint32_t num_ds;

@@ -62,8 +62,8 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **about 1.13x libjxl** (the latest full sweep measured
-1.131x; 1.16x before the recent RCT, Modular-property and noise work; 1.21x
+1245-file corpus we are **about 1.11x libjxl** (the latest full sweep measured
+1.113x; 1.13x before the recent RCT, Modular-property and noise work; 1.21x
 before the small-error
 self-correcting-weight and max-error specializations below; 1.25x before the
 identity-WP and gradient-property specializations below; 1.37x before the folded-predictor
@@ -82,6 +82,38 @@ hot source lines, heaviest call path). That is how the numbers below were
 found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
+
+### Specialize interior alpha prediction and hoist EPF/dequant divides
+The alpha plane in ordinary VarDCT files is a separate Modular stream. Its
+common gradient/weighted-predictor tree is literal-only and spends nearly all
+of a 256x256 group away from image edges, but it still took the general
+neighbour-loading path and tested LZ77 for every sample. A dedicated no-edge,
+no-LZ77 loop now uses direct row loads and resolves both conditions once per
+channel. Alternating saved-executable runs over five alpha-heavy files saved
+about 30ms, 2.85% of our aggregate decode time on that set.
+
+Two floating-point divisions were also removed from VarDCT hot loops. EPF
+metadata now stores the filter's scaled inverse sigma, so every filter sample
+multiplies by the per-pass factor instead of dividing by its block sigma. This
+saved a small but repeatable 0.7-1.3ms across five large files. Dequantization
+now follows libjxl's `AdjustQuantBias` implementation: AVX reciprocal estimate
+plus a fused negative multiply-add, rather than full AVX division. Three
+alternating eight-file A/B pairs averaged 1.7ms, about 0.35%, faster.
+
+The first full sweep after the Modular and EPF changes measured 18069.17ms
+against libjxl's 16257.33ms, **1.111x**. The next sweep, with the dequant
+change, measured 18000.72ms against 16170.88ms, **1.113x**: our column fell
+68.45ms, but the independently warmer libjxl column fell 86.45ms, so the
+controlled saved-executable A/B above is the useful evidence for the small
+dequant gain. Roughly 213ms of our time still has to come out to cross 1.10x
+at that run's libjxl time.
+
+All 1245 oracle comparisons pass, all 115 fuzz reproducers are clean under
+ASan/libFuzzer, and the regenerated amalgamation compiles with Clang and MSVC.
+Rejected experiments in this round included sparse DCT8 masked loads,
+contiguous coefficient-plane allocation, native CRT allocation for large
+coefficient planes, forced prefix-reader inlining, and extracted or packed
+effort-one RLE loops; each was slower in alternating release measurements.
 
 ### Shorten the HF coefficient and EPF dependency chains
 The common DCT8, literal-only HF coefficient loop now unpacks every symbol

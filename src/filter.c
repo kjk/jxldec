@@ -135,8 +135,6 @@ static const int8_t epf_dist_2[1][2] = {{0,0}};
 /* The weight is 1 + dist * (a negative constant / sigma * step_mul). Sigma
    and step_mul are fixed for a whole sample, so the reciprocal is hoisted out
    of the tap loop; only the multiply-add stays per tap. */
-#define EPF_SIGMA_MUL (6.6f * (0.70710678118654752f - 1.0f))
-
 #ifdef JXL_EPF_SSE2
 /* epf_pass, eight samples at a time. This is the densest arithmetic in the
    decoder -- step 0 is 12 kernel taps x 5 SAD offsets x 3 channels per
@@ -164,7 +162,7 @@ static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
         smv = _mm256_setr_ps(border_mul, step_mul, step_mul, step_mul,
                              step_mul, step_mul, step_mul, border_mul);
     }
-    nis = _mm256_mul_ps(_mm256_set1_ps(EPF_SIGMA_MUL / sigma_val), smv);
+    nis = _mm256_mul_ps(_mm256_set1_ps(sigma_val), smv);
 
     for (k = 0; k < nkernel; k++) dist8[k] = _mm256_setzero_ps();
     for (c = 0; c < 3; c++) {
@@ -251,7 +249,7 @@ static JXL_INLINE_HINT float epf_row8_pass1(
         smv = _mm256_setr_ps(border_mul, step_mul, step_mul, step_mul,
                              step_mul, step_mul, step_mul, border_mul);
     }
-    nis = _mm256_mul_ps(_mm256_set1_ps(EPF_SIGMA_MUL / sigma_val), smv);
+    nis = _mm256_mul_ps(_mm256_set1_ps(sigma_val), smv);
 
     if (!reuse_vtop) {
         for (c = 0; c < 3; c++) {
@@ -398,7 +396,7 @@ static uint32_t epf_row_pass1_avx2(
     int prev_valid = 0;
     for (; x + 9 < w; x += 8) {
         float sigma_val = sigma_row[x / 8];
-        if (sigma_val < 0.3f) {
+        if (sigma_val == 0.0f) {
             int c;
             for (c = 0; c < 3; c++) {
                 _mm256_storeu_ps(out[c] + row + x,
@@ -407,7 +405,7 @@ static uint32_t epf_row_pass1_avx2(
             prev_valid = 0;
         } else {
             int reuse_vtop = can_reuse_vtop && prev_vsad &&
-                             prev_sigma_row[x / 8] >= 0.3f;
+                             prev_sigma_row[x / 8] != 0.0f;
             if (!prev_valid)
                 prev_hsad = epf_hsad_one(in, row, x - 1, stride, cscale);
             prev_hsad = epf_row8_pass1(
@@ -505,7 +503,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                quad is 4-aligned, so x/8 is constant across it. */
             if (use_avx2 && y_inside && (x & 7u) == 0 &&
                 x >= (uint32_t)pad && x + 7 + (uint32_t)pad < w) {
-                if (sigma_val < 0.3f) {
+                if (sigma_val == 0.0f) {
                     for (c = 0; c < 3; c++) {
                         memcpy(out[c] + row + x, in[c] + row + x,
                                8 * sizeof(float));
@@ -522,7 +520,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
             if (y_inside && (x & 3u) == 0 &&
                 x >= (uint32_t)pad && x + 3 + (uint32_t)pad < w) {
                 __m128 dist4[12], sum4[3], sw, nis;
-                if (sigma_val < 0.3f) {
+                if (sigma_val == 0.0f) {
                     for (c = 0; c < 3; c++) {
                         _mm_storeu_ps(out[c] + row + x,
                                       _mm_loadu_ps(in[c] + row + x));
@@ -533,7 +531,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                 /* sm is per-lane: within an 8-wide block only lanes 0 and 7
                    take border_mul, and a 4-aligned quad covers either 0..3 or
                    4..7, so there are just two patterns. */
-                nis = _mm_mul_ps(_mm_set1_ps(EPF_SIGMA_MUL / sigma_val),
+                nis = _mm_mul_ps(_mm_set1_ps(sigma_val),
                                  is_y_border ? sm_border
                                              : ((x & 7u) == 0 ? sm_lo : sm_hi));
                 for (k = 0; k < nkernel; k++) dist4[k] = _mm_setzero_ps();
@@ -579,14 +577,14 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
             float sum[3];
             float sum_weights, inv_w, sm, neg_inv_sigma;
 
-            if (sigma_val < 0.3f) {
+            if (sigma_val == 0.0f) {
                 for (c = 0; c < 3; c++) out[c][row + x] = in[c][row + x];
                 x++;
                 continue;
             }
             if (is_y_border || (x & 7u) == 0 || (x & 7u) == 7) sm = border_mul;
             else sm = step_mul;
-            neg_inv_sigma = EPF_SIGMA_MUL / sigma_val * sm;
+            neg_inv_sigma = sigma_val * sm;
 
             /* The SADs come first, one channel at a time: a channel's whole
                footprint then comes from one plane, and its centre samples stay
