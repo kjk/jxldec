@@ -1509,10 +1509,10 @@ void jxl_cfl_lf(float *x, float *y, float *b, uint32_t w, uint32_t h,
    applying the quantization bias, the dequant matrix and the global scale. */
 #ifdef JXL_VARDCT_SSE2
 JXL_TARGET_AVX2
-static void dequant_varblock8(float *coeff, size_t stride, uint32_t w,
-                              uint32_t h, const float *matrix, float mul,
-                              float quant_bias,
-                              float quant_bias_numerator) {
+static JXL_INLINE_HINT void
+dequant_varblock8_core(float *coeff, size_t stride, uint32_t w, uint32_t h,
+                       const float *matrix, float mul, float quant_bias,
+                       float quant_bias_numerator) {
     const __m256 vbias = _mm256_set1_ps(quant_bias);
     const __m256 vnum = _mm256_set1_ps(quant_bias_numerator);
     const __m256 vmul = _mm256_set1_ps(mul);
@@ -1536,6 +1536,43 @@ static void dequant_varblock8(float *coeff, size_t stride, uint32_t w,
             v = _mm256_mul_ps(v, _mm256_loadu_ps(mrow + x));
             v = _mm256_mul_ps(v, vmul);
             _mm256_storeu_ps(row + x, v);
+        }
+    }
+}
+
+JXL_TARGET_AVX2
+static void dequant_varblock8(float *coeff, size_t stride, uint32_t w,
+                              uint32_t h, const float *matrix, float mul,
+                              float quant_bias,
+                              float quant_bias_numerator) {
+    dequant_varblock8_core(coeff, stride, w, h, matrix, mul, quant_bias,
+                           quant_bias_numerator);
+    _mm256_zeroupper();
+}
+
+/* As with the batched 8x8 IDCT, enter the AVX2 kernel once per plane rather
+   than once per block. Besides amortizing the ABI prologue, this leaves the
+   matrix and bias constants available to the optimizer across blocks. */
+JXL_TARGET_AVX2
+void jxl_dequant_dct8_plane(float *coeff, size_t stride,
+                            const jxl_block_info *blocks,
+                            uint32_t blocks_w, uint32_t blocks_h,
+                            int channel, const jxl_dequant_matrices *dm,
+                            const jxl_quantizer *q, float qm_scale,
+                            float quant_bias, float quant_bias_numerator) {
+    const int slot = jxl_tr_matrix_index(JXL_TR_DCT8);
+    const float *matrix = dm->matrix_tr[slot][channel];
+    uint32_t bx, by;
+    for (by = 0; by < blocks_h; by++) {
+        for (bx = 0; bx < blocks_w; bx++) {
+            const jxl_block_info *bi =
+                blocks + (size_t)by * blocks_w + bx;
+            float mul =
+                65536.0f / ((float)q->global_scale * (float)bi->hf_mul) *
+                qm_scale;
+            dequant_varblock8_core(
+                coeff + (size_t)(by * 8) * stride + bx * 8, stride, 8, 8,
+                matrix, mul, quant_bias, quant_bias_numerator);
         }
     }
     _mm256_zeroupper();

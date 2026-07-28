@@ -29,6 +29,7 @@
 #endif
 
 static int jxl_avx2_cached = -1;
+static int jxl_avx2_fma_cached = -1;
 
 static int jxl_detect_avx2(void) {
 #if defined(JXL_NO_AVX2)
@@ -66,6 +67,30 @@ int jxl_has_avx2(void) {
     if (v < 0) {
         v = jxl_detect_avx2();
         jxl_avx2_cached = v;
+    }
+    return v;
+}
+
+static int jxl_detect_avx2_fma(void) {
+    if (!jxl_has_avx2()) return 0;
+#if defined(_WIN32) && (defined(_M_X64) || defined(_M_AMD64) || defined(_M_IX86))
+    int r[4];
+    __cpuidex(r, 1, 0);
+    return (r[2] & (1 << 12)) != 0;             /* FMA */
+#elif defined(__x86_64__) || defined(__i386__)
+    unsigned a, b, c, d;
+    if (!__get_cpuid_count(1, 0, &a, &b, &c, &d)) return 0;
+    return (c & (1u << 12)) != 0;
+#else
+    return 0;
+#endif
+}
+
+int jxl_has_avx2_fma(void) {
+    int v = jxl_avx2_fma_cached;
+    if (v < 0) {
+        v = jxl_detect_avx2_fma();
+        jxl_avx2_fma_cached = v;
     }
     return v;
 }

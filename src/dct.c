@@ -424,6 +424,54 @@ static JXL_INLINE_HINT void dct8_v8(__m256 *io, int inverse) {
     }
 }
 
+/* libjxl's common 8-point inverse kernel. This is deliberately the only DCT
+   path that opts into FMA: the fused multiply-adds reduce both the instruction
+   count and the dependency depth, while the separate target attribute keeps
+   the scalar/SSE2 and all other AVX2 arithmetic unchanged. */
+JXL_TARGET_AVX2_FMA
+static JXL_INLINE_HINT void idct4_v8_fma(__m256 *io) {
+    const __m256 sqrt2 = _mm256_set1_ps(JXL_SQRT2);
+    const __m256 m0 = _mm256_set1_ps(sec_half_4[0]);
+    const __m256 m1 = _mm256_set1_ps(sec_half_4[1]);
+    __m256 e0 = _mm256_add_ps(io[0], io[2]);
+    __m256 e1 = _mm256_sub_ps(io[0], io[2]);
+    __m256 o0 = _mm256_mul_ps(io[1], sqrt2);
+    __m256 o1 = _mm256_add_ps(io[3], io[1]);
+    __m256 b0 = _mm256_add_ps(o0, o1);
+    __m256 b1 = _mm256_sub_ps(o0, o1);
+    io[0] = _mm256_fmadd_ps(m0, b0, e0);
+    io[3] = _mm256_fnmadd_ps(m0, b0, e0);
+    io[1] = _mm256_fmadd_ps(m1, b1, e1);
+    io[2] = _mm256_fnmadd_ps(m1, b1, e1);
+}
+
+JXL_TARGET_AVX2_FMA
+static JXL_INLINE_HINT void idct8_v8_fma(__m256 *io) {
+    const __m256 sqrt2 = _mm256_set1_ps(JXL_SQRT2);
+    const __m256 m0 = _mm256_set1_ps(sec_half_8[0]);
+    const __m256 m1 = _mm256_set1_ps(sec_half_8[1]);
+    const __m256 m2 = _mm256_set1_ps(sec_half_8[2]);
+    const __m256 m3 = _mm256_set1_ps(sec_half_8[3]);
+    __m256 even[4], odd[4];
+
+    even[0] = io[0]; even[1] = io[2];
+    even[2] = io[4]; even[3] = io[6];
+    odd[0] = _mm256_mul_ps(io[1], sqrt2);
+    odd[1] = _mm256_add_ps(io[3], io[1]);
+    odd[2] = _mm256_add_ps(io[5], io[3]);
+    odd[3] = _mm256_add_ps(io[7], io[5]);
+    idct4_v8_fma(even);
+    idct4_v8_fma(odd);
+    io[0] = _mm256_fmadd_ps(m0, odd[0], even[0]);
+    io[7] = _mm256_fnmadd_ps(m0, odd[0], even[0]);
+    io[1] = _mm256_fmadd_ps(m1, odd[1], even[1]);
+    io[6] = _mm256_fnmadd_ps(m1, odd[1], even[1]);
+    io[2] = _mm256_fmadd_ps(m2, odd[2], even[2]);
+    io[5] = _mm256_fnmadd_ps(m2, odd[2], even[2]);
+    io[3] = _mm256_fmadd_ps(m3, odd[3], even[3]);
+    io[4] = _mm256_fnmadd_ps(m3, odd[3], even[3]);
+}
+
 JXL_TARGET_AVX2
 static void dct_1d_v8(__m256 *io, int n, __m256 *scratch, int inverse) {
     const __m256 sqrt2 = _mm256_set1_ps(JXL_SQRT2);
@@ -603,6 +651,46 @@ static void dct_8x8(float *data, size_t stride, int inverse) {
     _mm256_zeroupper();
 }
 
+JXL_TARGET_AVX2_FMA
+static JXL_INLINE_HINT void idct_8x8_fma_core(float *data, size_t stride) {
+    __m256 r[8];
+    int y;
+    for (y = 0; y < 8; y++) {
+        r[y] = _mm256_loadu_ps(data + (size_t)y * stride);
+    }
+    transpose8_ps(&r[0], &r[1], &r[2], &r[3],
+                  &r[4], &r[5], &r[6], &r[7]);
+    idct8_v8_fma(r);
+    transpose8_ps(&r[0], &r[1], &r[2], &r[3],
+                  &r[4], &r[5], &r[6], &r[7]);
+    idct8_v8_fma(r);
+    for (y = 0; y < 8; y++) {
+        _mm256_storeu_ps(data + (size_t)y * stride, r[y]);
+    }
+}
+
+JXL_TARGET_AVX2_FMA
+static void idct_8x8_fma(float *data, size_t stride) {
+    idct_8x8_fma_core(data, stride);
+    _mm256_zeroupper();
+}
+
+/* Amortize the Windows x64 nonvolatile-SIMD prologue across a whole plane.
+   A standalone 8x8 entry saves ten XMM registers and builds an aligned stack
+   frame; doing that once per block was a substantial fraction of IDCT time. */
+JXL_TARGET_AVX2_FMA
+void jxl_idct8x8_plane(float *data, size_t stride,
+                       uint32_t blocks_w, uint32_t blocks_h) {
+    uint32_t bx, by;
+    for (by = 0; by < blocks_h; by++) {
+        for (bx = 0; bx < blocks_w; bx++) {
+            idct_8x8_fma_core(
+                data + (size_t)(by * 8) * stride + bx * 8, stride);
+        }
+    }
+    _mm256_zeroupper();
+}
+
 /* Eight rows at once. The transpose keeps each row in one SIMD lane while
    the 1-D kernel runs, then restores the ordinary row-major layout. */
 JXL_TARGET_AVX2
@@ -758,7 +846,8 @@ void jxl_dct_2d(float *data, size_t stride, int w, int h, int inverse) {
 
 #ifdef JXL_DCT_SSE2
     if (w == 8 && h == 8 && jxl_has_avx2()) {
-        dct_8x8(data, stride, inverse);
+        if (inverse && jxl_has_avx2_fma()) idct_8x8_fma(data, stride);
+        else dct_8x8(data, stride, inverse);
         return;
     }
     use_avx2 = jxl_has_avx2();

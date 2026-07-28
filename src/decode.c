@@ -447,30 +447,54 @@ static void vardct_finish_blocks(jxl_vardct_state *v,
                                  const jxl_frame_header *fh, int skip_cb) {
     float qm_scale[3];
     uint32_t bx, by;
-    int c;
+    int c, batch_dct8 = 0;
 
     qm_scale[0] = powf(0.8f, (float)fh->x_qm_scale - 2.0f);
     qm_scale[1] = 1.0f;
     qm_scale[2] = powf(0.8f, (float)fh->b_qm_scale - 2.0f);
+
+    if (jxl_has_avx2_fma() &&
+        !v->hs[0] && !v->vs[0] && !v->hs[1] && !v->vs[1] &&
+        !v->hs[2] && !v->vs[2]) {
+        size_t i, nblocks = (size_t)v->bw * v->bh;
+        batch_dct8 = 1;
+        for (i = 0; i < nblocks; i++) {
+            if (v->block_info[i].dct_select != JXL_TR_DCT8) {
+                batch_dct8 = 0;
+                break;
+            }
+        }
+    }
 
     /* In grayscale YCbCr output, the final retained value is
        Y + 1.402*Cr. Cb entropy was consumed to keep the ANS state and
        nonzero contexts in step, but its coefficients and CfL update were
        discarded, so neither dequantization nor an inverse transform remains
        to do for that channel. */
-    for (c = skip_cb ? 1 : 0; c < 3; c++) {
-        for (by = 0; by < v->bh; by++) {
-            uint32_t sby = by >> v->vs[c];
-            if ((sby << v->vs[c]) != by) continue;
-            for (bx = 0; bx < v->bw; bx++) {
-                const jxl_block_info *bi = &v->block_info[(size_t)by * v->bw + bx];
-                uint32_t sbx = bx >> v->hs[c];
-                if ((sbx << v->hs[c]) != bx) continue;
-                if (bi->dct_select >= JXL_TR_COUNT) continue;
-                jxl_dequant_varblock(
-                    v->coeff[c] + (size_t)(sby * 8) * v->pw + sbx * 8, v->pw,
-                    bi->dct_select, bi->hf_mul, c, &v->dm, &v->quantizer,
-                    qm_scale[c], meta->quant_bias[c], meta->quant_bias_numerator);
+    if (batch_dct8) {
+        for (c = skip_cb ? 1 : 0; c < 3; c++) {
+            jxl_dequant_dct8_plane(
+                v->coeff[c], v->pw, v->block_info, v->bw, v->bh, c,
+                &v->dm, &v->quantizer, qm_scale[c], meta->quant_bias[c],
+                meta->quant_bias_numerator);
+        }
+    } else {
+        for (c = skip_cb ? 1 : 0; c < 3; c++) {
+            for (by = 0; by < v->bh; by++) {
+                uint32_t sby = by >> v->vs[c];
+                if ((sby << v->vs[c]) != by) continue;
+                for (bx = 0; bx < v->bw; bx++) {
+                    const jxl_block_info *bi =
+                        &v->block_info[(size_t)by * v->bw + bx];
+                    uint32_t sbx = bx >> v->hs[c];
+                    if ((sbx << v->hs[c]) != bx) continue;
+                    if (bi->dct_select >= JXL_TR_COUNT) continue;
+                    jxl_dequant_varblock(
+                        v->coeff[c] + (size_t)(sby * 8) * v->pw + sbx * 8,
+                        v->pw, bi->dct_select, bi->hf_mul, c, &v->dm,
+                        &v->quantizer, qm_scale[c], meta->quant_bias[c],
+                        meta->quant_bias_numerator);
+                }
             }
         }
     }
@@ -480,6 +504,18 @@ static void vardct_finish_blocks(jxl_vardct_state *v,
     if (!v->hs[0] && !v->vs[0] && !v->hs[2] && !v->vs[2]) {
         jxl_cfl_hf(v->coeff[0], v->coeff[1], v->coeff[2], v->pw, v->pw, v->ph,
                    v->x_from_y, v->b_from_y, v->cfl_w, &v->chan_corr, skip_cb);
+    }
+
+    if (batch_dct8) {
+        for (c = skip_cb ? 1 : 0; c < 3; c++) {
+            for (by = 0; by < v->bh; by++) {
+                float *row = v->coeff[c] + (size_t)(by * 8) * v->pw;
+                const float *lf_row = v->lf[c] + (size_t)by * v->bw;
+                for (bx = 0; bx < v->bw; bx++) row[bx * 8] = lf_row[bx];
+            }
+            jxl_idct8x8_plane(v->coeff[c], v->pw, v->bw, v->bh);
+        }
+        return;
     }
 
     for (c = skip_cb ? 1 : 0; c < 3; c++) {

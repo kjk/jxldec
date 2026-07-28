@@ -193,7 +193,10 @@ static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
                 _mm256_loadu_ps(in[c] + row + x + koff[k])));
         }
     }
-    sw = _mm256_div_ps(one, sw);
+    /* This is libjxl's non-high-precision EPF reciprocal as well. Besides
+       avoiding the expensive vector divide, matching the reference estimate
+       makes the filtered floats converge before the later color transform. */
+    sw = _mm256_rcp_ps(sw);
     for (c = 0; c < 3; c++)
         _mm256_storeu_ps(out[c] + row + x, _mm256_mul_ps(sum8[c], sw));
     _mm256_zeroupper();
@@ -229,7 +232,7 @@ static JXL_EPF_NOINLINE float epf_hsad_one(
 }
 #undef JXL_EPF_NOINLINE
 
-JXL_TARGET_AVX2
+JXL_TARGET_AVX2_FMA
 static JXL_INLINE_HINT float epf_row8_pass1(
     float *in[3], float *out[3], size_t row, uint32_t x, size_t stride,
     const float cscale[3], float sigma_val, float step_mul, float border_mul,
@@ -279,7 +282,7 @@ static JXL_INLINE_HINT float epf_row8_pass1(
                 _mm256_and_ps(absmask, _mm256_sub_ps(p11, p12)));
             acc0 = _mm256_add_ps(acc0,
                 _mm256_and_ps(absmask, _mm256_sub_ps(p31, p32)));
-            dist0 = _mm256_add_ps(dist0, _mm256_mul_ps(cs, acc0));
+            dist0 = _mm256_fmadd_ps(cs, acc0, dist0);
         }
     }
 
@@ -323,8 +326,8 @@ static JXL_INLINE_HINT float epf_row8_pass1(
             _mm256_and_ps(absmask, _mm256_sub_ps(
                 _mm256_loadu_ps(p + 2), _mm256_loadu_ps(p + 1))));
 
-        dist1 = _mm256_add_ps(dist1, _mm256_mul_ps(cs, acc1));
-        dist3 = _mm256_add_ps(dist3, _mm256_mul_ps(cs, acc3));
+        dist1 = _mm256_fmadd_ps(cs, acc1, dist1);
+        dist3 = _mm256_fmadd_ps(cs, acc3, dist3);
     }
     if (prev_vsad) _mm256_storeu_ps(prev_vsad + x, dist1);
 
@@ -337,47 +340,41 @@ static JXL_INLINE_HINT float epf_row8_pass1(
     sum2 = _mm256_loadu_ps(in[2] + row + x);
     sw = one;
 
-    wgt = _mm256_add_ps(one, _mm256_mul_ps(dist0, nis));
+    wgt = _mm256_fmadd_ps(dist0, nis, one);
     wgt = _mm256_max_ps(wgt, zero);
     sw = _mm256_add_ps(sw, wgt);
-    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(
-        wgt, _mm256_loadu_ps(in[0] + row + x - (ptrdiff_t)stride)));
-    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(
-        wgt, _mm256_loadu_ps(in[1] + row + x - (ptrdiff_t)stride)));
-    sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(
-        wgt, _mm256_loadu_ps(in[2] + row + x - (ptrdiff_t)stride)));
+    sum0 = _mm256_fmadd_ps(
+        wgt, _mm256_loadu_ps(in[0] + row + x - (ptrdiff_t)stride), sum0);
+    sum1 = _mm256_fmadd_ps(
+        wgt, _mm256_loadu_ps(in[1] + row + x - (ptrdiff_t)stride), sum1);
+    sum2 = _mm256_fmadd_ps(
+        wgt, _mm256_loadu_ps(in[2] + row + x - (ptrdiff_t)stride), sum2);
 
-    wgt = _mm256_add_ps(one, _mm256_mul_ps(dist1, nis));
+    wgt = _mm256_fmadd_ps(dist1, nis, one);
     wgt = _mm256_max_ps(wgt, zero);
     sw = _mm256_add_ps(sw, wgt);
-    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(
-        wgt, _mm256_loadu_ps(in[0] + row + x + stride)));
-    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(
-        wgt, _mm256_loadu_ps(in[1] + row + x + stride)));
-    sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(
-        wgt, _mm256_loadu_ps(in[2] + row + x + stride)));
+    sum0 = _mm256_fmadd_ps(
+        wgt, _mm256_loadu_ps(in[0] + row + x + stride), sum0);
+    sum1 = _mm256_fmadd_ps(
+        wgt, _mm256_loadu_ps(in[1] + row + x + stride), sum1);
+    sum2 = _mm256_fmadd_ps(
+        wgt, _mm256_loadu_ps(in[2] + row + x + stride), sum2);
 
-    wgt = _mm256_add_ps(one, _mm256_mul_ps(dist2, nis));
+    wgt = _mm256_fmadd_ps(dist2, nis, one);
     wgt = _mm256_max_ps(wgt, zero);
     sw = _mm256_add_ps(sw, wgt);
-    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(
-        wgt, _mm256_loadu_ps(in[0] + row + x - 1)));
-    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(
-        wgt, _mm256_loadu_ps(in[1] + row + x - 1)));
-    sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(
-        wgt, _mm256_loadu_ps(in[2] + row + x - 1)));
+    sum0 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[0] + row + x - 1), sum0);
+    sum1 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[1] + row + x - 1), sum1);
+    sum2 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[2] + row + x - 1), sum2);
 
-    wgt = _mm256_add_ps(one, _mm256_mul_ps(dist3, nis));
+    wgt = _mm256_fmadd_ps(dist3, nis, one);
     wgt = _mm256_max_ps(wgt, zero);
     sw = _mm256_add_ps(sw, wgt);
-    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(
-        wgt, _mm256_loadu_ps(in[0] + row + x + 1)));
-    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(
-        wgt, _mm256_loadu_ps(in[1] + row + x + 1)));
-    sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(
-        wgt, _mm256_loadu_ps(in[2] + row + x + 1)));
+    sum0 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[0] + row + x + 1), sum0);
+    sum1 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[1] + row + x + 1), sum1);
+    sum2 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[2] + row + x + 1), sum2);
 
-    sw = _mm256_div_ps(one, sw);
+    sw = _mm256_rcp_ps(sw);
     _mm256_storeu_ps(out[0] + row + x, _mm256_mul_ps(sum0, sw));
     _mm256_storeu_ps(out[1] + row + x, _mm256_mul_ps(sum1, sw));
     _mm256_storeu_ps(out[2] + row + x, _mm256_mul_ps(sum2, sw));
@@ -391,7 +388,7 @@ static JXL_INLINE_HINT float epf_row8_pass1(
 /* Keep the AVX2 target boundary outside the hot x loop. Besides avoiding one
    call and one AVX/SSE handoff per octet, this lets the compiler keep the
    channel scales and fixed border pattern live for a whole interior row. */
-JXL_TARGET_AVX2
+JXL_TARGET_AVX2_FMA
 static uint32_t epf_row_pass1_avx2(
     float *in[3], float *out[3], size_t row, uint32_t x, uint32_t w,
     size_t stride, const float *sigma_row, const float cscale[3],
@@ -441,6 +438,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
 #ifdef JXL_EPF_SSE2
     __m128 epf_absmask, sm_border, sm_lo, sm_hi;
     const int use_avx2 = jxl_has_avx2();
+    const int use_avx2_fma = jxl_has_avx2_fma();
 #else
     (void)vsad_cache;
 #endif
@@ -489,7 +487,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
             float sigma_val = sigma_row[x / 8];
 
 #ifdef JXL_EPF_SSE2
-            if (use_avx2 && step == 1 && y_inside && (x & 7u) == 0 &&
+            if (use_avx2_fma && step == 1 && y_inside && (x & 7u) == 0 &&
                 x >= 2 && x + 9 < w) {
                 x = epf_row_pass1_avx2(in, out, row, x, w, stride, sigma_row,
                                        cscale, step_mul, border_mul,

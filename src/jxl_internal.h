@@ -47,6 +47,11 @@ int jxl_size_mul(size_t a, size_t b, size_t *out);
    SSE2 paths are diffed against each other. */
 int jxl_has_avx2(void);
 
+/* FMA is a separate CPUID feature from AVX2. It is used only by kernels that
+   explicitly opt into fused rounding; keeping it separate prevents clang's
+   fp-contract pass from changing the arithmetic in the other AVX2 paths. */
+int jxl_has_avx2_fma(void);
+
 /* AVX2 kernels sit beside their SSE2 twins in the same translation unit so
    the dist/ amalgamation stays one file. MSVC needs nothing; clang and gcc
    need the target attribute per function. */
@@ -59,8 +64,10 @@ int jxl_has_avx2(void);
    (that loop is load-bound, not FLOP-bound) and cost cross-machine
    reproducibility, so nothing here uses it. */
 #define JXL_TARGET_AVX2 __attribute__((target("avx2")))
+#define JXL_TARGET_AVX2_FMA __attribute__((target("avx2,fma")))
 #else
 #define JXL_TARGET_AVX2
+#define JXL_TARGET_AVX2_FMA
 #endif
 
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -928,7 +935,15 @@ void jxl_dequant_varblock(float *coeff, size_t stride, int tr, int32_t hf_mul,
                           int channel, const jxl_dequant_matrices *dm,
                           const jxl_quantizer *q, float qm_scale,
                           float quant_bias, float quant_bias_numerator);
+void jxl_dequant_dct8_plane(float *coeff, size_t stride,
+                            const jxl_block_info *blocks,
+                            uint32_t blocks_w, uint32_t blocks_h,
+                            int channel, const jxl_dequant_matrices *dm,
+                            const jxl_quantizer *q, float qm_scale,
+                            float quant_bias, float quant_bias_numerator);
 void jxl_transform_varblock(float *coeff, size_t stride, int tr);
+void jxl_idct8x8_plane(float *data, size_t stride,
+                       uint32_t blocks_w, uint32_t blocks_h);
 void jxl_fill_varblock_lf(float *coeff, size_t stride, int tr,
                           const float *lf, size_t lf_stride, uint32_t lf_x,
                           uint32_t lf_y);

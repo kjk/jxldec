@@ -747,6 +747,57 @@ static void sc_record(jxl_sc_pred *sc, const jxl_sc_result *pred, int32_t sample
     }
 }
 
+/* Interior-row counterpart to sc_record. The general version has to handle
+   both row transitions and the right-edge replication on every sample.
+   Between x=2 and x=w-3 on y>1 neither can happen, so keep just the state
+   transition that is actually taken. */
+static JXL_INLINE_HINT void
+sc_record_nec(jxl_sc_pred *sc, const jxl_sc_result *pred, int32_t sample) {
+    int64_t s = (int64_t)sample << 3;
+    int64_t true_err = pred->prediction - s;
+    uint32_t subpred_err0, subpred_err1, subpred_err2, subpred_err3;
+    uint32_t x = sc->x;
+    uint32_t next_x = x + 1;
+    uint32_t *subpred_row = sc->subpred_err_row + (size_t)x * 4;
+    int64_t d;
+
+    d = pred->subpred[0] - s;
+    if (d < 0) d = -d;
+    subpred_err0 = (uint32_t)((d + 3) >> 3);
+    d = pred->subpred[1] - s;
+    if (d < 0) d = -d;
+    subpred_err1 = (uint32_t)((d + 3) >> 3);
+    d = pred->subpred[2] - s;
+    if (d < 0) d = -d;
+    subpred_err2 = (uint32_t)((d + 3) >> 3);
+    d = pred->subpred[3] - s;
+    if (d < 0) d = -d;
+    subpred_err3 = (uint32_t)((d + 3) >> 3);
+
+    sc->true_err_row[x] = (int32_t)true_err;
+    subpred_row[0] = subpred_err0;
+    subpred_row[1] = subpred_err1;
+    subpred_row[2] = subpred_err2;
+    subpred_row[3] = subpred_err3;
+    sc->x = next_x;
+    sc->true_err_w = (int32_t)true_err;
+    sc->true_err_nw = sc->true_err_n;
+    sc->true_err_n = sc->true_err_ne;
+    sc->subpred_err_nw_ww[0] = sc->subpred_err_n_w[0];
+    sc->subpred_err_nw_ww[1] = sc->subpred_err_n_w[1];
+    sc->subpred_err_nw_ww[2] = sc->subpred_err_n_w[2];
+    sc->subpred_err_nw_ww[3] = sc->subpred_err_n_w[3];
+    sc->subpred_err_n_w[0] = sc->subpred_err_ne[0] + subpred_err0;
+    sc->subpred_err_n_w[1] = sc->subpred_err_ne[1] + subpred_err1;
+    sc->subpred_err_n_w[2] = sc->subpred_err_ne[2] + subpred_err2;
+    sc->subpred_err_n_w[3] = sc->subpred_err_ne[3] + subpred_err3;
+    sc->true_err_ne = sc->true_err_row[next_x + 1];
+    sc->subpred_err_ne[0] = sc->subpred_err_row[(size_t)(next_x + 1) * 4];
+    sc->subpred_err_ne[1] = sc->subpred_err_row[(size_t)(next_x + 1) * 4 + 1];
+    sc->subpred_err_ne[2] = sc->subpred_err_row[(size_t)(next_x + 1) * 4 + 2];
+    sc->subpred_err_ne[3] = sc->subpred_err_row[(size_t)(next_x + 1) * 4 + 3];
+}
+
 /* Per-sample decoding context: the 16 cached properties plus the
    self-correcting prediction, if the tree needs it. */
 typedef struct {
@@ -788,6 +839,45 @@ static void props_compute(const jxl_pred_state *ps, jxl_props *pr,
     pr->cache[12] = (int32_t)((uint32_t)ps->n - (uint32_t)pred_ne(ps));
     pr->cache[13] = (int32_t)((uint32_t)ps->n - (uint32_t)pred_nn(ps));
     pr->cache[14] = (int32_t)((uint32_t)ps->w - (uint32_t)pred_ww(ps));
+    pr->cache[15] = pr->sc.max_error;
+}
+
+/* Full property set for a non-edge sample. At this point the two row buffers
+   are complete at every index we read, so the four neighbour helpers' bounds
+   tests collapse to direct loads just as in libjxl's PredictTreeWPNEC path. */
+static JXL_INLINE_HINT void
+props_compute_nec(const jxl_pred_state *ps, jxl_props *pr,
+                  int32_t channel, int32_t stream_idx) {
+    uint32_t x = ps->x;
+    int32_t ne = ps->prev_row[x + 1];
+    int32_t nn = ps->curr_row[x];
+    int32_t ww = ps->curr_row[x - 2];
+    int32_t w_nw = (int32_t)((uint32_t)ps->w - (uint32_t)ps->nw);
+    if (ps->use_sc) {
+        sc_predict(&ps->sc, ps->n, ps->nw, ne, ps->w, nn, &pr->sc);
+        pr->has_sc = 1;
+    } else {
+        pr->has_sc = 0;
+        pr->sc.prediction = 0;
+        pr->sc.max_error = 0;
+    }
+    pr->cache[0] = channel;
+    pr->cache[1] = stream_idx;
+    pr->cache[2] = (int32_t)ps->y;
+    pr->cache[3] = (int32_t)x;
+    pr->cache[4] =
+        (int32_t)(ps->n < 0 ? 0u - (uint32_t)ps->n : (uint32_t)ps->n);
+    pr->cache[5] =
+        (int32_t)(ps->w < 0 ? 0u - (uint32_t)ps->w : (uint32_t)ps->w);
+    pr->cache[6] = ps->n;
+    pr->cache[7] = ps->w;
+    pr->cache[8] = (int32_t)((uint32_t)ps->w - (uint32_t)ps->prev_grad);
+    pr->cache[9] = (int32_t)((uint32_t)w_nw + (uint32_t)ps->n);
+    pr->cache[10] = w_nw;
+    pr->cache[11] = (int32_t)((uint32_t)ps->nw - (uint32_t)ps->n);
+    pr->cache[12] = (int32_t)((uint32_t)ps->n - (uint32_t)ne);
+    pr->cache[13] = (int32_t)((uint32_t)ps->n - (uint32_t)nn);
+    pr->cache[14] = (int32_t)((uint32_t)ps->w - (uint32_t)ww);
     pr->cache[15] = pr->sc.max_error;
 }
 
@@ -901,6 +991,49 @@ static int32_t predict_sample(const jxl_pred_state *ps, const jxl_props *pr,
     }
 }
 
+static JXL_INLINE_HINT int32_t
+predict_sample_nec(const jxl_pred_state *ps, const jxl_props *pr,
+                   uint8_t predictor) {
+    uint32_t x = ps->x;
+    int32_t ne = ps->prev_row[x + 1];
+    switch (predictor) {
+        case JXL_PRED_ZERO: return 0;
+        case JXL_PRED_WEST: return ps->w;
+        case JXL_PRED_NORTH: return ps->n;
+        case JXL_PRED_AVG_W_N:
+            return (int32_t)(((int64_t)ps->w + ps->n) / 2);
+        case JXL_PRED_SELECT: {
+            int32_t n = ps->n, w = ps->w, nw = ps->nw;
+            uint64_t dn =
+                (uint64_t)(n > nw ? (int64_t)n - nw : (int64_t)nw - n);
+            uint64_t dw =
+                (uint64_t)(w > nw ? (int64_t)w - nw : (int64_t)nw - w);
+            return dn < dw ? w : n;
+        }
+        case JXL_PRED_GRADIENT:
+            return grad_clamped(ps->n, ps->w, ps->nw);
+        case JXL_PRED_SELF_CORRECTING:
+            return (int32_t)((pr->sc.prediction + 3) >> 3);
+        case JXL_PRED_NORTH_EAST: return ne;
+        case JXL_PRED_NORTH_WEST: return ps->nw;
+        case JXL_PRED_WEST_WEST: return ps->curr_row[x - 2];
+        case JXL_PRED_AVG_W_NW:
+            return (int32_t)(((int64_t)ps->w + ps->nw) / 2);
+        case JXL_PRED_AVG_N_NW:
+            return (int32_t)(((int64_t)ps->n + ps->nw) / 2);
+        case JXL_PRED_AVG_N_NE:
+            return (int32_t)(((int64_t)ps->n + ne) / 2);
+        default: {
+            int64_t n = ps->n, w = ps->w;
+            int64_t nn = ps->curr_row[x];
+            int64_t ww = ps->curr_row[x - 2];
+            int64_t nee = ps->prev_row[x + 2];
+            return (int32_t)((6 * n - 2 * nn + 7 * w + ww + nee +
+                              3 * (int64_t)ne + 8) / 16);
+        }
+    }
+}
+
 static void pred_record(jxl_pred_state *ps, const jxl_props *pr, int32_t sample) {
     if (ps->use_sc && pr->has_sc) sc_record(&ps->sc, &pr->sc, sample);
 
@@ -932,6 +1065,18 @@ static void pred_record(jxl_pred_state *ps, const jxl_props *pr, int32_t sample)
             ps->n = ps->prev_row[ps->x];
         }
     }
+}
+
+static JXL_INLINE_HINT void
+pred_record_nec(jxl_pred_state *ps, const jxl_props *pr, int32_t sample) {
+    uint32_t x = ps->x;
+    if (ps->use_sc && pr->has_sc) sc_record_nec(&ps->sc, &pr->sc, sample);
+    ps->curr_row[x] = sample;
+    ps->x = x + 1;
+    ps->prev_grad = pr->cache[9];
+    ps->w = sample;
+    ps->nw = ps->n;
+    ps->n = ps->prev_row[x + 1];
 }
 
 /* ===================================================================== */
@@ -2472,6 +2617,74 @@ static uint32_t ma_max_prev_channels(const jxl_ma_config *ma) {
     return max;
 }
 
+#if defined(_MSC_VER)
+#define JXL_MODULAR_NOINLINE __declspec(noinline)
+#elif defined(__clang__) || defined(__GNUC__)
+#define JXL_MODULAR_NOINLINE __attribute__((noinline))
+#else
+#define JXL_MODULAR_NOINLINE
+#endif
+
+/* Keep the large full-property loop out of jxl_modular_decode. Responsive
+   streams take a smaller property-only path in that function; putting this
+   second interior loop beside it enlarged the parent enough to slow those
+   streams despite never executing the new code. libjxl likewise dispatches
+   its NEC template specialization as a separate instantiated function. */
+static JXL_MODULAR_NOINLINE int
+modular_decode_general_nec(jxl_mchan *ch, jxl_pred_state *ps,
+                           const jxl_ma_config *ma, jxl_dec *dec, jxl_br *br,
+                           uint32_t dist_multiplier, int32_t channel,
+                           int32_t stream_idx) {
+    uint32_t x, y;
+
+#define JXL_NEC_SAMPLE(COMPUTE_PROPS, PREDICT_SAMPLE, RECORD_SAMPLE) do {     \
+        jxl_props pr;                                                         \
+        const jxl_ma_leaf *leaf;                                              \
+        uint32_t token;                                                       \
+        int32_t diff, value;                                                  \
+                                                                              \
+        COMPUTE_PROPS;                                                        \
+        leaf = ma_get_leaf_local(ma, &pr);                                    \
+        token = jxl_dec_read_clustered(dec, br, leaf->cluster,                \
+                                       dist_multiplier);                      \
+        diff = jxl_unpack_signed(token);                                      \
+        diff = (int32_t)((uint32_t)diff * leaf->multiplier +                  \
+                         (uint32_t)leaf->offset);                              \
+        value = (int32_t)((uint32_t)diff + (uint32_t)(PREDICT_SAMPLE));       \
+        row[x] = value;                                                       \
+        RECORD_SAMPLE;                                                        \
+    } while (0)
+
+    for (y = 0; y < ch->h; y++) {
+        int32_t *row = ch->data + (size_t)y * ch->stride;
+        x = 0;
+        if (y > 1 && ch->w > 8) {
+            for (; x < 2; x++) {
+                JXL_NEC_SAMPLE(
+                    props_compute(ps, &pr, channel, stream_idx),
+                    predict_sample(ps, &pr, leaf->predictor),
+                    pred_record(ps, &pr, value));
+            }
+            for (; x + 2 < ch->w; x++) {
+                JXL_NEC_SAMPLE(
+                    props_compute_nec(ps, &pr, channel, stream_idx),
+                    predict_sample_nec(ps, &pr, leaf->predictor),
+                    pred_record_nec(ps, &pr, value));
+            }
+        }
+        for (; x < ch->w; x++) {
+            JXL_NEC_SAMPLE(
+                props_compute(ps, &pr, channel, stream_idx),
+                predict_sample(ps, &pr, leaf->predictor),
+                pred_record(ps, &pr, value));
+        }
+        if (br->err || dec->err) return -1;
+    }
+#undef JXL_NEC_SAMPLE
+    return 0;
+}
+#undef JXL_MODULAR_NOINLINE
+
 int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                        jxl_br *br, uint32_t stream_idx) {
     jxl_ma_config *ma = m->ma;
@@ -2947,7 +3160,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
 
 #define JXL_GENERAL_LOOP(GET_LEAF, COMPUTE_PROPS)                            \
         for (y = 0; y < ch->h; y++) {                                        \
-            int32_t *row = ch->data + (size_t)y * ch->stride;                \
+            int32_t *row = ch->data + (size_t)y * ch->stride;                 \
             for (x = 0; x < ch->w; x++) {                                    \
                 jxl_props pr;                                                 \
                 const jxl_ma_leaf *leaf;                                      \
@@ -2985,10 +3198,13 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                     props_compute_grad_wp(
                         &ps, &pr, (int32_t)ci, (int32_t)stream_idx))
             } else {
-                JXL_GENERAL_LOOP(
-                    ma_get_leaf_local(cma, &pr),
-                    props_compute(
-                        &ps, &pr, (int32_t)ci, (int32_t)stream_idx))
+                if (modular_decode_general_nec(
+                        ch, &ps, cma, dec, br, dist_multiplier, (int32_t)ci,
+                        (int32_t)stream_idx) != 0) {
+                    JXL_ERR(ctx, "modular: truncated stream %u",
+                            (unsigned)stream_idx);
+                    goto done;
+                }
             }
         } else {
             JXL_GENERAL_LOOP(
