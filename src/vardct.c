@@ -899,6 +899,7 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
     int hshifts[3], vshifts[3];
     uint32_t ctx_size, cluster_base;
     uint32_t hfp_bits, hfp;
+    uint32_t *nz_all = NULL;
     uint32_t *nz_row[3];
     uint32_t nz_len[3];
     uint32_t order0_offsets[3][64];
@@ -925,11 +926,19 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
 
     jxl_dec_begin(dist, br);
 
-    for (c = 0; c < 3; c++) {
-        nz_len[c] = (p->bi_w + ((1u << hshifts[c]) - 1)) >> hshifts[c];
-        nz_row[c] = (uint32_t *)jxl_calloc(ctx, nz_len[c] ? nz_len[c] : 1,
-                                           sizeof(uint32_t));
-        if (!nz_row[c]) goto done;
+    {
+        size_t nz_total = 0;
+        for (c = 0; c < 3; c++) {
+            nz_len[c] =
+                (p->bi_w + ((1u << hshifts[c]) - 1)) >> hshifts[c];
+            nz_total += nz_len[c] ? nz_len[c] : 1;
+        }
+        nz_all = (uint32_t *)jxl_calloc(ctx, nz_total, sizeof(uint32_t));
+        if (!nz_all) goto done;
+        nz_row[0] = nz_all;
+        for (c = 1; c < 3; c++) {
+            nz_row[c] = nz_row[c - 1] + (nz_len[c - 1] ? nz_len[c - 1] : 1);
+        }
     }
 
     for (y = 0; y < p->bi_h; y++) {
@@ -1225,7 +1234,7 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
     rc = 0;
 
 done:
-    for (c = 0; c < 3; c++) jxl_free(ctx, nz_row[c]);
+    jxl_free(ctx, nz_all);
     return rc;
 }
 

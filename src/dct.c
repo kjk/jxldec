@@ -580,6 +580,29 @@ static void transpose8_ps(__m256 *r0, __m256 *r1, __m256 *r2, __m256 *r3,
     *r7 = _mm256_permute2f128_ps(s3, s7, 0x31);
 }
 
+/* The overwhelmingly common 8x8 transform keeps the row-pass result in
+   registers for the column pass. This is expression-for-expression the same
+   row-then-column sequence as dct_rows8 followed by dct_cols8; it merely
+   removes their intermediate 64-float store and reload. */
+JXL_TARGET_AVX2
+static void dct_8x8(float *data, size_t stride, int inverse) {
+    __m256 r[8];
+    int y;
+    for (y = 0; y < 8; y++) {
+        r[y] = _mm256_loadu_ps(data + (size_t)y * stride);
+    }
+    transpose8_ps(&r[0], &r[1], &r[2], &r[3],
+                  &r[4], &r[5], &r[6], &r[7]);
+    dct8_v8(r, inverse);
+    transpose8_ps(&r[0], &r[1], &r[2], &r[3],
+                  &r[4], &r[5], &r[6], &r[7]);
+    dct8_v8(r, inverse);
+    for (y = 0; y < 8; y++) {
+        _mm256_storeu_ps(data + (size_t)y * stride, r[y]);
+    }
+    _mm256_zeroupper();
+}
+
 /* Eight rows at once. The transpose keeps each row in one SIMD lane while
    the 1-D kernel runs, then restores the ordinary row-major layout. */
 JXL_TARGET_AVX2
@@ -734,6 +757,10 @@ void jxl_dct_2d(float *data, size_t stride, int w, int h, int inverse) {
     }
 
 #ifdef JXL_DCT_SSE2
+    if (w == 8 && h == 8 && jxl_has_avx2()) {
+        dct_8x8(data, stride, inverse);
+        return;
+    }
     use_avx2 = jxl_has_avx2();
 #endif
     y = 0;
