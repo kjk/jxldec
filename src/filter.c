@@ -38,10 +38,76 @@ static uint32_t jxl_mirror(int64_t offset, uint32_t len) {
     }
 }
 
+#ifdef JXL_EPF_SSE2
+/* Keep the AVX2 target boundary outside both image loops. Gaborish is only a
+   nine-tap stencil, so entering a target helper for every octet would erase a
+   useful part of widening the existing SSE2 kernel. */
+JXL_TARGET_AVX2
+static void gabor_plane_avx2(float *plane, uint32_t w, uint32_t h,
+                             size_t stride, float *ring,
+                             float w0, float w1, float gw) {
+    const __m256 v0 = _mm256_set1_ps(w0);
+    const __m256 v1 = _mm256_set1_ps(w1);
+    const __m256 vg = _mm256_set1_ps(gw);
+    uint32_t x, y;
+
+    for (y = 0; y < h; y++) {
+        float *cur = ring + (size_t)(y & 1u) * w;
+        const float *rn, *rc, *rs;
+        float *dst = plane + (size_t)y * stride;
+        uint32_t xlo = w > 1 ? 1 : 0;
+        uint32_t xhi = w > 1 ? w - 1 : 0;
+
+        memcpy(cur, dst, (size_t)w * sizeof(float));
+        rc = cur;
+        rn = y > 0 ? ring + (size_t)((y - 1) & 1u) * w : cur;
+        rs = y + 1 < h ? plane + (size_t)(y + 1) * stride : cur;
+
+        for (x = 0; x < xlo; x++) {
+            uint32_t xm = 0, xp = (w > 1) ? 1 : 0;
+            dst[x] = (rc[x] + (rn[x] + rs[x] + rc[xm] + rc[xp]) * w0 +
+                      (rn[xm] + rn[xp] + rs[xm] + rs[xp]) * w1) * gw;
+        }
+        for (; x + 8 <= xhi; x += 8) {
+            __m256 cc = _mm256_loadu_ps(rc + x);
+            __m256 side =
+                _mm256_add_ps(_mm256_loadu_ps(rn + x),
+                              _mm256_loadu_ps(rs + x));
+            __m256 diag;
+            __m256 r;
+            side = _mm256_add_ps(side, _mm256_loadu_ps(rc + x - 1));
+            side = _mm256_add_ps(side, _mm256_loadu_ps(rc + x + 1));
+            diag = _mm256_add_ps(_mm256_loadu_ps(rn + x - 1),
+                                 _mm256_loadu_ps(rn + x + 1));
+            diag = _mm256_add_ps(diag, _mm256_loadu_ps(rs + x - 1));
+            diag = _mm256_add_ps(diag, _mm256_loadu_ps(rs + x + 1));
+            r = _mm256_add_ps(cc, _mm256_mul_ps(side, v0));
+            r = _mm256_add_ps(r, _mm256_mul_ps(diag, v1));
+            _mm256_storeu_ps(dst + x, _mm256_mul_ps(r, vg));
+        }
+        for (; x < xhi; x++) {
+            dst[x] = (rc[x] +
+                      (rn[x] + rs[x] + rc[x - 1] + rc[x + 1]) * w0 +
+                      (rn[x - 1] + rn[x + 1] + rs[x - 1] + rs[x + 1]) * w1) *
+                     gw;
+        }
+        for (x = xhi; x < w; x++) {
+            uint32_t xm = x > 0 ? x - 1 : 0;
+            uint32_t xp = x + 1 < w ? x + 1 : w - 1;
+            dst[x] = (rc[x] + (rn[x] + rs[x] + rc[xm] + rc[xp]) * w0 +
+                      (rn[xm] + rn[xp] + rs[xm] + rs[xp]) * w1) * gw;
+        }
+    }
+}
+#endif
+
 int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
                     size_t stride, const float weights[3][2]) {
     float *ring;
     int c;
+#ifdef JXL_EPF_SSE2
+    int use_avx2 = jxl_has_avx2();
+#endif
     if (w == 0 || h == 0) return 0;
     /* The filter writes row y from rows y-1, y and y+1 of the input. Row y+1
        has not been written yet when row y is produced, so it can be read
@@ -60,6 +126,10 @@ int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
 #ifdef JXL_EPF_SSE2
         const __m128 v0 = _mm_set1_ps(w0), v1 = _mm_set1_ps(w1);
         const __m128 vg = _mm_set1_ps(gw);
+        if (use_avx2) {
+            gabor_plane_avx2(plane[c], w, h, stride, ring, w0, w1, gw);
+            continue;
+        }
 #endif
         for (y = 0; y < h; y++) {
             /* Clamping depends only on the row, so resolve the three row
@@ -233,22 +303,14 @@ static JXL_EPF_NOINLINE float epf_hsad_one(
 JXL_TARGET_AVX2_FMA
 static JXL_INLINE_HINT float epf_row8_pass1(
     float *in[3], float *out[3], size_t row, uint32_t x, size_t stride,
-    const float cscale[3], float sigma_val, float step_mul, float border_mul,
-    int is_y_border, float prev_hsad, float *prev_vsad, int reuse_vtop) {
-    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
-    const __m256 zero = _mm256_setzero_ps();
-    const __m256 one = _mm256_set1_ps(1.0f);
+    const float cscale[3], float sigma_val, __m256 smv, __m256 absmask,
+    __m256 zero, __m256 one, float prev_hsad, float *prev_vsad,
+    int reuse_vtop) {
     __m256 dist0 = reuse_vtop ? _mm256_loadu_ps(prev_vsad + x) : zero;
     __m256 dist1 = zero, dist2, dist3 = zero;
-    __m256 sum0, sum1, sum2, sw, nis, smv, wgt;
+    __m256 sum0, sum1, sum2, sw, nis, wgt;
     int c;
 
-    if (is_y_border) {
-        smv = _mm256_set1_ps(border_mul);
-    } else {
-        smv = _mm256_setr_ps(border_mul, step_mul, step_mul, step_mul,
-                             step_mul, step_mul, step_mul, border_mul);
-    }
     nis = _mm256_mul_ps(_mm256_set1_ps(sigma_val), smv);
 
     if (!reuse_vtop) {
@@ -329,8 +391,16 @@ static JXL_INLINE_HINT float epf_row8_pass1(
     }
     if (prev_vsad) _mm256_storeu_ps(prev_vsad + x, dist1);
 
-    dist2 = _mm256_permutevar8x32_ps(
-        dist3, _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6));
+    {
+        /* Shift the preceding right-SADs one lane toward higher x. A
+           lane-cross plus lane-local align avoids vpermd's index-vector load
+           and longer dependency latency. The first lane is replaced by the
+           scalar carried from the preceding octet just below. */
+        __m256i carry = _mm256_castps_si256(
+            _mm256_permute2f128_ps(dist3, dist3, 0x08));
+        dist2 = _mm256_castsi256_ps(_mm256_alignr_epi8(
+            _mm256_castps_si256(dist3), carry, 12));
+    }
     dist2 = _mm256_blend_ps(dist2, _mm256_set1_ps(prev_hsad), 0x01);
 
     sum0 = _mm256_loadu_ps(in[0] + row + x);
@@ -392,6 +462,15 @@ static uint32_t epf_row_pass1_avx2(
     size_t stride, const float *sigma_row, const float cscale[3],
     float step_mul, float border_mul, int is_y_border, float *prev_vsad,
     const float *prev_sigma_row, int can_reuse_vtop) {
+    const __m256 absmask =
+        _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 smv = is_y_border
+        ? _mm256_set1_ps(border_mul)
+        : _mm256_setr_ps(border_mul, step_mul, step_mul, step_mul,
+                         step_mul, step_mul, step_mul, border_mul);
+    const int have_vtop = can_reuse_vtop && prev_vsad != NULL;
     float prev_hsad = 0.0f;
     int prev_valid = 0;
     for (; x + 9 < w; x += 8) {
@@ -404,13 +483,13 @@ static uint32_t epf_row_pass1_avx2(
             }
             prev_valid = 0;
         } else {
-            int reuse_vtop = can_reuse_vtop && prev_vsad &&
-                             prev_sigma_row[x / 8] != 0.0f;
+            int reuse_vtop =
+                have_vtop && prev_sigma_row[x / 8] != 0.0f;
             if (!prev_valid)
                 prev_hsad = epf_hsad_one(in, row, x - 1, stride, cscale);
             prev_hsad = epf_row8_pass1(
-                in, out, row, x, stride, cscale, sigma_val, step_mul,
-                border_mul, is_y_border, prev_hsad, prev_vsad, reuse_vtop);
+                in, out, row, x, stride, cscale, sigma_val, smv, absmask,
+                zero, one, prev_hsad, prev_vsad, reuse_vtop);
             prev_valid = 1;
         }
     }

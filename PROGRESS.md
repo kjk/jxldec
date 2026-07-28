@@ -62,8 +62,9 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **about 1.11x libjxl** (the latest full sweep measured
-1.113x; 1.13x before the recent RCT, Modular-property and noise work; 1.21x
+1245-file corpus we are **about 1.12x libjxl** (the latest full sweep measured
+1.124x, with both columns thermally slower than the preceding 1.113x sweep;
+1.13x before the recent RCT, Modular-property and noise work; 1.21x
 before the small-error
 self-correcting-weight and max-error specializations below; 1.25x before the
 identity-WP and gradient-property specializations below; 1.37x before the folded-predictor
@@ -82,6 +83,41 @@ hot source lines, heaviest call path). That is how the numbers below were
 found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
+
+### Widen Gaborish and specialize the common prefix-RLE configuration
+Gaborish now processes eight interior samples at a time on AVX2 machines,
+with the runtime target check outside both image loops. The scalar borders
+and SSE2 fallback remain, and the vector arithmetic preserves the scalar
+operation order.
+
+The common effort-one alpha stream uses distance-one prefix RLE with
+split-one literal hybrid integers and zero-field length integers. The fast
+path now verifies that complete configuration once and then decodes its
+literal and length tokens directly, instead of retesting the generic
+hybrid-integer fields for every sample. Extracting the channel loop, forcing
+the reader out of line, returning packed RLE state by value and rescheduling
+the gradient calculation were all neutral or slower and were reverted.
+
+EPF pass 1 now builds its row-invariant multiplier and constant vectors once
+per row rather than once per octet. Three alternating saved-executable
+comparisons over seven EPF-heavy files saved 1.6-3.7ms per batch (roughly
+0.4-1.0%); a 120-region profile reduced `epf_row_pass1_avx2` from 3004 to
+2934 self samples. Its horizontal-SAD lane shift now uses a lane-crossing
+shuffle plus lane-local align instead of `vpermd`; three more alternating
+comparisons saved 0.8-3.0ms over that batch. Grouping active octets into runs
+was neutral and was reverted.
+
+The full sweep after the prefix-RLE and Gaborish changes, but before the EPF
+constant hoist, measured 18415.32ms against libjxl's 16386.57ms, **1.124x**.
+Both columns were slower than the preceding 1.113x sweep, so the alternating
+saved-executable measurements remain the useful evidence for these small
+changes. All 1245 oracle comparisons pass.
+All 115 fuzz reproducers are clean under ASan/libFuzzer.
+
+One tempting EPF assumption was rejected by the oracle before commit. Custom
+filter parameters mean a nonzero sigma is not necessarily positive, so
+replacing the zero test with a positive comparison changed pixels. That
+change does not remain.
 
 ### Specialize interior alpha prediction and hoist EPF/dequant divides
 The alpha plane in ordinary VarDCT files is a separate Modular stream. Its

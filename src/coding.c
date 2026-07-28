@@ -1030,13 +1030,26 @@ uint32_t jxl_dec_read(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx) {
 }
 
 int jxl_dec_is_prefix_rle1(const jxl_dec *dec) {
-    uint32_t cluster;
+    uint32_t cluster, i;
     if (!dec->lz77_enabled || !dec->use_prefix || dec->num_dist == 0)
         return 0;
     cluster = dec->clusters[dec->num_dist - 1];
     if (cluster >= dec->num_clusters) return 0;
-    return dec->pfx[cluster].single_symbol == 1 &&
-           dec->configs[cluster].split <= 1;
+    if (dec->pfx[cluster].single_symbol != 1 ||
+        dec->configs[cluster].split > 1 ||
+        (dec->lz_len_conf.msb_in_token |
+         dec->lz_len_conf.lsb_in_token) != 0) {
+        return 0;
+    }
+    for (i = 0; i < dec->num_clusters; i++) {
+        if (dec->configs[i].split != 1 ||
+            dec->configs[i].split_exponent != 0 ||
+            (dec->configs[i].msb_in_token |
+             dec->configs[i].lsb_in_token) != 0) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 /* Read the next literal or begin a distance-one run. `run` counts repeats
@@ -1045,10 +1058,7 @@ int jxl_dec_is_prefix_rle1(const jxl_dec *dec) {
 uint32_t jxl_dec_read_prefix_rle1(jxl_dec *dec, jxl_br *br, uint32_t cluster,
                                   uint32_t *last, uint32_t *run, int *have) {
     uint32_t token;
-    if (cluster >= dec->num_clusters) {
-        dec->err = 1;
-        return 0;
-    }
+    /* The fixed MA leaf carries an already-validated cluster index. */
     token = pfx_read(&dec->pfx[cluster], br);
     if (token >= dec->min_symbol) {
         uint32_t n;
@@ -1058,19 +1068,19 @@ uint32_t jxl_dec_read_prefix_rle1(jxl_dec *dec, jxl_br *br, uint32_t cluster,
             return 0;
         }
         token -= dec->min_symbol;
-        n = (cfg->msb_in_token | cfg->lsb_in_token) == 0
-                ? read_uint_00(br, cfg, token)
-                : read_uint(br, cfg, token);
+        n = read_uint_00(br, cfg, token);
         if (n > 0xffffffffu - dec->min_length) {
             dec->err = 1;
             return 0;
         }
         *run = n + dec->min_length - 1;
     } else {
-        const jxl_int_config *cfg = &dec->configs[cluster];
-        *last = (cfg->msb_in_token | cfg->lsb_in_token) == 0
-                    ? read_uint_00(br, cfg, token)
-                    : read_uint(br, cfg, token);
+        if (token == 0) {
+            *last = 0;
+        } else {
+            uint32_t n = (token - 1) & 31;
+            *last = (1u << n) | jxl_br_read(br, (int)n);
+        }
         *have = 1;
     }
     return *last;
