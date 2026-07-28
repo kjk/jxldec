@@ -169,6 +169,38 @@ specialization, and `R2020-sRGB-blue.v_orient` fell from 1.95x to 1.34x with
 the tiled transpose below. Files below ~1ms sit at much larger ratios purely
 on fixed setup cost.
 
+### Vectorize inverse RCT and apply channel permutations by ownership
+The latest full-corpus checkpoint measured 18719.77ms against libjxl's
+16344.30ms, 1.145x. Modular effort 1 still contributed 152ms of gap, and a
+30-run side-by-side profile of `flower.m_e1` exposed a separate transform
+cost below its already heavily specialised prefix-gradient loop:
+`rct_inverse` took 389 self samples against 112 for libjxl's AVX2
+`InvRCTRow<6>`.
+
+Inverse RCT now processes eight signed samples at a time. AVX2 add/sub and
+arithmetic right shift have the same wraparound behavior as the existing
+unsigned scalar formulation, so this remains exact even at the int32 limits.
+The common type 6 has its own branch-free kernel, matching libjxl's
+compile-time specialisation. Other nonzero RCT types use the same vector row
+shape. Input vectors are all loaded before the first possibly aliased output
+store, so the transform writes directly to the permuted channel destinations
+instead of transforming and then swapping every pixel in a second pass.
+A transform with custom type zero is only a permutation and now moves the
+three channel views without touching their image data.
+
+The final profile put `rct_inverse6_avx2` at 223 self samples, down 42.7%,
+against 99 for libjxl. Alternating all 73 effort-one files measured about
+0.7% less normalized time; the improvement is broader than that preset
+because all Modular encodings use RCT. The five-run full rerank measured
+**18575.05ms against 16323.48ms, 1.138x**. Relative to the preceding clean
+checkpoint, our column fell 144.72ms while libjxl's moved only 20.82ms.
+
+All 1245 corpus outputs pass the libjxl oracle. Two related experiments were
+rejected. Carrying an EPF horizontal SAD as a vector instead of a scalar was
+profile-neutral and made no stable release difference. Globally aligning
+allocations to 32 bytes and padding owned Modular rows to eight samples made
+a ten-file mixed set about 0.4% slower after normalization.
+
 ### Reuse symmetric EPF pass-1 patch distances
 Pass 1 evaluates five-sample patch distances to the four axial neighbours.
 Two kinds of work were symmetric but repeated: a pixel's right-neighbour SAD

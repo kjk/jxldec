@@ -1196,20 +1196,148 @@ static int transform_apply(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
 
 /* ----- inverse transforms ----- */
 
+#ifdef JXL_MODULAR_AVX2
+JXL_TARGET_AVX2
+static void rct_inverse6_avx2(const jxl_mchan *a, const jxl_mchan *b,
+                              const jxl_mchan *c, jxl_mchan *od,
+                              jxl_mchan *oe, jxl_mchan *of) {
+    uint32_t x, y;
+    for (y = 0; y < a->h; y++) {
+        const int32_t *ra = a->data + (size_t)y * a->stride;
+        const int32_t *rb = b->data + (size_t)y * b->stride;
+        const int32_t *rc = c->data + (size_t)y * c->stride;
+        int32_t *rd = od->data + (size_t)y * od->stride;
+        int32_t *re = oe->data + (size_t)y * oe->stride;
+        int32_t *rf = of->data + (size_t)y * of->stride;
+
+        for (x = 0; x + 8 <= a->w; x += 8) {
+            __m256i va = _mm256_loadu_si256((const __m256i *)(ra + x));
+            __m256i vb = _mm256_loadu_si256((const __m256i *)(rb + x));
+            __m256i vc = _mm256_loadu_si256((const __m256i *)(rc + x));
+            __m256i tmp =
+                _mm256_sub_epi32(va, _mm256_srai_epi32(vc, 1));
+            __m256i e = _mm256_add_epi32(vc, tmp);
+            __m256i f =
+                _mm256_sub_epi32(tmp, _mm256_srai_epi32(vb, 1));
+            __m256i d = _mm256_add_epi32(f, vb);
+            /* All three inputs are loaded before any potentially aliased
+               permuted destination is overwritten. */
+            _mm256_storeu_si256((__m256i *)(rd + x), d);
+            _mm256_storeu_si256((__m256i *)(re + x), e);
+            _mm256_storeu_si256((__m256i *)(rf + x), f);
+        }
+        for (; x < a->w; x++) {
+            uint32_t va = (uint32_t)ra[x];
+            uint32_t vb = (uint32_t)rb[x];
+            uint32_t vc = (uint32_t)rc[x];
+            uint32_t tmp = va - (uint32_t)(((int32_t)vc) >> 1);
+            uint32_t e = vc + tmp;
+            uint32_t f = tmp - (uint32_t)(((int32_t)vb) >> 1);
+            uint32_t d = f + vb;
+            rd[x] = (int32_t)d;
+            re[x] = (int32_t)e;
+            rf[x] = (int32_t)f;
+        }
+    }
+    _mm256_zeroupper();
+}
+
+JXL_TARGET_AVX2
+static void rct_inverse_avx2(const jxl_mchan *a, const jxl_mchan *b,
+                             const jxl_mchan *c, jxl_mchan *od,
+                             jxl_mchan *oe, jxl_mchan *of, uint32_t type) {
+    uint32_t x, y;
+    for (y = 0; y < a->h; y++) {
+        const int32_t *ra = a->data + (size_t)y * a->stride;
+        const int32_t *rb = b->data + (size_t)y * b->stride;
+        const int32_t *rc = c->data + (size_t)y * c->stride;
+        int32_t *rd = od->data + (size_t)y * od->stride;
+        int32_t *re = oe->data + (size_t)y * oe->stride;
+        int32_t *rf = of->data + (size_t)y * of->stride;
+
+        for (x = 0; x + 8 <= a->w; x += 8) {
+            __m256i va = _mm256_loadu_si256((const __m256i *)(ra + x));
+            __m256i vb = _mm256_loadu_si256((const __m256i *)(rb + x));
+            __m256i vc = _mm256_loadu_si256((const __m256i *)(rc + x));
+            __m256i d = va;
+            __m256i f = (type & 1) ? _mm256_add_epi32(vc, va) : vc;
+            __m256i e;
+            if ((type >> 1) == 1) {
+                e = _mm256_add_epi32(vb, va);
+            } else if ((type >> 1) == 2) {
+                e = _mm256_add_epi32(
+                    vb, _mm256_srai_epi32(_mm256_add_epi32(va, f), 1));
+            } else {
+                e = vb;
+            }
+            _mm256_storeu_si256((__m256i *)(rd + x), d);
+            _mm256_storeu_si256((__m256i *)(re + x), e);
+            _mm256_storeu_si256((__m256i *)(rf + x), f);
+        }
+        for (; x < a->w; x++) {
+            uint32_t va = (uint32_t)ra[x];
+            uint32_t vb = (uint32_t)rb[x];
+            uint32_t vc = (uint32_t)rc[x];
+            uint32_t d = va;
+            uint32_t f = (type & 1) ? vc + va : vc;
+            uint32_t e;
+            if ((type >> 1) == 1) e = vb + va;
+            else if ((type >> 1) == 2)
+                e = vb + (uint32_t)(((int32_t)(va + f)) >> 1);
+            else e = vb;
+            rd[x] = (int32_t)d;
+            re[x] = (int32_t)e;
+            rf[x] = (int32_t)f;
+        }
+    }
+    _mm256_zeroupper();
+}
+#endif
+
 static void rct_inverse(jxl_transform *tr, jxl_chanlist *cl) {
     uint32_t permutation = tr->rct_type / 7;
     uint32_t type = tr->rct_type % 7;
-    jxl_mchan *a = &cl->chans[tr->begin_c];
-    jxl_mchan *b = &cl->chans[tr->begin_c + 1];
-    jxl_mchan *c = &cl->chans[tr->begin_c + 2];
+    uint32_t begin = tr->begin_c;
+    jxl_mchan *a = &cl->chans[begin];
+    jxl_mchan *b = &cl->chans[begin + 1];
+    jxl_mchan *c = &cl->chans[begin + 2];
+    jxl_mchan *od = &cl->chans[begin + permutation % 3];
+    jxl_mchan *oe =
+        &cl->chans[begin + (permutation + 1 + permutation / 3) % 3];
+    jxl_mchan *of =
+        &cl->chans[begin + (permutation + 2 - permutation / 3) % 3];
     uint32_t x, y;
 
+    /* A zero custom transform is only a channel permutation. Moving the
+       channel views avoids touching the image and matches the same shortcut
+       in libjxl. */
+    if (type == 0) {
+        jxl_mchan ia = *a, ib = *b, ic = *c;
+        *od = ia;
+        *oe = ib;
+        *of = ic;
+        return;
+    }
+
+#ifdef JXL_MODULAR_AVX2
+    if (jxl_has_avx2()) {
+        if (type == 6) rct_inverse6_avx2(a, b, c, od, oe, of);
+        else rct_inverse_avx2(a, b, c, od, oe, of, type);
+        return;
+    }
+#endif
+
     for (y = 0; y < a->h; y++) {
-        int32_t *ra = a->data + (size_t)y * a->stride;
-        int32_t *rb = b->data + (size_t)y * b->stride;
-        int32_t *rc = c->data + (size_t)y * c->stride;
+        const int32_t *ra = a->data + (size_t)y * a->stride;
+        const int32_t *rb = b->data + (size_t)y * b->stride;
+        const int32_t *rc = c->data + (size_t)y * c->stride;
+        int32_t *rd = od->data + (size_t)y * od->stride;
+        int32_t *re = oe->data + (size_t)y * oe->stride;
+        int32_t *rf = of->data + (size_t)y * of->stride;
         for (x = 0; x < a->w; x++) {
-            uint32_t va = (uint32_t)ra[x], vb = (uint32_t)rb[x], vc = (uint32_t)rc[x];
+            uint32_t va = (uint32_t)ra[x];
+            uint32_t vb = (uint32_t)rb[x];
+            uint32_t vc = (uint32_t)rc[x];
             uint32_t d, e, f;
             if (type == 6) {
                 uint32_t tmp = va - (uint32_t)(((int32_t)vc) >> 1);
@@ -1224,39 +1352,9 @@ static void rct_inverse(jxl_transform *tr, jxl_chanlist *cl) {
                     e = vb + (uint32_t)(((int32_t)(va + f)) >> 1);
                 else e = vb;
             }
-            ra[x] = (int32_t)d;
-            rb[x] = (int32_t)e;
-            rc[x] = (int32_t)f;
-        }
-        switch (permutation) {
-            case 1:
-                for (x = 0; x < a->w; x++) {
-                    int32_t t = ra[x]; ra[x] = rb[x]; rb[x] = t;
-                    t = ra[x]; ra[x] = rc[x]; rc[x] = t;
-                }
-                break;
-            case 2:
-                for (x = 0; x < a->w; x++) {
-                    int32_t t = ra[x]; ra[x] = rb[x]; rb[x] = t;
-                    t = rb[x]; rb[x] = rc[x]; rc[x] = t;
-                }
-                break;
-            case 3:
-                for (x = 0; x < a->w; x++) {
-                    int32_t t = rb[x]; rb[x] = rc[x]; rc[x] = t;
-                }
-                break;
-            case 4:
-                for (x = 0; x < a->w; x++) {
-                    int32_t t = ra[x]; ra[x] = rb[x]; rb[x] = t;
-                }
-                break;
-            case 5:
-                for (x = 0; x < a->w; x++) {
-                    int32_t t = ra[x]; ra[x] = rc[x]; rc[x] = t;
-                }
-                break;
-            default: break;
+            rd[x] = (int32_t)d;
+            re[x] = (int32_t)e;
+            rf[x] = (int32_t)f;
         }
     }
 }
