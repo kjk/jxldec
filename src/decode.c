@@ -317,7 +317,8 @@ static void vardct_state_free(jxl_ctx *ctx, jxl_vardct_state *v) {
 }
 
 static int vardct_state_alloc(jxl_ctx *ctx, jxl_vardct_state *v, uint32_t bw,
-                              uint32_t bh) {
+                               uint32_t bh, int skip_coeff0_zero) {
+    size_t coeff_count, coeff_bytes;
     int c;
     v->bw = bw;
     v->bh = bh;
@@ -325,10 +326,17 @@ static int vardct_state_alloc(jxl_ctx *ctx, jxl_vardct_state *v, uint32_t bw,
     v->ph = bh * 8;
     v->cfl_w = (v->pw + 63) / 64;
     v->cfl_h = (v->ph + 63) / 64;
+    if (!jxl_size_mul(v->pw, v->ph, &coeff_count) ||
+        !jxl_size_mul(coeff_count, sizeof(float), &coeff_bytes))
+        return -1;
     for (c = 0; c < 3; c++) {
         v->lf[c] = (float *)jxl_calloc(ctx, (size_t)bw * bh, sizeof(float));
         v->lfq[c] = (int32_t *)jxl_calloc(ctx, (size_t)bw * bh, sizeof(int32_t));
-        v->coeff[c] = (float *)jxl_calloc(ctx, (size_t)v->pw * v->ph, sizeof(float));
+        if (c == 0 && skip_coeff0_zero) {
+            v->coeff[c] = (float *)jxl_malloc(ctx, coeff_bytes);
+        } else {
+            v->coeff[c] = (float *)jxl_calloc(ctx, coeff_count, sizeof(float));
+        }
         if (!v->lf[c] || !v->lfq[c] || !v->coeff[c]) return -1;
     }
     v->block_info =
@@ -614,8 +622,12 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
             jxl_jpeg_upsampling_shifts(fh->jpeg_upsampling, i, &vd.hs[i],
                                        &vd.vs[i]);
         }
-        if (vardct_state_alloc(ctx, &vd, jxl_frame_blocks_w(fh),
-                               jxl_frame_blocks_h(fh)) != 0)
+        if (vardct_state_alloc(
+                ctx, &vd, jxl_frame_blocks_w(fh), jxl_frame_blocks_h(fh),
+                discard_cb && !fh->gab.enabled && !fh->epf.enabled &&
+                    !(fh->flags &
+                      (JXL_FF_PATCHES | JXL_FF_SPLINES | JXL_FF_NOISE)) &&
+                    fh->upsampling == 1) != 0)
             goto done;
         jxl_quantizer_read(br, &vd.quantizer);
         if (jxl_hf_block_ctx_read(ctx, br, &vd.block_ctx) != 0) goto done;

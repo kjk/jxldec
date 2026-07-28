@@ -25,13 +25,13 @@ static uint32_t div_ceil_u32(uint32_t a, uint32_t b) {
     return (a + b - 1) / b;
 }
 
-static int32_t grad_clamped(int32_t n, int32_t w, int32_t nw) {
+static JXL_INLINE_HINT int32_t grad_clamped(int32_t n, int32_t w, int32_t nw) {
     int32_t lo = n < w ? n : w;
     int32_t hi = n < w ? w : n;
-    int64_t g = (int64_t)n + w - nw;
-    if (g < lo) return lo;
-    if (g > hi) return hi;
-    return (int32_t)g;
+    int32_t grad =
+        (int32_t)((uint32_t)n + (uint32_t)w - (uint32_t)nw);
+    int32_t grad_hi = nw < lo ? hi : grad;
+    return nw > hi ? lo : grad_hi;
 }
 
 /* The SELECT predictor, split out of predict_sample so the fixed-leaf loop
