@@ -123,7 +123,7 @@ static int read_icc_stream(jxl_ctx *ctx, jxl_br *br, uint8_t **out,
     jxl_dec dec;
     uint8_t *enc = NULL;
     uint8_t b1 = 0, b2 = 0;
-    size_t i;
+    size_t i, header_len, bits_at_start;
     int rc = -1;
 
     if (enc_size > (1u << 28)) {
@@ -131,11 +131,18 @@ static int read_icc_stream(jxl_ctx *ctx, jxl_br *br, uint8_t **out,
         return -1;
     }
     if (jxl_dec_init(ctx, &dec, br, 41) != 0) return -1;
+    jxl_dec_begin(&dec, br);
+    bits_at_start = jxl_br_bits_read(br);
 
-    enc = (uint8_t *)jxl_calloc(ctx, (size_t)enc_size ? (size_t)enc_size : 1, 1);
+    /* Decode only the varint preamble first (at most 18 bytes: two 9-byte
+       varints). Matches libjxl CheckPreamble / jxl-oxide so a crafted
+       enc_size cannot force a full multi-megabyte entropy decode (or an
+       LZ77 expansion of one) before the size relationship is checked. */
+    header_len = (size_t)enc_size < 18 ? (size_t)enc_size : 18;
+    enc = (uint8_t *)jxl_malloc(ctx, header_len ? header_len : 1);
     if (!enc) goto done;
 
-    for (i = 0; i < (size_t)enc_size; i++) {
+    for (i = 0; i < header_len; i++) {
         uint32_t sym = jxl_dec_read(&dec, br, icc_ctx_for(i, b1, b2));
         if (sym >= 256 || br->err || dec.err) {
             JXL_ERR(ctx, "icc: bad encoded byte");
@@ -144,6 +151,55 @@ static int read_icc_stream(jxl_ctx *ctx, jxl_br *br, uint8_t **out,
         enc[i] = (uint8_t)sym;
         b2 = b1;
         b1 = enc[i];
+    }
+
+    if (header_len > 0) {
+        jxl_bytecur hdr = {enc, header_len, 0, 0};
+        uint64_t output_size = bc_varint(&hdr);
+        uint64_t commands_size = bc_varint(&hdr);
+        size_t stream_offset = hdr.pos;
+        if (hdr.err || stream_offset + commands_size > enc_size) {
+            JXL_ERR(ctx, "icc: invalid commands_size");
+            goto done;
+        }
+        if (output_size > (1u << 28)) {
+            JXL_ERR(ctx, "icc: output too large");
+            goto done;
+        }
+        /* UnpredictICC is expected to inflate; an encoded stream far larger
+           than the claimed profile is malformed (and a classic fuzzer trap). */
+        if (output_size + 65536ull < enc_size) {
+            JXL_ERR(ctx, "icc: encoded profile far larger than output");
+            goto done;
+        }
+    }
+
+    if (enc_size > header_len) {
+        uint8_t *np = (uint8_t *)jxl_realloc_array(
+            ctx, enc, header_len, (size_t)enc_size, 1);
+        if (!np) goto done;
+        enc = np;
+        for (i = header_len; i < (size_t)enc_size; i++) {
+            uint32_t sym = jxl_dec_read(&dec, br, icc_ctx_for(i, b1, b2));
+            if (sym >= 256 || br->err || dec.err) {
+                JXL_ERR(ctx, "icc: bad encoded byte");
+                goto done;
+            }
+            enc[i] = (uint8_t)sym;
+            b2 = b1;
+            b1 = enc[i];
+            /* LZ77 can expand a short bit stream into millions of symbols
+               even when the size relationship above is plausible. libjxl
+               aborts when decoded bytes exceed 256x bits consumed. */
+            if ((i & 0xFFFF) == 0 && i > 0) {
+                size_t used_bits = jxl_br_bits_read(br) - bits_at_start;
+                size_t used_bytes = (used_bits + 7) / 8;
+                if (used_bytes == 0 || i > used_bytes * 256) {
+                    JXL_ERR(ctx, "icc: corrupted stream");
+                    goto done;
+                }
+            }
+        }
     }
     if (jxl_dec_finalize(&dec) != 0) {
         JXL_ERR(ctx, "icc: bad ANS final state");

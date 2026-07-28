@@ -2970,6 +2970,30 @@ Worth noting what this says about the corpus: a null-deref reachable from
 `jxl_doc_open` on a 62-byte input survived 1245 conformance files and every
 ASan run over them, because none of them is malformed.
 
+### Fuzz slow-unit: ICC stream without a preamble check
+libFuzzer reported `slow-unit-d9a5dc9ea912...` (39 bytes). Under MSVC -O2 it
+spent ~2.4 s failing with `icc: bad ANS final state`; under the ASan fuzzer
+it ran past the 20 s slow-unit threshold and hung a single-input replay.
+
+Cause: `read_icc_stream` allocated and entropy-decoded the full claimed
+`enc_size` (up to 256 MiB) before looking at the two varints that declare
+`output_size` / `commands_size`. A crafted stream with LZ77 can expand a
+handful of input bits into millions of symbols; the final ANS-state check
+only runs after that walk finishes.
+
+Fix matches libjxl's `CheckPreamble` and jxl-oxide's quick validity check:
+decode at most 18 preamble bytes, reject when
+`output_size + 65536 < enc_size` (or the commands range is nonsense), then
+decode the rest. A secondary libjxl-style expansion bound
+(`decoded_bytes > 256 * bits_consumed`) aborts LZ77 bombs that still pass
+the size relationship. Also call `jxl_dec_begin` on the ICC decoder (was
+missing; prefix-coded ICC hid it).
+
+After: the unit rejects in 0 ms under ASan with
+`icc: encoded profile far larger than output`. 20/20 sample `v_icc` files
+and three oracle compares (flower / 358colors / hdr_room) still ok; all 121
+`-check` reproducers clean.
+
 ### Non-sRGB primaries, finally exercised -- and correct
 Acting on what the coverage run below reported. The obstacle was never the
 decoder: it was that every corpus source is a PAM, which carries no colour
