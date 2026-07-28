@@ -150,6 +150,43 @@ static void noise_hbox5(const float *src, float *dst, uint32_t w) {
     }
 }
 
+#ifdef JXL_NOISE_SSE2
+JXL_TARGET_AVX2
+static void noise_hbox5_avx2(const float *src, float *dst, uint32_t w) {
+    uint32_t x, lo, hi;
+    lo = w < 2 ? w : 2;
+    hi = w < 2 ? w : w - 2;
+    if (hi < lo) hi = lo;
+    for (x = 0; x < lo; x++) {
+        dst[x] = src[noise_mirror((int64_t)x - 2, w)] +
+                 src[noise_mirror((int64_t)x - 1, w)] +
+                 src[noise_mirror((int64_t)x, w)] +
+                 src[noise_mirror((int64_t)x + 1, w)] +
+                 src[noise_mirror((int64_t)x + 2, w)];
+    }
+    x = lo;
+    for (; x + 8 <= hi; x += 8) {
+        __m256 s = _mm256_loadu_ps(src + x - 2);
+        s = _mm256_add_ps(s, _mm256_loadu_ps(src + x - 1));
+        s = _mm256_add_ps(s, _mm256_loadu_ps(src + x));
+        s = _mm256_add_ps(s, _mm256_loadu_ps(src + x + 1));
+        s = _mm256_add_ps(s, _mm256_loadu_ps(src + x + 2));
+        _mm256_storeu_ps(dst + x, s);
+    }
+    for (; x < hi; x++) {
+        dst[x] = src[x - 2] + src[x - 1] + src[x] + src[x + 1] + src[x + 2];
+    }
+    for (x = hi; x < w; x++) {
+        dst[x] = src[noise_mirror((int64_t)x - 2, w)] +
+                 src[noise_mirror((int64_t)x - 1, w)] +
+                 src[noise_mirror((int64_t)x, w)] +
+                 src[noise_mirror((int64_t)x + 1, w)] +
+                 src[noise_mirror((int64_t)x + 2, w)];
+    }
+    _mm256_zeroupper();
+}
+#endif
+
 /* The vertical half: five already-horizontally-summed rows, scaled by 0.16,
    minus four times the centre sample. 0.16 * 25 == 4, so the kernel sums to
    zero and the [1, 2) offset of the raw values cancels. */
@@ -174,6 +211,31 @@ static void noise_vbox5(const float *const rows[5], const float *centre,
         dst[x] = s * 0.16f - centre[x] * 4.0f;
     }
 }
+
+#ifdef JXL_NOISE_SSE2
+JXL_TARGET_AVX2
+static void noise_vbox5_avx2(const float *const rows[5], const float *centre,
+                             float *dst, uint32_t w) {
+    const __m256 k = _mm256_set1_ps(0.16f);
+    const __m256 m4 = _mm256_set1_ps(4.0f);
+    uint32_t x = 0;
+    for (; x + 8 <= w; x += 8) {
+        __m256 s = _mm256_loadu_ps(rows[0] + x);
+        s = _mm256_add_ps(s, _mm256_loadu_ps(rows[1] + x));
+        s = _mm256_add_ps(s, _mm256_loadu_ps(rows[2] + x));
+        s = _mm256_add_ps(s, _mm256_loadu_ps(rows[3] + x));
+        s = _mm256_add_ps(s, _mm256_loadu_ps(rows[4] + x));
+        s = _mm256_sub_ps(_mm256_mul_ps(s, k),
+                          _mm256_mul_ps(_mm256_loadu_ps(centre + x), m4));
+        _mm256_storeu_ps(dst + x, s);
+    }
+    for (; x < w; x++) {
+        float s = rows[0][x] + rows[1][x] + rows[2][x] + rows[3][x] + rows[4][x];
+        dst[x] = s * 0.16f - centre[x] * 4.0f;
+    }
+    _mm256_zeroupper();
+}
+#endif
 
 #ifdef JXL_NOISE_SSE2
 JXL_TARGET_AVX2
@@ -347,8 +409,14 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
                 uint32_t r = noise_mirror((int64_t)y + dy, height);
                 uint32_t sl = r % 5;
                 if (hsum_row[sl] != r) {
-                    noise_hbox5(raw[c] + (size_t)r * width,
-                                hsum + (size_t)sl * width, width);
+#ifdef JXL_NOISE_SSE2
+                    if (use_avx2)
+                        noise_hbox5_avx2(raw[c] + (size_t)r * width,
+                                         hsum + (size_t)sl * width, width);
+                    else
+#endif
+                        noise_hbox5(raw[c] + (size_t)r * width,
+                                    hsum + (size_t)sl * width, width);
                     hsum_row[sl] = r;
                 }
                 rows[dy + 2] = hsum + (size_t)sl * width;
@@ -357,8 +425,14 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
                now every horizontal sum that row y feeds has been taken. A
                slot is only recycled for row y+5, which is first needed at
                output row y+3 -- by which point row y is out of the window. */
-            noise_vbox5(rows, raw[c] + (size_t)y * width,
-                        raw[c] + (size_t)y * width, width);
+#ifdef JXL_NOISE_SSE2
+            if (use_avx2)
+                noise_vbox5_avx2(rows, raw[c] + (size_t)y * width,
+                                 raw[c] + (size_t)y * width, width);
+            else
+#endif
+                noise_vbox5(rows, raw[c] + (size_t)y * width,
+                            raw[c] + (size_t)y * width, width);
         }
     }
 

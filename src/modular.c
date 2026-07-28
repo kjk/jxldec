@@ -583,9 +583,7 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
     const uint32_t *dl = jxl_div_lookup;
     int64_t te_w = sc->true_err_w, te_nw = sc->true_err_nw;
     int64_t te_n = sc->true_err_n, te_ne = sc->true_err_ne;
-    int64_t n3 = (int64_t)n << 3, nw3 = (int64_t)nw << 3;
-    int64_t ne3 = (int64_t)ne << 3, w3 = (int64_t)w << 3;
-    int64_t nn3 = (int64_t)nn << 3;
+    int64_t n3, nw3, ne3, w3, nn3;
     /* Scalars, not arrays. The four-lane steps below are all constant-trip
        loops, but keeping them as arrays left the values in memory: summing
        four uint32s was 6.7% of the whole decode on its own, which is only
@@ -603,21 +601,6 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
        reasoning as the weight lanes below, which were unrolled out of arrays
        for exactly this. */
     int64_t sp0, sp1, sp2, sp3, pred;
-
-    sp0 = w3 + ne3 - n3;
-    if (sc->default_wp) {
-        sp1 = n3 - (((te_w + te_n + te_ne) * 16) >> 5);
-        sp2 = w3 - (((te_w + te_n + te_nw) * 10) >> 5);
-        sp3 = n3 - (((te_nw + te_n + te_ne) * 7) >> 5);
-    } else {
-        sp1 = n3 - (((te_w + te_n + te_ne) * (int64_t)sc->wp.p1) >> 5);
-        sp2 = w3 - (((te_w + te_n + te_nw) * (int64_t)sc->wp.p2) >> 5);
-        sp3 = n3 - ((te_nw * (int64_t)sc->wp.p3a +
-                     te_n * (int64_t)sc->wp.p3b +
-                     te_ne * (int64_t)sc->wp.p3c +
-                     (nn3 - n3) * (int64_t)sc->wp.p3d +
-                     (nw3 - w3) * (int64_t)sc->wp.p3e) >> 5);
-    }
 
     es0 = sc->subpred_err_nw_ww[0] + sc->subpred_err_n_w[0] + sc->subpred_err_ne[0];
     es1 = sc->subpred_err_nw_ww[1] + sc->subpred_err_n_w[1] + sc->subpred_err_ne[1];
@@ -647,6 +630,29 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
     wt0 >>= log_weight; wt1 >>= log_weight;
     wt2 >>= log_weight; wt3 >>= log_weight;
     sum_weights = wt0 + wt1 + wt2 + wt3;
+
+    /* Compute sub-predictions only after the relatively large weight
+       calculation. They are independent of the weights, and delaying them
+       keeps four int64 values from being spilled across that whole block. */
+    n3 = (int64_t)n << 3;
+    nw3 = (int64_t)nw << 3;
+    ne3 = (int64_t)ne << 3;
+    w3 = (int64_t)w << 3;
+    nn3 = (int64_t)nn << 3;
+    sp0 = w3 + ne3 - n3;
+    if (sc->default_wp) {
+        sp1 = n3 - (((te_w + te_n + te_ne) * 16) >> 5);
+        sp2 = w3 - (((te_w + te_n + te_nw) * 10) >> 5);
+        sp3 = n3 - (((te_nw + te_n + te_ne) * 7) >> 5);
+    } else {
+        sp1 = n3 - (((te_w + te_n + te_ne) * (int64_t)sc->wp.p1) >> 5);
+        sp2 = w3 - (((te_w + te_n + te_nw) * (int64_t)sc->wp.p2) >> 5);
+        sp3 = n3 - ((te_nw * (int64_t)sc->wp.p3a +
+                     te_n * (int64_t)sc->wp.p3b +
+                     te_ne * (int64_t)sc->wp.p3c +
+                     (nn3 - n3) * (int64_t)sc->wp.p3d +
+                     (nw3 - w3) * (int64_t)sc->wp.p3e) >> 5);
+    }
 
     s = ((int64_t)sum_weights >> 1) - 1;
     s += sp0 * (int64_t)wt0;
@@ -689,6 +695,9 @@ static void sc_record(jxl_sc_pred *sc, const jxl_sc_result *pred, int32_t sample
     int64_t s = (int64_t)sample << 3;
     int64_t true_err = pred->prediction - s;
     uint32_t subpred_err[4];
+    uint32_t x = sc->x;
+    uint32_t next_x = x + 1;
+    uint32_t *subpred_row = sc->subpred_err_row + (size_t)x * 4;
     int i;
 
     for (i = 0; i < 4; i++) {
@@ -696,11 +705,11 @@ static void sc_record(jxl_sc_pred *sc, const jxl_sc_result *pred, int32_t sample
         if (d < 0) d = -d;
         subpred_err[i] = (uint32_t)((d + 3) >> 3);
     }
-    sc->true_err_row[sc->x] = (int32_t)true_err;
-    for (i = 0; i < 4; i++) sc->subpred_err_row[sc->x * 4 + i] = subpred_err[i];
-    sc->x++;
+    sc->true_err_row[x] = (int32_t)true_err;
+    for (i = 0; i < 4; i++) subpred_row[i] = subpred_err[i];
+    sc->x = next_x;
 
-    if (sc->x >= sc->width) {
+    if (next_x >= sc->width) {
         sc->y++;
         sc->x = 0;
         sc->true_err_w = 0;
@@ -726,14 +735,14 @@ static void sc_record(jxl_sc_pred *sc, const jxl_sc_result *pred, int32_t sample
             sc->subpred_err_n_w[i] = sc->subpred_err_ne[i];
             sc->subpred_err_n_w[i] += subpred_err[i];
         }
-        if (sc->x + 1 >= sc->width) {
+        if (next_x + 1 >= sc->width) {
             sc->true_err_ne = sc->true_err_n;
             for (i = 0; i < 4; i++) sc->subpred_err_ne[i] = sc->subpred_err_n_w[i];
         } else if (sc->y != 0) {
-            uint32_t x = sc->x;
-            sc->true_err_ne = sc->true_err_row[x + 1];
+            sc->true_err_ne = sc->true_err_row[next_x + 1];
             for (i = 0; i < 4; i++)
-                sc->subpred_err_ne[i] = sc->subpred_err_row[(x + 1) * 4 + i];
+                sc->subpred_err_ne[i] =
+                    sc->subpred_err_row[(size_t)(next_x + 1) * 4 + i];
         }
     }
 }
@@ -780,6 +789,25 @@ static void props_compute(const jxl_pred_state *ps, jxl_props *pr,
     pr->cache[13] = (int32_t)((uint32_t)ps->n - (uint32_t)pred_nn(ps));
     pr->cache[14] = (int32_t)((uint32_t)ps->w - (uint32_t)pred_ww(ps));
     pr->cache[15] = pr->sc.max_error;
+}
+
+/* Responsive Modular trees commonly test only |N|, |W|, N, W and the
+   previous local gradient. Property 9 is still maintained because
+   pred_record carries it into property 8 for the next sample. */
+static JXL_INLINE_HINT void
+props_compute_nw(const jxl_pred_state *ps, jxl_props *pr,
+                 int32_t channel, int32_t stream_idx) {
+    int32_t n = ps->n, w = ps->w;
+    int32_t w_nw = (int32_t)((uint32_t)w - (uint32_t)ps->nw);
+    pr->cache[0] = channel;
+    pr->cache[1] = stream_idx;
+    pr->cache[4] = (int32_t)(n < 0 ? 0u - (uint32_t)n : (uint32_t)n);
+    pr->cache[5] = (int32_t)(w < 0 ? 0u - (uint32_t)w : (uint32_t)w);
+    pr->cache[6] = n;
+    pr->cache[7] = w;
+    pr->cache[8] = (int32_t)((uint32_t)w - (uint32_t)ps->prev_grad);
+    pr->cache[9] = (int32_t)((uint32_t)w_nw + (uint32_t)n);
+    pr->has_sc = 0;
 }
 
 /* Effort-7/9 Modular trees commonly retain only the four local-gradient
@@ -2946,7 +2974,12 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
         }
 
         if (max_prev == 0) {
-            if ((props_mask & ~0x9e03u) == 0) {
+            if (!need_sc && (props_mask & ~0x1f3u) == 0) {
+                JXL_GENERAL_LOOP(
+                    ma_get_leaf_local(cma, &pr),
+                    props_compute_nw(
+                        &ps, &pr, (int32_t)ci, (int32_t)stream_idx))
+            } else if ((props_mask & ~0x9e03u) == 0) {
                 JXL_GENERAL_LOOP(
                     ma_get_leaf_local(cma, &pr),
                     props_compute_grad_wp(
