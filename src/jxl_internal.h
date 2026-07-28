@@ -176,9 +176,18 @@ static JXL_INLINE_HINT uint32_t jxl_br_read(jxl_br *br, int n) {  /* n <= 32 */
 }
 
 static inline uint32_t jxl_floor_log2_u64(uint64_t v) {
-#if defined(_MSC_VER) && !defined(__clang__)
+#if defined(_MSC_VER) && !defined(__clang__) && defined(_WIN64)
     unsigned long idx;
     _BitScanReverse64(&idx, v);
+    return (uint32_t)idx;
+#elif defined(_MSC_VER) && !defined(__clang__)
+    /* _BitScanReverse64 is x64/ARM64-only; on x86 use two 32-bit BSRs. */
+    unsigned long idx;
+    if ((uint32_t)(v >> 32)) {
+        _BitScanReverse(&idx, (unsigned long)(v >> 32));
+        return (uint32_t)idx + 32u;
+    }
+    _BitScanReverse(&idx, (unsigned long)v);
     return (uint32_t)idx;
 #elif defined(__clang__) || defined(__GNUC__)
     return 63u - (uint32_t)__builtin_clzll(v);

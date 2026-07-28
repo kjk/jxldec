@@ -41,7 +41,18 @@ static int jxl_detect_avx2(void) {
     __cpuidex(r, 1, 0);
     if (!(r[2] & (1 << 27))) return 0;          /* OSXSAVE */
     if (!(r[2] & (1 << 28))) return 0;          /* AVX */
+    /* gcc's _xgetbv is always_inline and requires -mxsave; use asm on
+       gcc/clang (including mingw) so baseline -msse2 / Wine CI builds work. */
+#if defined(__GNUC__) || defined(__clang__)
+    {
+        unsigned lo, hi;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        (void)hi;
+        if ((lo & 0x6u) != 0x6u) return 0;      /* OS saves XMM and YMM */
+    }
+#else
     if ((_xgetbv(0) & 0x6u) != 0x6u) return 0;  /* OS saves XMM and YMM */
+#endif
     __cpuidex(r, 7, 0);
     return (r[1] & (1 << 5)) != 0;              /* AVX2 */
 #elif defined(__x86_64__) || defined(__i386__)

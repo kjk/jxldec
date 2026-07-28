@@ -118,20 +118,167 @@ async function haveCompiler(name: string): Promise<boolean> {
   return r.exitCode === 0;
 }
 
-async function verifyDistCompile(toolchain: "clang" | "msvc"): Promise<boolean> {
-  if (toolchain === "clang") {
-    const obj = "dist/jxl_verify_clang.o";
-    const rc = await runCmd(`clang ${clangCFlags("-O1")} -c dist/jxl.c -o ${obj}`, ROOT);
-    if (existsSync(join(DIST, "jxl_verify_clang.o"))) rmSync(join(DIST, "jxl_verify_clang.o"));
-    return rc === 0;
-  }
-  const obj = "dist/jxl_verify_msvc.obj";
-  const rc = await runCmd(`cl ${JXLDEC_MSVC_CL_C} -c dist/jxl.c -Fo${obj}`, ROOT);
-  if (existsSync(join(DIST, "jxl_verify_msvc.obj"))) rmSync(join(DIST, "jxl_verify_msvc.obj"));
-  return rc === 0;
+async function firstOnPath(name: string): Promise<string | null> {
+  const probe = isWindows ? $`where ${name}` : $`which ${name}`;
+  const r = await probe.nothrow().quiet();
+  if (r.exitCode !== 0) return null;
+  const line = r.stdout.toString().trim().split(/\r?\n/)[0]?.trim();
+  return line || null;
 }
 
-export async function buildDist(): Promise<void> {
+/** Resolve HostX64/x86/cl.exe next to the PATH cl (x64 host) for a Win32 compile. */
+async function findMsvcClX86(): Promise<string | null> {
+  const cl = await firstOnPath("cl");
+  if (!cl) return null;
+  const norm = cl.replaceAll("\\", "/");
+  if (/\/x86\/cl\.exe$/i.test(norm)) return cl;
+  const x86 = norm.replace(/\/x64\/cl\.exe$/i, "/x86/cl.exe");
+  if (x86 !== norm && existsSync(x86)) return x86;
+  return null;
+}
+
+/** Prefer posix-threaded mingw (matches Sumatra Wine CI); fall back to plain. */
+async function findMingwGcc(): Promise<string | null> {
+  for (const name of [
+    "x86_64-w64-mingw32-gcc-posix",
+    "x86_64-w64-mingw32-gcc",
+  ]) {
+    const p = await firstOnPath(name);
+    if (p) return p;
+  }
+  return null;
+}
+
+function rmIfExists(...paths: string[]): void {
+  for (const p of paths) {
+    if (existsSync(p)) rmSync(p);
+  }
+}
+
+type VerifyVariant = {
+  name: string;
+  /** false = skip (compiler missing); true = must pass */
+  required: boolean;
+  run: () => Promise<boolean>;
+};
+
+// Compile-only checks for consumer toolchains that have bitten us before:
+//   msvc      -- default host MSVC (x64 on CI windows)
+//   msvc-x86  -- Win32: _BitScanReverse64 is not available there
+//   clang     -- host clang
+//   mingw     -- cross gcc without -mxsave: _xgetbv needs inline asm
+function distVerifyVariants(): VerifyVariant[] {
+  return [
+    {
+      name: "clang",
+      required: true,
+      run: async () => {
+        if (!(await haveCompiler("clang"))) return false;
+        const obj = join(DIST, "jxl_verify_clang.o");
+        const rc = await runCmd(
+          `clang ${clangCFlags("-O1")} -c dist/jxl.c -o ${obj}`,
+          ROOT,
+        );
+        rmIfExists(obj);
+        return rc === 0;
+      },
+    },
+    {
+      name: "msvc",
+      required: isWindows,
+      run: async () => {
+        if (!(await haveCompiler("cl"))) return false;
+        const obj = join(DIST, "jxl_verify_msvc.obj");
+        const rc = await runCmd(
+          `cl ${JXLDEC_MSVC_CL_C} -c dist/jxl.c -Fo${obj}`,
+          ROOT,
+        );
+        rmIfExists(obj);
+        return rc === 0;
+      },
+    },
+    {
+      name: "msvc-x86",
+      required: false,
+      run: async () => {
+        const clx86 = await findMsvcClX86();
+        if (!clx86) return false;
+        const obj = join(DIST, "jxl_verify_msvc_x86.obj");
+        // -WX so an undeclared _BitScanReverse64 (C4013) fails the build.
+        const rc = await runCmd(
+          `"${clx86}" ${JXLDEC_MSVC_CL_C} -c dist/jxl.c -Fo${obj}`,
+          ROOT,
+        );
+        rmIfExists(obj);
+        return rc === 0;
+      },
+    },
+    {
+      name: "mingw",
+      required: false,
+      run: async () => {
+        const gcc = await findMingwGcc();
+        if (!gcc) return false;
+        const obj = join(DIST, "jxl_verify_mingw.o");
+        // No -mxsave: gcc's _xgetbv is always_inline and needs that target
+        // flag unless we use inline asm (the path consumers / Wine CI use).
+        const rc = await runCmd(
+          `"${gcc}" -std=c11 -O1 -w -D_CRT_SECURE_NO_WARNINGS -c dist/jxl.c -o ${obj}`,
+          ROOT,
+        );
+        rmIfExists(obj);
+        return rc === 0;
+      },
+    },
+  ];
+}
+
+/** Compile dist/jxl.c with every available toolchain variant. */
+export async function verifyDist(opts: { requireMingw?: boolean; requireMsvcX86?: boolean } = {}): Promise<void> {
+  const variants = distVerifyVariants();
+  let failed = false;
+  let ran = 0;
+  for (const v of variants) {
+    const force =
+      (opts.requireMingw && v.name === "mingw") ||
+      (opts.requireMsvcX86 && v.name === "msvc-x86");
+    const available =
+      v.name === "clang"
+        ? await haveCompiler("clang")
+        : v.name === "msvc"
+          ? isWindows && (await haveCompiler("cl"))
+          : v.name === "msvc-x86"
+            ? !!(await findMsvcClX86())
+            : v.name === "mingw"
+              ? !!(await findMingwGcc())
+              : false;
+
+    if (!available) {
+      if (v.required || force) {
+        console.error(`amalgamation verify: ${v.name} required but not found`);
+        failed = true;
+      } else {
+        console.log(`amalgamation verify: skip ${v.name} (compiler not found)`);
+      }
+      continue;
+    }
+
+    console.log(`verifying dist/jxl.c (${v.name})...`);
+    ran++;
+    if (await v.run()) console.log(`amalgamation compiles cleanly (${v.name})`);
+    else {
+      console.error(`amalgamation FAILED to compile (${v.name})`);
+      failed = true;
+    }
+  }
+  if (ran === 0) {
+    console.error("amalgamation verify: no compilers available");
+    failed = true;
+  }
+  if (failed) process.exit(1);
+}
+
+export async function buildDist(opts: { requireMingw?: boolean; requireMsvcX86?: boolean } = {}): Promise<void> {
   mkdirSync(DIST, { recursive: true });
 
   const publicHeader = readFileSync(join(SRC, "jxl.h"), "utf8");
@@ -152,24 +299,7 @@ export async function buildDist(): Promise<void> {
     `wrote dist/jxl.c (${amalgamated.split("\n").length} lines, ${DIST_MODULES.length} modules)`,
   );
 
-  const toolchains: ("clang" | "msvc")[] = [];
-  if (await haveCompiler("clang")) toolchains.push("clang");
-  else {
-    console.error("amalgamation verify: clang not found");
-    process.exit(1);
-  }
-  if (isWindows && (await haveCompiler("cl"))) toolchains.push("msvc");
-
-  let failed = false;
-  for (const tc of toolchains) {
-    console.log(`verifying dist/jxl.c (${tc})...`);
-    if (await verifyDistCompile(tc)) console.log(`amalgamation compiles cleanly (${tc})`);
-    else {
-      console.error(`amalgamation FAILED to compile (${tc})`);
-      failed = true;
-    }
-  }
-  if (failed) process.exit(1);
+  await verifyDist(opts);
 }
 
 export async function ensureDist(): Promise<void> {
@@ -182,5 +312,9 @@ export async function ensureDist(): Promise<void> {
 }
 
 if (import.meta.main) {
-  await buildDist();
+  const args = process.argv.slice(2);
+  await buildDist({
+    requireMingw: args.includes("-require-mingw"),
+    requireMsvcX86: args.includes("-require-msvc-x86"),
+  });
 }

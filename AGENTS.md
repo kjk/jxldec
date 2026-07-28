@@ -85,6 +85,7 @@ Manual equivalent:
 - `bun cmd/build.ts` — fetch deps, build the decoder + `jxl_test`. **MSVC is
   the default on Windows** (`out/msvc/jxl_test_msvc.exe`); `-clang` builds
   with clang (`out/clang/jxl_test_clang.exe`). `-clean` wipes `out/`.
+  `-no-deps` skips cloning/building libjxl (CI compile checks).
   `bun cmd/build.ts asan` builds the clang+ASan harness.
 - `bun cmd/tests.ts <-all | -rand N | file.jxl ...>` — the test driver:
   builds, then decodes each corpus file with both our decoder and `djxl`
@@ -125,7 +126,11 @@ Manual equivalent:
   debug-info libjxl (built on demand into `deps/libjxl-dbg`); that is how to
   see which side of a ratio is slow.
 - `bun cmd/build-dist.ts` — regenerate the `dist/jxl.c` + `dist/jxl.h`
-  amalgamation and verify it compiles with every available toolchain.
+  amalgamation and verify it compiles with every available toolchain:
+  host clang, host MSVC, MSVC x86 (`Host*/x86/cl` when the PATH cl is x64),
+  and mingw-w64 gcc **without** `-mxsave` (catches the `_xgetbv` always_inline
+  trap that broke SumatraPDF's Wine CI). Optional `-require-mingw` /
+  `-require-msvc-x86` fail the script if that compiler is missing (used by CI).
 
 **Script convention** (from djvudec): every script that operates on `.jxl`
 files does nothing by default — it prints its options plus the available

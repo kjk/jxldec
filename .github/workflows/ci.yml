@@ -1,0 +1,81 @@
+# CI for jxldec — host build, amalgamation, and the cross/arch compile
+# variants that have failed consumers before (MSVC Win32, mingw-w64).
+#
+# Full pixel-oracle corpus (tests.ts -all vs libjxl) stays local: it needs
+# the full deps tree and is much longer. CI keeps the loop short and catches
+# compile breaks on the toolchains SumatraPDF / Wine use.
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUN_INSTALL_CACHE_DIR: ${{ github.workspace }}/.bun-cache
+
+jobs:
+  windows-msvc:
+    name: Windows MSVC x64 + amalgamation
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: MSVC environment (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build harness (no oracle deps)
+        run: bun cmd/build.ts -no-deps
+      - name: Amalgamation (clang + msvc + msvc-x86)
+        # -require-msvc-x86 uses HostX64/x86/cl when the PATH cl is x64, so we
+        # catch Win32-only breaks (_BitScanReverse64) on the same job.
+        run: bun cmd/build-dist.ts -require-msvc-x86
+
+  windows-msvc-x86:
+    name: Windows MSVC Win32 harness
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: MSVC environment (x86)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Build harness under Win32 cl
+        # Full link of jxl_test under x86 — the SumatraPDF rel32 failure was
+        # LNK2001 on __BitScanReverse64, not only a compile warning.
+        run: bun cmd/build.ts -no-deps
+      - name: Amalgamation under Win32 cl
+        run: bun cmd/build-dist.ts
+
+  linux:
+    name: Linux clang + amalgamation + mingw
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang gcc-mingw-w64-x86-64
+      - name: Build clang harness
+        run: bun cmd/build.ts -clang -no-deps
+      - name: Amalgamation (clang + mingw without -mxsave)
+        # mingw must not need -mxsave: that is how SumatraPDF Wine CI compiles
+        # jxl.c. gcc's _xgetbv is always_inline and fails without it.
+        run: bun cmd/build-dist.ts -require-mingw

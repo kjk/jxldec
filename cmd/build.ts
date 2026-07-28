@@ -3,6 +3,7 @@
 //   bun cmd/build.ts          fetch deps + build jxl_test (MSVC default)
 //   bun cmd/build.ts -clang   build with clang instead of MSVC
 //   bun cmd/build.ts -clean   delete out/ first (full rebuild)
+//   bun cmd/build.ts -no-deps skip getDeps (harness-only; for CI compile checks)
 //   bun cmd/build.ts asan     clang + AddressSanitizer harness
 //   bun cmd/build.ts cov      clang + coverage instrumentation (see coverage.ts)
 //   bun cmd/build.ts fuzz     clang + libFuzzer + ASan (see fuzz.ts)
@@ -575,7 +576,8 @@ export async function buildProfHarness(): Promise<string> {
 if (import.meta.main) {
   const args = process.argv.slice(2);
   if (args.includes("-clean")) cleanBuildOutput();
-  await getDeps();
+  // -no-deps: harness / asan / cov only need src/; getDeps is for the oracle.
+  if (!args.includes("-no-deps")) await getDeps();
   const useClang = args.includes("-clang") || defaultUseClang;
   if (args.includes("asan")) await buildAsan();
   else if (args.includes("cov")) await buildCoverage();
