@@ -12,8 +12,9 @@
  *
  * Each file is decoded `runs` times per decoder and the best time is
  * reported: the fastest run is the one least perturbed by the scheduler.
- * Output is one line per file plus a total, in the shape djvudec's bench
- * prints.
+ * Output is one line per file plus a total, in the compact sibling-decoder
+ * shape: libjxl, jxldec, signed difference, signed percentage difference,
+ * then the file path and size.
  */
 #include "jxl.h"
 
@@ -67,6 +68,28 @@ static uint8_t *read_file(const char *path, size_t *len) {
     fclose(f);
     *len = (size_t)n;
     return buf;
+}
+
+static void format_bytes_exact(size_t bytes, char out[64]) {
+    char digits[32];
+    size_t i, n, j = 0;
+    snprintf(digits, sizeof(digits), "%zu", bytes);
+    n = strlen(digits);
+    for (i = 0; i < n; i++) {
+        if (i > 0 && (n - i) % 3 == 0) out[j++] = ',';
+        out[j++] = digits[i];
+    }
+    out[j] = 0;
+}
+
+static void print_file_label(const char *path, size_t len) {
+    char exact[64];
+    const char *display = path;
+    if (strncmp(display, "deps/corpus/", 12) == 0 ||
+        strncmp(display, "deps\\corpus\\", 12) == 0)
+        display += 12;
+    format_bytes_exact(len, exact);
+    printf("%s %s b", display, exact);
 }
 
 /* Returns the decode time in ms, or -1 on failure. */
@@ -151,7 +174,6 @@ static void bench_one(const char *path, int runs, double *tot_ref,
     uint8_t *data;
     size_t len;
     double best_ours = -1, best_ref = -1;
-    const char *base, *p;
     int r;
 
     data = read_file(path, &len);
@@ -167,19 +189,24 @@ static void bench_one(const char *path, int runs, double *tot_ref,
     }
     free(data);
 
-    base = path;
-    for (p = path; *p; p++) {
-        if (*p == '/' || *p == '\\') base = p + 1;
-    }
-
     if (best_ours < 0 || best_ref < 0) {
-        printf("%-46s %10s %10s %8s\n", base, best_ref < 0 ? "fail" : "-",
-               best_ours < 0 ? "fail" : "-", "-");
+        printf("%8s %8s %8s %8s ", best_ref < 0 ? "ERROR" : "-",
+               best_ours < 0 ? "ERROR" : "-", "ERROR", "ERROR");
+        print_file_label(path, len);
+        putchar('\n');
         fflush(stdout);
         return;
     }
-    printf("%-46s %9.2fms %9.2fms %7.2fx\n", base, best_ref, best_ours,
-           best_ref > 0 ? best_ours / best_ref : 0.0);
+    {
+        double diff = best_ours - best_ref;
+        double pct = best_ref > 0 ? diff * 100.0 / best_ref : 0.0;
+        char pct_text[32];
+        snprintf(pct_text, sizeof(pct_text), "%+.1f%%", pct);
+        printf("%8.2f %8.2f %+8.2f %8s ", best_ref, best_ours, diff,
+               pct_text);
+        print_file_label(path, len);
+        putchar('\n');
+    }
     fflush(stdout);
     *tot_ours += best_ours;
     *tot_ref += best_ref;
@@ -224,7 +251,8 @@ int main(int argc, char **argv) {
             output_bgra = 1;
         }
     }
-    printf("%-46s %10s %10s %8s\n", "file", "libjxl", "jxldec", "ratio");
+    printf("%8s %8s %8s %8s %s\n", "libjxl", "jxldec", "diff", "%diff",
+           "file");
 
     if (list_path &&
         bench_list(list_path, runs, &tot_ref, &tot_ours, &tot_bytes, &nfiles) != 0) {
@@ -239,8 +267,12 @@ int main(int argc, char **argv) {
     }
 
     if (nfiles) {
-        printf("%-46s %9.2fms %9.2fms %7.2fx\n", "TOTAL", tot_ref, tot_ours,
-               tot_ref > 0 ? tot_ours / tot_ref : 0.0);
+        double diff = tot_ours - tot_ref;
+        double pct = tot_ref > 0 ? diff * 100.0 / tot_ref : 0.0;
+        char pct_text[32];
+        snprintf(pct_text, sizeof(pct_text), "%+.1f%%", pct);
+        printf("%8.2f %8.2f %+8.2f %8s TOTAL\n", tot_ref, tot_ours, diff,
+               pct_text);
         printf("%d file(s), %.1f MB\n", nfiles, (double)tot_bytes / (1024 * 1024));
     }
     return 0;

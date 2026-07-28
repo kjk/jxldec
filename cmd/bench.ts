@@ -9,11 +9,13 @@
 // 8-bit interleaved samples of the first frame; libjxl runs single-threaded,
 // the only configuration we implement. The best of -runs decodes is reported
 // per decoder, since the fastest run is the least perturbed one.
+// Output follows the sibling decoders: libjxl, jxldec, signed millisecond
+// difference, signed percentage difference, then path and file size.
 //
 // Windows/MSVC only: libjxl is C++ and links against the MSVC runtime.
 import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { dirname, join } from "path";
+import { dirname, isAbsolute, join, relative, resolve } from "path";
 import { buildBenchHarness, isWindows } from "./build";
 import { corpusSummary, selectFiles } from "./corpus";
 import { getDeps } from "./get-deps";
@@ -42,6 +44,8 @@ options:
   -preset a,b     restrict the generated corpus to these presets
   -bgra           request BGRA8 from ours and RGBA8 from libjxl
 
+Output columns: libjxl jxldec diff %diff file (+ = jxldec slower).
+
 ${corpusSummary()}`,
   ["-rand", "-runs", "-preset"],
 );
@@ -49,7 +53,13 @@ ${corpusSummary()}`,
 const EXE = await buildBenchHarness();
 const tmp = mkdtempSync(join(tmpdir(), "jxldec-bench-"));
 const listFile = join(tmp, "files.txt");
-writeFileSync(listFile, files.join("\n") + "\n");
+const displayPath = (file: string): string => {
+  const absolute = resolve(file);
+  const rel = relative(ROOT, absolute);
+  return (rel.startsWith("..") || isAbsolute(rel) ? absolute : rel)
+    .replaceAll("\\", "/");
+};
+writeFileSync(listFile, files.map(displayPath).join("\n") + "\n");
 try {
   const proc = Bun.spawnSync({
     cmd: [EXE, "-runs", RUNS, ...(BGRA ? ["-bgra"] : []),
