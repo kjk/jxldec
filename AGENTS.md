@@ -109,6 +109,10 @@ Manual equivalent:
   lie. `fuzz/corpus/` is the checkpoint (gitignored): Ctrl-C to stop, rerun to
   resume. Artifacts land in `fuzz/crashes/`, which **is** tracked — replay one
   with `-repro`.
+- `bun cmd/fuzz-afl.ts` — same harness via **AFL++** (macOS/*nix; needs
+  `brew install afl++`). Shares `fuzz/corpus/` with libFuzzer; AFL state is in
+  `fuzz/afl-out/` (gitignored). On exit (and with `-import`), queue/crashes
+  merge into the shared dirs. On macOS run once: `sudo afl-system-config`.
 - `bun cmd/bench.ts <selection> [-runs N]` — times our decode against libjxl's,
   both in one process, single-threaded, best of N. Windows/MSVC only: it links
   libjxl's static libraries, which need `-MD` and `-DJXL_STATIC_DEFINE`.

@@ -6,13 +6,22 @@
 //   bun cmd/build.ts asan     clang + AddressSanitizer harness
 //   bun cmd/build.ts cov      clang + coverage instrumentation (see coverage.ts)
 //   bun cmd/build.ts fuzz     clang + libFuzzer + ASan (see fuzz.ts)
+//   bun cmd/build.ts fuzz-afl afl-clang-fast harness (see fuzz-afl.ts; *nix)
 //
 // Objects and exes land in out/msvc/, out/clang/ or out/clang_asan/. The build
 // is incremental: a source is recompiled only when newer than its object, and
 // the exe is relinked only when an object is newer. build() returns the exe
 // path. Verification lives in tests.ts.
 import { $ } from "bun";
-import { copyFileSync, existsSync, mkdirSync, rmSync, statSync } from "fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "fs";
 import { resolve as resolvePath } from "path";
 import { DIST_C, DIST_H, ensureDist } from "./build-dist";
 import { buildRefDebug, getDeps } from "./get-deps";
@@ -238,6 +247,139 @@ export async function buildFuzz(clean = false): Promise<string> {
   return FUZZ_EXE;
 }
 
+/* ----- AFL++ target (driven by cmd/fuzz-afl.ts; macOS / *nix) ----- */
+
+const FUZZ_AFL_DIR = `${OUT_ROOT}/fuzz-afl`;
+export const FUZZ_AFL_EXE = `${FUZZ_AFL_DIR}/jxl_afl`;
+
+/** Prefer Homebrew AFL++ wrappers (afl-clang-fast → Homebrew LLVM). */
+export function findAflCc(): string {
+  const env = process.env.AFL_CC || process.env.AFL_CLANG_FAST;
+  if (env && existsSync(env)) return env;
+  for (const c of [
+    "/opt/homebrew/bin/afl-clang-fast",
+    "/usr/local/bin/afl-clang-fast",
+    "/opt/homebrew/bin/afl-cc",
+    "/usr/local/bin/afl-cc",
+  ]) {
+    if (existsSync(c)) return c;
+  }
+  return "afl-clang-fast";
+}
+
+export function aflTool(name: string): string | null {
+  const envKey = name.toUpperCase().replaceAll("-", "_");
+  const env = process.env[envKey];
+  if (env && existsSync(env)) return env;
+  for (const base of ["/opt/homebrew/bin", "/usr/local/bin"]) {
+    const p = `${base}/${name}`;
+    if (existsSync(p)) return p;
+  }
+  return Bun.which(name);
+}
+
+// AFL++ target: same LLVMFuzzerTestOneInput harness as libFuzzer, but built
+// with afl-clang-fast -fsanitize=fuzzer (AFL++ swaps that for libAFLDriver.a
+// + persistent-mode shared-memory input). Optional ASan via AFL_USE_ASAN.
+export async function buildAflFuzz(
+  opts: { clean?: boolean; asan?: boolean } = {},
+): Promise<string> {
+  if (isWindows) {
+    throw new Error(
+      "AFL++ fuzzing is not supported on Windows; use bun cmd/fuzz.ts (libFuzzer)",
+    );
+  }
+  const clean = !!opts.clean;
+  const asan = opts.asan !== false; // default on
+  mkdirSync(FUZZ_AFL_DIR, { recursive: true });
+
+  const cc = findAflCc();
+  const ccOk =
+    existsSync(cc) ||
+    !!Bun.which(cc) ||
+    cc === "afl-clang-fast" ||
+    cc === "afl-cc";
+  if (!ccOk && !Bun.which("afl-clang-fast") && !Bun.which("afl-cc")) {
+    throw new Error(
+      "afl-clang-fast not found. On macOS: brew install afl++\n" +
+        "  (uses Homebrew LLVM for instrumentation)",
+    );
+  }
+
+  const testSrc = `${ROOT}/test/fuzz_target.c`;
+  const units: { src: string; obj: string }[] = [
+    ...SRCS.map((s) => ({
+      src: `${ROOT}/${s}`,
+      obj: `${FUZZ_AFL_DIR}/${objBase(s)}.o`,
+    })),
+    { src: testSrc, obj: `${FUZZ_AFL_DIR}/fuzz_target.o` },
+  ];
+
+  const stampWant = `asan=${asan ? 1 : 0};cc=${cc}`;
+  const stampPath = `${FUZZ_AFL_DIR}/.afl_features`;
+  const stampPrev = existsSync(stampPath)
+    ? readFileSync(stampPath, "utf8").trim()
+    : "";
+  const stampChanged = stampPrev !== stampWant;
+
+  if (clean || stampChanged) {
+    for (const u of units) rmSync(u.obj, { force: true });
+    rmSync(FUZZ_AFL_EXE, { force: true });
+  }
+
+  const headers = [INTERNAL_H, PUBLIC_H];
+  const objStale = (u: { src: string; obj: string }) =>
+    needsRebuild(u.obj, u.src, ...headers);
+  const staleObj = units.some(objStale);
+  const staleExe = needsRebuild(FUZZ_AFL_EXE, ...units.map((u) => u.obj));
+  if (!staleObj && !staleExe && existsSync(FUZZ_AFL_EXE) && !stampChanged) {
+    console.log("jxl_afl up to date");
+    return FUZZ_AFL_EXE;
+  }
+
+  // -O1 for readable ASan traces; -fsanitize=fuzzer → AFL++ libAFLDriver.
+  // Do not also pass -fsanitize=address: AFL_USE_ASAN adds it.
+  const cflags =
+    `-fsanitize=fuzzer ${clangCFlags("-g -O1", false)} -I${ROOT}/src`;
+  const env: Record<string, string> = {
+    ...process.env,
+    // Strip -Werror noise from AFL plugin passes on some LLVM versions.
+    AFL_LLVM_NO_ERROR: process.env.AFL_LLVM_NO_ERROR ?? "1",
+    AFL_QUIET: process.env.AFL_QUIET ?? "1",
+  };
+  if (asan) env.AFL_USE_ASAN = "1";
+  else delete env.AFL_USE_ASAN;
+
+  console.log(
+    `building jxl_afl (afl-clang-fast+fuzzer${asan ? "+asan" : ""})...`,
+  );
+  try {
+    for (const u of units) {
+      if (!objStale(u) && !stampChanged) continue;
+      await $`${cc} ${{ raw: cflags }} -c -o ${u.obj} ${u.src}`
+        .cwd(ROOT)
+        .env(env);
+    }
+    const objs = units.map((u) => u.obj);
+    if (needsRebuild(FUZZ_AFL_EXE, ...objs) || stampChanged) {
+      await $`${cc} -fsanitize=fuzzer ${{ raw: objs.join(" ") }} -lpthread -lm -o ${FUZZ_AFL_EXE}`
+        .cwd(ROOT)
+        .env(env);
+    }
+  } catch (e) {
+    console.error("\nAFL++ fuzz build failed.");
+    console.error("Install AFL++ (and LLVM) via Homebrew:");
+    console.error("  brew install afl++");
+    console.error(
+      "afl-clang-fast must be on PATH (or set AFL_CC=/path/to/afl-clang-fast).\n",
+    );
+    throw e;
+  }
+  writeFileSync(stampPath, stampWant);
+  console.log("built jxl_afl");
+  return FUZZ_AFL_EXE;
+}
+
 // clang + source-based coverage instrumentation -> out/clang_cov/.
 // -O0 so that no inlining folds one function's lines into another's and a
 // never-executed branch cannot be optimised away before it is counted.
@@ -437,6 +579,7 @@ if (import.meta.main) {
   const useClang = args.includes("-clang") || defaultUseClang;
   if (args.includes("asan")) await buildAsan();
   else if (args.includes("cov")) await buildCoverage();
+  else if (args.includes("fuzz-afl")) await buildAflFuzz();
   else if (args.includes("fuzz")) await buildFuzz();
   else await build(useClang);
 }

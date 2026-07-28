@@ -5,6 +5,9 @@ dist/
 # seeds -- a crash artifact is the only reproducer we have for it.
 fuzz/corpus/
 fuzz/corpus.min/
+fuzz/corpus.cmin/
+fuzz/corpus.precmin/
+fuzz/afl-out/
 fuzz/*.log
 *.o
 *.obj

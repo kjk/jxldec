@@ -1,16 +1,16 @@
-/* fuzz_target.c -- libFuzzer entry point for the JPEG XL decoder.
+/* fuzz_target.c -- LLVMFuzzerTestOneInput for the JPEG XL decoder.
  *
  * Each input is treated as a whole .jxl file: open it, read the info and the
  * ICC profile, then render frames, so malformed bytes reach the container,
- * header, entropy-coding, Modular, VarDCT, filter and render paths. Built with
- * `clang -fsanitize=address,fuzzer`; libFuzzer supplies main().
+ * header, entropy-coding, Modular, VarDCT, filter and render paths.
+ *
+ *   bun cmd/fuzz.ts      clang -fsanitize=address,fuzzer (libFuzzer supplies main)
+ *   bun cmd/fuzz-afl.ts  afl-clang-fast -fsanitize=fuzzer (AFL++ libAFLDriver)
  *
  * The corpus this fuzzer seeds from is 1200+ *valid* files, and a valid file
  * never takes an error path: jxl_errorf, the target of every JXL_ERR in the
  * decoder, does not execute once across the whole of cmd/tests.ts. Everything
  * the decoder does when it is lied to is what this is here to cover.
- *
- * See cmd/fuzz.ts for the driver.
  */
 #include "jxl.h"
 

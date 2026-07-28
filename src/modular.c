@@ -17,9 +17,18 @@
  */
 #include "jxl_internal.h"
 
-#include <immintrin.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+/* AVX2 squeeze inverse lives beside the scalar path (runtime-gated via
+   jxl_has_avx2). The include and kernels are compile-gated so arm64 and
+   -DJXL_NO_AVX2 builds stay free of immintrin. */
+#if !defined(JXL_NO_AVX2) && \
+    (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
+     (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#define JXL_MODULAR_AVX2 1
+#include <immintrin.h>
+#endif
 
 static uint32_t div_ceil_u32(uint32_t a, uint32_t b) {
     return (a + b - 1) / b;
@@ -1268,6 +1277,7 @@ static int32_t squeeze_tendency(int32_t a, int32_t b, int32_t c) {
     return 0;
 }
 
+#ifdef JXL_MODULAR_AVX2
 /* Eight independent lifting steps. The caller supplies lanes that have no
    dependency on each other: columns for vertical squeeze, rows for
    horizontal squeeze. Returns 0 when an extreme input needs the scalar/int64
@@ -1538,6 +1548,7 @@ static JXL_TARGET_AVX2 int squeeze_inverse_h_avx2(jxl_ctx *ctx,
     jxl_free(ctx, scratch);
     return 0;
 }
+#endif /* JXL_MODULAR_AVX2 */
 
 static int squeeze_inverse_h(jxl_ctx *ctx, jxl_mchan *merged) {
     uint32_t width = merged->w, height = merged->h;
@@ -1546,8 +1557,10 @@ static int squeeze_inverse_h(jxl_ctx *ctx, jxl_mchan *merged) {
     uint32_t x, y;
 
     if (width == 0 || height == 0) return 0;
+#ifdef JXL_MODULAR_AVX2
     if (height >= 8 && width >= 16 && jxl_has_avx2())
         return squeeze_inverse_h_avx2(ctx, merged);
+#endif
     scratch = (int32_t *)jxl_malloc(ctx, (size_t)width * sizeof(int32_t));
     if (!scratch) return -1;
 
@@ -1581,6 +1594,7 @@ static int squeeze_inverse_h(jxl_ctx *ctx, jxl_mchan *merged) {
 
 #define JXL_SQ_STRIP 16
 
+#ifdef JXL_MODULAR_AVX2
 /* Eight independent columns of the vertical lifting step. This is the
    branchless form used by libjxl's FastUnsqueeze: floor(abs(B-a) / 3) is a
    multiply-high by 0x55555556, and signed diff/2 is an arithmetic shift after
@@ -1674,6 +1688,7 @@ static JXL_TARGET_AVX2 void squeeze_inverse_v_avx2(
         }
     }
 }
+#endif /* JXL_MODULAR_AVX2 */
 
 static int squeeze_inverse_v(jxl_ctx *ctx, jxl_mchan *merged) {
     uint32_t width = merged->w, height = merged->h;
@@ -1698,11 +1713,13 @@ static int squeeze_inverse_v(jxl_ctx *ctx, jxl_mchan *merged) {
         ctx, (size_t)height * JXL_SQ_STRIP * sizeof(int32_t));
     if (!scratch) return -1;
 
+#ifdef JXL_MODULAR_AVX2
     if (jxl_has_avx2()) {
         squeeze_inverse_v_avx2(merged, scratch, width, height, avg_height);
         jxl_free(ctx, scratch);
         return 0;
     }
+#endif
 
     for (x = 0; x < width; x += JXL_SQ_STRIP) {
         uint32_t nresidu = height / 2;
