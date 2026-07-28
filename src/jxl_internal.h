@@ -509,9 +509,9 @@ typedef struct {
     union {
         struct {
             int32_t split0;
-            int32_t prop1, split1;   /* test at the left child  */
-            int32_t prop2, split2;   /* test at the right child */
+            int32_t split1, split2;  /* tests at the two children */
             uint32_t child;          /* base of LL, LR, RL, RR  */
+            int16_t prop1, prop2;    /* properties at the two children */
         } dec;
         jxl_ma_leaf leaf;
     } u;
@@ -847,6 +847,8 @@ typedef struct {
 
 typedef struct {
     uint8_t dct_select;
+    uint8_t hf_nonzero_mask;
+    uint8_t hf_transform_mask;
     int32_t hf_mul;
 } jxl_block_info;
 
@@ -903,7 +905,7 @@ void jxl_hf_pass_free(jxl_ctx *ctx, jxl_hf_pass *hp);
 typedef struct {
     uint32_t num_hf_presets;
     const jxl_hf_block_ctx *bc;
-    const jxl_block_info *block_info;
+    jxl_block_info *block_info;
     uint32_t bi_w, bi_h;
     size_t bi_stride;
     uint32_t jpeg_upsampling[3];
@@ -949,6 +951,7 @@ void jxl_dequant_dct8_plane(float *coeff, size_t stride,
                             float quant_bias, float quant_bias_numerator);
 void jxl_transform_varblock(float *coeff, size_t stride, int tr);
 void jxl_idct8x8_plane(float *data, size_t stride,
+                       const jxl_block_info *blocks, int channel,
                        uint32_t blocks_w, uint32_t blocks_h);
 void jxl_fill_varblock_lf(float *coeff, size_t stride, int tr,
                           const float *lf, size_t lf_stride, uint32_t lf_x,

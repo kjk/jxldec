@@ -680,12 +680,22 @@ static void idct_8x8_fma(float *data, size_t stride) {
    frame; doing that once per block was a substantial fraction of IDCT time. */
 JXL_TARGET_AVX2_FMA
 void jxl_idct8x8_plane(float *data, size_t stride,
+                       const jxl_block_info *blocks, int channel,
                        uint32_t blocks_w, uint32_t blocks_h) {
     uint32_t bx, by;
     for (by = 0; by < blocks_h; by++) {
         for (bx = 0; bx < blocks_w; bx++) {
-            idct_8x8_fma_core(
-                data + (size_t)(by * 8) * stride + bx * 8, stride);
+            float *block =
+                data + (size_t)(by * 8) * stride + bx * 8;
+            if (blocks[(size_t)by * blocks_w + bx].hf_transform_mask &
+                (1u << channel)) {
+                idct_8x8_fma_core(block, stride);
+            } else {
+                __m256 dc = _mm256_set1_ps(block[0]);
+                uint32_t y;
+                for (y = 0; y < 8; y++)
+                    _mm256_storeu_ps(block + (size_t)y * stride, dc);
+            }
         }
     }
     _mm256_zeroupper();

@@ -217,10 +217,10 @@ static int ma_flatten(jxl_ctx *ctx, const jxl_ma_node *raw,
                                           channel, stream_idx);
             }
             if (side == 0) {
-                flat[fi].u.dec.prop1 = p;
+                flat[fi].u.dec.prop1 = (int16_t)p;
                 flat[fi].u.dec.split1 = s;
             } else {
-                flat[fi].u.dec.prop2 = p;
+                flat[fi].u.dec.prop2 = (int16_t)p;
                 flat[fi].u.dec.split2 = s;
             }
         }
@@ -282,6 +282,10 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
         property = jxl_dec_read(&tree_dec, br, 1);
         if (br->err || tree_dec.err) {
             JXL_ERR(ctx, "modular: truncated MA tree");
+            goto done;
+        }
+        if (property > 256) {
+            JXL_ERR(ctx, "modular: bad MA property %u", (unsigned)property);
             goto done;
         }
         if (property > 0) {
@@ -2711,6 +2715,59 @@ modular_decode_general_nec(jxl_mchan *ch, jxl_pred_state *ps,
     return 0;
 }
 
+/* Responsive Modular streams do not use the weighted predictor and commonly
+   test only N/W and the previous gradient. Match libjxl's no-LZ77 NEC track:
+   keep the first/last two columns on the edge-aware state machine, but use
+   direct row loads and the literal-only entropy reader through the interior. */
+static JXL_MODULAR_NOINLINE int
+modular_decode_nw_nec(jxl_mchan *ch, jxl_pred_state *ps,
+                      const jxl_ma_config *ma, jxl_dec *dec, jxl_br *br,
+                      int32_t channel, int32_t stream_idx) {
+    uint32_t x, y;
+
+#define JXL_NW_SAMPLE(PREDICT_SAMPLE, RECORD_SAMPLE) do {                    \
+        jxl_props pr;                                                         \
+        const jxl_ma_leaf *leaf;                                              \
+        uint32_t token;                                                       \
+        int32_t diff, value;                                                  \
+                                                                              \
+        props_compute_nw(ps, &pr, channel, stream_idx);                       \
+        leaf = ma_get_leaf_local(ma, &pr);                                    \
+        token = jxl_dec_read_clustered_no_lz77(dec, br, leaf->cluster);       \
+        diff = jxl_unpack_signed(token);                                      \
+        diff = (int32_t)((uint32_t)diff * leaf->multiplier +                  \
+                         (uint32_t)leaf->offset);                              \
+        value = (int32_t)((uint32_t)diff + (uint32_t)(PREDICT_SAMPLE));       \
+        row[x] = value;                                                       \
+        RECORD_SAMPLE;                                                        \
+    } while (0)
+
+    for (y = 0; y < ch->h; y++) {
+        int32_t *row = ch->data + (size_t)y * ch->stride;
+        x = 0;
+        if (y > 1 && ch->w > 8) {
+            for (; x < 2; x++) {
+                JXL_NW_SAMPLE(
+                    predict_sample(ps, &pr, leaf->predictor),
+                    pred_record(ps, &pr, value));
+            }
+            for (; x + 2 < ch->w; x++) {
+                JXL_NW_SAMPLE(
+                    predict_sample_nec(ps, &pr, leaf->predictor),
+                    pred_record_nec(ps, &pr, value));
+            }
+        }
+        for (; x < ch->w; x++) {
+            JXL_NW_SAMPLE(
+                predict_sample(ps, &pr, leaf->predictor),
+                pred_record(ps, &pr, value));
+        }
+        if (br->err || dec->err) return -1;
+    }
+#undef JXL_NW_SAMPLE
+    return 0;
+}
+
 /* libjxl instantiates a separate no-LZ77, no-edge-case loop for this track.
    Besides the direct neighbours and predictor-state update, resolving LZ77
    once here removes its branch and the redundant cluster range check from
@@ -3118,6 +3175,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                     }
                     for (y = 1; y < ch->h; y++) {
                         const int32_t *rtop;
+                        int32_t left, topleft;
                         row = ch->data + (size_t)y * ch->stride;
                         rtop = row - ch->stride;
                         if (rle1_run) {
@@ -3130,7 +3188,10 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                         }
                         row[0] = (int32_t)((uint32_t)rle1_diff +
                                            (uint32_t)rtop[0]);
+                        left = row[0];
+                        topleft = rtop[0];
                         for (x = 1; x < ch->w; x++) {
+                            int32_t top;
                             if (rle1_run) {
                                 rle1_run--;
                             } else {
@@ -3139,9 +3200,11 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                                     &rle1_have);
                                 rle1_diff = jxl_unpack_signed(token);
                             }
-                            row[x] = (int32_t)((uint32_t)rle1_diff +
-                                (uint32_t)grad_clamped(
-                                    rtop[x], row[x - 1], rtop[x - 1]));
+                            top = rtop[x];
+                            left = (int32_t)((uint32_t)rle1_diff +
+                                (uint32_t)grad_clamped(top, left, topleft));
+                            row[x] = left;
+                            topleft = top;
                         }
                         if (br->err || dec->err) {
                             JXL_ERR(ctx, "modular: truncated stream %u",
@@ -3274,10 +3337,20 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
 
         if (max_prev == 0) {
             if (!need_sc && (props_mask & ~0x1f3u) == 0) {
-                JXL_GENERAL_LOOP(
-                    ma_get_leaf_local(cma, &pr),
-                    props_compute_nw(
-                        &ps, &pr, (int32_t)ci, (int32_t)stream_idx))
+                if (!dec->lz77_enabled) {
+                    if (modular_decode_nw_nec(
+                            ch, &ps, cma, dec, br, (int32_t)ci,
+                            (int32_t)stream_idx) != 0) {
+                        JXL_ERR(ctx, "modular: truncated stream %u",
+                                (unsigned)stream_idx);
+                        goto done;
+                    }
+                } else {
+                    JXL_GENERAL_LOOP(
+                        ma_get_leaf_local(cma, &pr),
+                        props_compute_nw(
+                            &ps, &pr, (int32_t)ci, (int32_t)stream_idx))
+                }
             } else if ((props_mask & ~0x9e03u) == 0) {
                 if (!dec->lz77_enabled) {
                     if (modular_decode_grad_wp_nec(

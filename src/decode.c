@@ -510,13 +510,38 @@ static void vardct_finish_blocks(jxl_vardct_state *v,
     }
 
     if (batch_dct8) {
+        /* An all-zero AC block stays DC-only unless chroma-from-luma copies
+           nonzero Y coefficients into X or B. Record that once per block so
+           the inverse transform can broadcast LF directly for the remaining
+           constant blocks. */
+        for (by = 0; by < v->bh; by++) {
+            for (bx = 0; bx < v->bw; bx++) {
+                jxl_block_info *bi =
+                    &v->block_info[(size_t)by * v->bw + bx];
+                uint8_t mask = bi->hf_nonzero_mask;
+                if (mask & (1u << 1)) {
+                    size_t corr_idx =
+                        (size_t)(by / 8) * v->cfl_w + bx / 8;
+                    float kx = v->chan_corr.base_correlation_x +
+                        (float)v->x_from_y[corr_idx] /
+                            (float)v->chan_corr.colour_factor;
+                    float kb = v->chan_corr.base_correlation_b +
+                        (float)v->b_from_y[corr_idx] /
+                            (float)v->chan_corr.colour_factor;
+                    if (kx != 0.0f) mask |= 1u << 0;
+                    if (kb != 0.0f) mask |= 1u << 2;
+                }
+                bi->hf_transform_mask = mask;
+            }
+        }
         for (c = skip_cb ? 1 : 0; c < 3; c++) {
             for (by = 0; by < v->bh; by++) {
                 float *row = v->coeff[c] + (size_t)(by * 8) * v->pw;
                 const float *lf_row = v->lf[c] + (size_t)by * v->bw;
                 for (bx = 0; bx < v->bw; bx++) row[bx * 8] = lf_row[bx];
             }
-            jxl_idct8x8_plane(v->coeff[c], v->pw, v->bw, v->bh);
+            jxl_idct8x8_plane(v->coeff[c], v->pw, v->block_info, c,
+                              v->bw, v->bh);
         }
         return;
     }

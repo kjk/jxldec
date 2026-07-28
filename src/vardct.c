@@ -943,7 +943,8 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
 
     for (y = 0; y < p->bi_h; y++) {
         for (x = 0; x < p->bi_w; x++) {
-            const jxl_block_info *bi = &p->block_info[(size_t)y * p->bi_stride + x];
+            jxl_block_info *bi =
+                &p->block_info[(size_t)y * p->bi_stride + x];
             uint32_t bw8, bh8, num_blocks, num_blocks_log, order_id;
             uint32_t lf_idx = 0, hf_idx = 0;
             int32_t qf;
@@ -1038,6 +1039,7 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                     nz_row[cc][sx + dx8] = non_zeros_val;
                 }
                 if (non_zeros == 0) continue;
+                bi->hf_nonzero_mask |= (uint8_t)(1u << cc);
 
                 is_prev_nonzero = (non_zeros <= num_blocks * 4) ? 1 : 0;
                 ord = NULL;
@@ -1571,6 +1573,7 @@ void jxl_dequant_dct8_plane(float *coeff, size_t stride,
         for (bx = 0; bx < blocks_w; bx++) {
             const jxl_block_info *bi =
                 blocks + (size_t)by * blocks_w + bx;
+            if (!(bi->hf_nonzero_mask & (1u << channel))) continue;
             float mul =
                 65536.0f / ((float)q->global_scale * (float)bi->hf_mul) *
                 qm_scale;

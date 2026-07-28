@@ -62,8 +62,11 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **about 1.12x libjxl** (the latest full sweep measured
-1.124x, with both columns thermally slower than the preceding 1.113x sweep;
+1245-file corpus we are **about 1.10x libjxl** (the latest best-of-five sweep
+measured 18089.84ms against 16470.12ms, **1.0983x**; an immediately preceding
+best-of-three sweep measured 18195.22ms against 16560.84ms, **1.0987x**;
+1.124x before the recent work below, with both columns thermally slower than
+the preceding 1.113x sweep;
 1.13x before the recent RCT, Modular-property and noise work; 1.21x
 before the small-error
 self-correcting-weight and max-error specializations below; 1.25x before the
@@ -83,6 +86,48 @@ hot source lines, heaviest call path). That is how the numbers below were
 found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
+
+### Cross 1.10x: specialize responsive Modular and skip zero VarDCT work
+The effort-one prefix-RLE gradient loop now carries the west and northwest
+samples in registers through each interior row. Alternating release runs
+saved 16-18ms over the complete `m_e1` preset.
+
+HF decoding records which channels of each DCT8 block contain a nonzero AC
+coefficient. Dequantization skips the untouched channels, and the inverse
+transform broadcasts the DC coefficient over an all-zero-AC block instead of
+running two 1-D transforms. Chroma-from-luma first propagates Y's nonzero flag
+to X/B when the corresponding correlation is nonzero. The dequant skip saved
+about 35.6ms over 782 VarDCT files; the DC-only inverse transform reduced
+normalized VarDCT time by roughly 0.3-0.6%.
+
+Responsive Modular streams use neither LZ77 nor the weighted predictor. A
+dedicated loop now keeps the edge-aware first and last two columns, but uses
+the no-edge predictor/state updates and literal-only entropy reader across the
+interior. A same-machine whole-corpus saved-binary comparison moved the ratio
+from 1.1304x to 1.1071x, while repeated `flower_alpha.m_resp` comparisons moved
+from about 1.068x to 1.04-1.05x.
+
+The packed MA decision node also now matches libjxl's 24-byte layout: the two
+second-level split values are adjacent and their property indices are 16-bit.
+The parser rejects the same out-of-range property values as libjxl before the
+narrowing conversion. Alternating comparisons over all 73 responsive files
+moved from 1.03-1.04x to 1.01-1.02x after normalization; the large
+`flower_alpha.m_resp` file improved by about 1.4%. Packing the node further to
+20 bytes was about 0.6% slower and was reverted.
+
+The resulting full-corpus sweeps are 18195.22/16560.84ms (**1.0987x**,
+best of three) and 18089.84/16470.12ms (**1.0983x**, best of five), crossing
+the 1.10x target for the first time.
+
+Profile-guided experiments rejected during this round include a vector-carried
+EPF horizontal SAD, partial or lazy coefficient-plane zeroing, uninitialized
+Modular base buffers, tiled DCT8 finishing, extracted/direct-ANS HF loops and
+DCT8 offset hoisting. Each was oracle-checked where applicable and reverted
+after controlled timings were neutral or slower.
+
+All 1245 oracle comparisons pass, all 115 fuzz reproducers are clean under
+ASan/libFuzzer, and the regenerated amalgamation compiles without warnings
+under Clang and MSVC.
 
 ### Widen Gaborish and specialize the common prefix-RLE configuration
 Gaborish now processes eight interior samples at a time on AVX2 machines,
