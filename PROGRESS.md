@@ -1595,6 +1595,47 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Optional sRGB output for linear-light images
+SumatraPDF issue #5919: a 6000x4000 photo came out dark and over-contrasty
+next to the Windows Photos app. The file is xyb-encoded, 16-bit, no ICC, sRGB
+primaries — and declares a **linear** transfer function. We decode to the
+image's own colour encoding, so `jxl_linear_to_tf` was a no-op and the caller
+blitted linear light to an sRGB display. Every viewer that colour-manages
+(Photos, anything on libjxl + a CMS) applies the sRGB curve; a caller that
+hands our output straight to a display cannot, because by then it is 8-bit.
+
+`jxl_ctx_set_srgb_output(ctx, 1)` rewrites the output encoding's transfer
+function to sRGB when the image declares linear, so the curve runs inside the
+existing per-row float stage — before the 8/16-bit quantiser, so the darks do
+not band. Off by default: the default output stays what `djxl` writes, which
+is what `cmd/tests.ts` compares against.
+
+Verified on pairs of the same photo encoded twice, once linear (`_709_g1`) and
+once sRGB (`_srgb8`), decoded to PAM and differenced. Seven pairs, mean abs
+difference in 8-bit levels:
+
+| pair | flag off | flag on |
+|---|---|---|
+| HUAWEI-EVA-L09-16bit | 64.82 | 1.22 |
+| ra0ed45_alfann24 | 70.63 | 0.47 |
+| tmshre_riaphotographs | 69.55 | 0.27 |
+| u76c0g_bliznaca | 31.55 | 0.47 |
+| vgqcws_vin | 13.10 | 2.79 |
+| q3a0b3_d17ws | 5.28 | 0.16 |
+| t0gho7_orlaustral | 1.95 | 0.45 |
+
+Files that declare any other transfer function decode bit-identically with the
+flag on or off, and `-rand 120` against `djxl` stays 120/120.
+
+Two deliberate limits. Only **xyb-encoded** images are touched: an image
+stored in its original colour space keeps samples that are not ours to
+reinterpret — `cafe.jxl` declares linear, is not xyb, and applying the curve
+to it blows the image out. And only the transfer function: primaries are left
+alone, so a linear BT.2020 file still lands a few levels off its sRGB twin.
+Note the corpus under `deps/corpus/gen` cannot exercise this — `cjxl` converts
+the `_g1` sources to sRGB while encoding, so every generated file declares
+sRGB. The files used above came from SumatraPDF's own jxl test set.
+
 ### The sRGB transfer function eight wide, after getting it wrong once
 With `flower.v_e3` (pure VarDCT, 2.13x) profiled properly, the stage-by-stage
 comparison against libjxl is:

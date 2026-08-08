@@ -152,6 +152,10 @@ void jxl_ctx_set_keep_orientation(jxl_ctx *ctx, int enable) {
     if (ctx) ctx->keep_orientation = enable ? 1 : 0;
 }
 
+void jxl_ctx_set_srgb_output(jxl_ctx *ctx, int enable) {
+    if (ctx) ctx->srgb_output = enable ? 1 : 0;
+}
+
 void jxl_request_abort(jxl_ctx *ctx) {
     if (ctx) ctx->abort_epoch++;
 }

@@ -25,6 +25,7 @@ struct jxl_ctx {
 
     int bgr;                 /* emit B,G,R[,A] instead of R,G,B[,A] */
     int keep_orientation;    /* skip the EXIF-style orientation fixup */
+    int srgb_output;         /* encode linear-light output as sRGB */
     volatile int abort_epoch;
 };
 
