@@ -85,7 +85,7 @@ Manual equivalent:
 - `bun cmd/build.ts` — fetch deps, build the decoder + `jxl_test`. **MSVC is
   the default on Windows** (`out/msvc/jxl_test_msvc.exe`); `-clang` builds
   with clang (`out/clang/jxl_test_clang.exe`). `-clean` wipes `out/`.
-  `-no-deps` skips cloning/building libjxl (CI compile checks).
+  `-no-deps` skips cloning/building libjxl (local compile-only checks).
   `bun cmd/build.ts asan` builds the clang+ASan harness.
 - `bun cmd/tests.ts <-all | -rand N | file.jxl ...>` — the test driver:
   builds, then decodes each corpus file with both our decoder and `djxl`
