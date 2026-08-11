@@ -798,9 +798,12 @@ static void dct_rows4(float *data, size_t stride, int w, int inverse) {
 /* Declared for the batched VarDCT path in decode.c. That path is gated on
    jxl_has_avx2_fma(), which is always 0 without x86, so this is never called. */
 void jxl_idct8x8_plane(float *data, size_t stride,
+                       const jxl_block_info *blocks, int channel,
                        uint32_t blocks_w, uint32_t blocks_h) {
     (void)data;
     (void)stride;
+    (void)blocks;
+    (void)channel;
     (void)blocks_w;
     (void)blocks_h;
 }
