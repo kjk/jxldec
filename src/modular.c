@@ -2803,6 +2803,18 @@ modular_decode_grad_wp_nec(jxl_mchan *ch, jxl_pred_state *ps,
                            const jxl_ma_config *ma, jxl_dec *dec, jxl_br *br,
                            int32_t channel, int32_t stream_idx) {
     uint32_t x, y;
+    /* The flat state sc_predict short-cuts -- W, N, NW and NE all equal v and
+       every predictor error term zero -- also fixes the properties this
+       track computes: 9 is v, 10 to 12 and 15 are 0. The leaf then depends
+       on v alone, and every predictor it can name returns v (or 0 for the
+       zero predictor), so both are kept for the last flat value. While the
+       decoded sample is v again the state stays flat, and the only things
+       that change from one sample to the next are the errors and the value
+       at NE: that is the inner loop below, which is where the background of
+       a scanned page is decoded. */
+    const int flat_ok = ps->use_sc && ps->sc.default_wp;
+    const jxl_ma_leaf *flat_leaf = NULL;
+    int32_t flat_v = 0, flat_pred = 0;
 
 #define JXL_GRAD_WP_SAMPLE(COMPUTE_PROPS, PREDICT_SAMPLE, RECORD_SAMPLE) do { \
         jxl_props pr;                                                         \
@@ -2833,6 +2845,108 @@ modular_decode_grad_wp_nec(jxl_mchan *ch, jxl_pred_state *ps,
                     pred_record(ps, &pr, value));
             }
             for (; x + 2 < ch->w; x++) {
+                jxl_sc_pred *sc = &ps->sc;
+                int32_t v = ps->w;
+                if (flat_ok && ps->n == v && ps->nw == v &&
+                    ps->prev_row[x + 1] == v &&
+                    (sc->true_err_w | sc->true_err_n | sc->true_err_nw |
+                     sc->true_err_ne) == 0 &&
+                    (sc->subpred_err_nw_ww[0] | sc->subpred_err_nw_ww[1] |
+                     sc->subpred_err_nw_ww[2] | sc->subpred_err_nw_ww[3] |
+                     sc->subpred_err_n_w[0] | sc->subpred_err_n_w[1] |
+                     sc->subpred_err_n_w[2] | sc->subpred_err_n_w[3] |
+                     sc->subpred_err_ne[0] | sc->subpred_err_ne[1] |
+                     sc->subpred_err_ne[2] | sc->subpred_err_ne[3]) == 0) {
+                    int32_t *te_row = sc->true_err_row;
+                    uint32_t *se_row = sc->subpred_err_row;
+                    int32_t te_ne = 0, value;
+                    uint32_t se0 = 0, se1 = 0, se2 = 0, se3 = 0;
+                    uint32_t x0 = x;
+                    if (!flat_leaf || v != flat_v) {
+                        jxl_props pr;
+                        pr.cache[0] = channel;
+                        pr.cache[1] = stream_idx;
+                        pr.cache[9] = v;
+                        pr.cache[10] = 0;
+                        pr.cache[11] = 0;
+                        pr.cache[12] = 0;
+                        pr.cache[15] = 0;
+                        flat_leaf = ma_get_leaf_local(ma, &pr);
+                        flat_v = v;
+                        flat_pred =
+                            flat_leaf->predictor == JXL_PRED_ZERO ? 0 : v;
+                    }
+                    for (;;) {
+                        uint32_t *se = se_row + (size_t)x * 4;
+                        uint32_t token = jxl_dec_read_clustered_no_lz77(
+                            dec, br, flat_leaf->cluster);
+                        int32_t diff = jxl_unpack_signed(token);
+                        diff = (int32_t)(
+                            (uint32_t)diff * flat_leaf->multiplier +
+                            (uint32_t)flat_leaf->offset);
+                        value = (int32_t)((uint32_t)diff +
+                                          (uint32_t)flat_pred);
+                        row[x] = value;
+                        ps->curr_row[x] = value;
+                        if (value != v) break;
+                        /* Predicted exactly: this sample's errors are zero
+                           and the state moves one step right. */
+                        te_row[x] = 0;
+                        se[0] = 0; se[1] = 0; se[2] = 0; se[3] = 0;
+                        te_ne = te_row[x + 2];
+                        se0 = se[8]; se1 = se[9]; se2 = se[10]; se3 = se[11];
+                        x++;
+                        if (!(x + 2 < ch->w && te_ne == 0 &&
+                              (se0 | se1 | se2 | se3) == 0 &&
+                              ps->prev_row[x + 1] == v))
+                            break;
+                    }
+                    if (x != x0) {
+                        /* The exact samples left W, N and NW's terms as they
+                           were; only NE's moved. */
+                        sc->true_err_ne = te_ne;
+                        sc->subpred_err_ne[0] = se0;
+                        sc->subpred_err_ne[1] = se1;
+                        sc->subpred_err_ne[2] = se2;
+                        sc->subpred_err_ne[3] = se3;
+                        ps->prev_grad = v;
+                    }
+                    if (value != v) {
+                        /* sc_record_nec and pred_record_nec for a sample
+                           decoded in the flat state, with its constants
+                           folded in: all four sub-predictions are v, so they
+                           share one error, and the N, NW and NE terms being
+                           shifted along are zero. */
+                        uint32_t *se = se_row + (size_t)x * 4;
+                        int64_t true_err =
+                            ((int64_t)v << 3) - ((int64_t)value << 3);
+                        int64_t d = true_err < 0 ? -true_err : true_err;
+                        uint32_t e = (uint32_t)((d + 3) >> 3);
+                        te_row[x] = (int32_t)true_err;
+                        se[0] = e; se[1] = e; se[2] = e; se[3] = e;
+                        sc->true_err_w = (int32_t)true_err;
+                        sc->subpred_err_n_w[0] = e;
+                        sc->subpred_err_n_w[1] = e;
+                        sc->subpred_err_n_w[2] = e;
+                        sc->subpred_err_n_w[3] = e;
+                        sc->true_err_ne = te_row[x + 2];
+                        sc->subpred_err_ne[0] = se[8];
+                        sc->subpred_err_ne[1] = se[9];
+                        sc->subpred_err_ne[2] = se[10];
+                        sc->subpred_err_ne[3] = se[11];
+                        ps->prev_grad = v;
+                        ps->w = value;
+                        sc->x = x + 1;
+                        ps->x = x + 1;
+                        continue;
+                    }
+                    /* Stopped on a sample that is not flat (or at the row's
+                       edge), which the general code takes from here. */
+                    sc->x = x;
+                    ps->x = x;
+                    x--;
+                    continue;
+                }
                 JXL_GRAD_WP_SAMPLE(
                     props_compute_grad_wp_nec(
                         ps, &pr, channel, stream_idx),

@@ -170,6 +170,19 @@ void *jxl_calloc(jxl_ctx *ctx, size_t count, size_t size) {
     void *p;
     if (!jxl_size_mul(count, size, &total)) return NULL;
     if (total == 0) total = 1;
+    /* A large block from the C runtime is fresh zero pages, so writing zeros
+       over all of it is a second pass through memory. Just leaving it to
+       calloc is slower still, though: the pages then fault in one at a time
+       wherever the decoder first lands on them, and scattered first touches
+       cost far more than a sequential sweep. So take calloc's zeros and walk
+       the block once, a byte per page. Only the default allocator can do
+       this -- a caller's callback has no zeroing variant. */
+    if (ctx->alloc == default_alloc && total >= ((size_t)1 << 20)) {
+        size_t i;
+        p = calloc(1, total);
+        if (p) for (i = 0; i < total; i += 4096) ((volatile char *)p)[i] = 0;
+        return p;
+    }
     p = ctx->alloc(ctx->user, ctx, total);
     if (p) memset(p, 0, total);
     return p;
