@@ -125,6 +125,19 @@ static float plane_sample(const jxl_fplane *p, uint32_t x, uint32_t y,
     return p->data[(size_t)py * p->stride + px];
 }
 
+/* Row y of a full-size plane as floats. An integer plane is converted into
+   `scratch` with the arithmetic the up-front float copy used. */
+static const float *plane_row(const jxl_fplane *p, uint32_t y, uint32_t w,
+                              float *scratch) {
+    const int32_t *src;
+    float scale = p->iscale;
+    uint32_t x;
+    if (!p->idata) return p->data + (size_t)y * p->stride;
+    src = p->idata + (size_t)y * p->istride;
+    for (x = 0; x < w; x++) scratch[x] = (float)src[x] * scale;
+    return scratch;
+}
+
 /* A plane that plane_sample() would read one-to-one, needing no scaling. */
 static int plane_is_full(const jxl_fplane *p, uint32_t w, uint32_t h) {
     return p && p->w == w && p->h == h && w != 0 && h != 0;
@@ -399,7 +412,7 @@ static void write_transposed_rgba8(const jxl_out_planes *op,
 }
 #endif
 
-static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
+static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, jxl_fimage *img,
                         jxl_format fmt, uint8_t *dst, int stride) {
     const jxl_image_metadata *meta = &doc->meta;
     jxl_out_planes op;
@@ -414,6 +427,8 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
     int direct, reverse_x, transposed;
     uint32_t maxval;
     int bgr = ctx->bgr;
+    /* Row buffers for planes still held as integers (jxl_fplane.idata). */
+    float *lazy_rows = NULL;
 #ifdef JXL_RENDER_SSE2
     const int use_avx2 = jxl_has_avx2();
 #endif
@@ -452,6 +467,21 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
     reverse_x = orientation == 2 || orientation == 3;
     transposed = orientation >= 5;
 
+    /* Integer planes are converted a row at a time as the rows are written,
+       which only the row-ordered direct path can do. Anything else gets
+       ordinary float planes first. */
+    if ((op.r && op.r->idata) || (op.g && op.g->idata) ||
+        (op.b && op.b->idata) || (op.a && op.a->idata)) {
+        if (!direct || transposed) {
+            if (jxl_fimage_materialize(ctx, img) != 0) return -1;
+        } else {
+            size_t n;
+            if (!jxl_size_mul(sw, 4 * sizeof(float), &n)) return -1;
+            lazy_rows = (float *)jxl_malloc(ctx, n);
+            if (!lazy_rows) return -1;
+        }
+    }
+
 #ifdef JXL_RENDER_SSE2
     if (direct && transposed && !wide && !gray && ncomp == 4 &&
         (ow & 3u) == 0 && (oh & 3u) == 0) {
@@ -481,12 +511,28 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
                 sy = (orientation == 3 || orientation == 4)
                          ? sh - 1 - oy : oy;
             }
+            if (lazy_rows) {
+                /* Not transposed here, so sx is 0 and a row is sw samples.
+                   A gray image written as RGB has all three colours on one
+                   plane, which is converted once. */
+                pr = plane_row(op.r, sy, sw, lazy_rows);
+                if (!gray) {
+                    pg = op.g == op.r
+                        ? pr : plane_row(op.g, sy, sw, lazy_rows + sw);
+                    pb = op.b == op.r
+                        ? pr : plane_row(op.b, sy, sw,
+                                         lazy_rows + 2 * (size_t)sw);
+                }
+                if (op.a)
+                    pa = plane_row(op.a, sy, sw, lazy_rows + 3 * (size_t)sw);
+            } else {
             pr = op.r->data + (size_t)sy * op.r->stride + sx;
             if (!gray) {
                 pg = op.g->data + (size_t)sy * op.g->stride + sx;
                 pb = op.b->data + (size_t)sy * op.b->stride + sx;
             }
             if (op.a) pa = op.a->data + (size_t)sy * op.a->stride + sx;
+            }
             if (transposed) {
                 sr = (ptrdiff_t)op.r->stride;
                 sg = gray ? sr : (ptrdiff_t)op.g->stride;
@@ -732,6 +778,7 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, const jxl_fimage *img,
             }
         }
     }
+    jxl_free(ctx, lazy_rows);
     return 0;
 }
 
@@ -810,6 +857,11 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
             continue;
         }
 
+        /* A wanted frame that replaces the whole canvas and is not kept as
+           a reference goes to the output writer untouched. */
+        st.lazy_int_ok = want && !fh.have_crop &&
+                         fh.blending.mode == JXL_BLEND_REPLACE &&
+                         !(fh.save_as_reference < 4 && !fh.is_last);
         if (jxl_frame_decode(ctx, doc, &fh, &toc, &st, apply_ct, &tmp) != 0) {
             jxl_toc_free(ctx, &toc);
             jxl_frame_header_free(ctx, &fh);
@@ -836,7 +888,13 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
             int needs_canvas = cropped || fh.blending.mode != JXL_BLEND_REPLACE;
             int failed = 0;
 
-            if (!needs_canvas) {
+            /* The blend and the reference copy below want float planes. */
+            if (needs_canvas || (fh.save_as_reference < 4 && !fh.is_last))
+                failed = jxl_fimage_materialize(ctx, &tmp) != 0;
+
+            if (failed) {
+                jxl_fimage_free(ctx, &tmp);
+            } else if (!needs_canvas) {
                 jxl_fimage_free(ctx, &canvas);
                 canvas = tmp;
                 memset(&tmp, 0, sizeof(tmp));

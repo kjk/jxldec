@@ -76,10 +76,33 @@ int jxl_fimage_alloc(jxl_ctx *ctx, jxl_fimage *img, uint32_t nplane) {
 void jxl_fimage_free(jxl_ctx *ctx, jxl_fimage *img) {
     uint32_t i;
     if (!img || !img->plane) return;
-    for (i = 0; i < img->nplane; i++) jxl_free(ctx, img->plane[i].data);
+    for (i = 0; i < img->nplane; i++) {
+        jxl_free(ctx, img->plane[i].data);
+        jxl_free(ctx, img->plane[i].idata);
+    }
     jxl_free(ctx, img->plane);
     img->plane = NULL;
     img->nplane = 0;
+}
+
+int jxl_fimage_materialize(jxl_ctx *ctx, jxl_fimage *img) {
+    uint32_t i, x, y;
+    if (!img || !img->plane) return 0;
+    for (i = 0; i < img->nplane; i++) {
+        jxl_fplane *p = &img->plane[i];
+        int32_t *idata = p->idata;
+        float scale = p->iscale;
+        if (!idata) continue;
+        if (jxl_fplane_alloc_uninit(ctx, p, p->w, p->h) != 0) return -1;
+        for (y = 0; y < p->h; y++) {
+            const int32_t *src = idata + (size_t)y * p->istride;
+            float *dst = p->data + (size_t)y * p->stride;
+            for (x = 0; x < p->w; x++) dst[x] = (float)src[x] * scale;
+        }
+        jxl_free(ctx, idata);
+        p->idata = NULL;
+    }
+    return 0;
 }
 
 /* VarDCT starts with three color planes. Once a grayscale color transform
@@ -614,6 +637,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     jxl_noise_params noise;
     int have_patches = 0, have_splines = 0, have_noise = 0;
     int is_vardct, discard_cb;
+    int lazy_int = 0;
     uint32_t nspecs = 0, i, split;
     uint32_t color_w, color_h, group_dim, group_dim_shift;
     uint32_t num_lf_groups, num_groups, num_passes;
@@ -1105,12 +1129,38 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                 }
             }
         }
+        /* Whether anything after this point reads or rewrites the planes. */
+        lazy_int = st->lazy_int_ok && !is_vardct && !meta->xyb_encoded &&
+                   !have_patches && !have_splines && !have_noise &&
+                   color_upsampling_shift == 0 &&
+                   !(apply_ct && fh->do_ycbcr && out->ncolor >= 3);
         for (i = 0; i < gmod.nbase; i++) {
             const jxl_mchan *ch = &gmod.base[i];
             uint32_t x, y;
             uint32_t pi = base + i;
             if (pi >= nplane) break;
             if (!is_vardct && meta->xyb_encoded && i < 3) continue;
+            if (lazy_int) {
+                /* Nothing below reads these samples, so skip the float copy:
+                   take the channel's buffer and let the output writer
+                   convert a row at a time, in cache. On a 12-megapixel gray
+                   page the copy was a tenth of the decode. */
+                uint32_t bi;
+                for (bi = 0; bi < gmod.nbufs; bi++) {
+                    if (gmod.bufs[bi] == ch->data) break;
+                }
+                if (bi < gmod.nbufs) {
+                    jxl_fplane *p = &out->plane[pi];
+                    p->idata = ch->data;
+                    p->istride = ch->stride;
+                    p->iscale = scale;
+                    p->w = ch->w;
+                    p->h = ch->h;
+                    p->stride = ch->stride;
+                    gmod.bufs[bi] = NULL;
+                    continue;
+                }
+            }
             if (jxl_fplane_alloc_uninit(ctx, &out->plane[pi], ch->w, ch->h) != 0) goto done;
             for (y = 0; y < ch->h; y++) {
                 const int32_t *src = ch->data + (size_t)y * ch->stride;

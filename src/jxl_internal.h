@@ -1102,6 +1102,14 @@ typedef struct {
     float *data;
     uint32_t w, h;
     size_t stride;      /* in floats */
+    /* A plane that is still the Modular channel it was decoded into: `data`
+       is NULL and sample (x, y) is idata[y * istride + x] * iscale. Only a
+       frame that goes straight to the output writer is left like this (see
+       jxl_frame_state.lazy_int_ok); jxl_fimage_materialize turns it into
+       an ordinary float plane for anything else. */
+    int32_t *idata;
+    size_t istride;
+    float iscale;
 } jxl_fplane;
 
 /* One decoded frame: color planes first, then the extra channels. Planes
@@ -1131,6 +1139,10 @@ typedef struct {
     /* Noise is seeded from how many frames have been shown so far. */
     uint32_t visible_frames;
     uint32_t invisible_frames;
+    /* Set by the caller for a frame whose planes nothing but the output
+       writer will read: integer channels may then be handed over as they
+       are instead of being converted to float planes. */
+    int lazy_int_ok;
 } jxl_frame_state;
 
 void jxl_frame_state_free(jxl_ctx *ctx, jxl_frame_state *st);
@@ -1143,6 +1155,8 @@ int jxl_blend_frame(jxl_ctx *ctx, jxl_fimage *canvas, const jxl_fimage *frame,
 int jxl_fimage_blank_like(jxl_ctx *ctx, jxl_fimage *out, const jxl_fimage *like,
                           uint32_t w, uint32_t h);
 int jxl_fimage_copy(jxl_ctx *ctx, jxl_fimage *dst, const jxl_fimage *src);
+/* Converts any integer planes (jxl_fplane.idata) to float planes. */
+int jxl_fimage_materialize(jxl_ctx *ctx, jxl_fimage *img);
 int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,
                        const jxl_frame_header *fh, float corr_x, float corr_b);
 int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,

@@ -95,7 +95,7 @@ on 14 pages of each, `-bgra`, pinned to one P-core:
 
 | set | before | after | change | vs libjxl before -> after |
 |---|---|---|---|---|
-| lossless gray | 4523ms | 1903ms | -58% | 0.96x -> 0.40x |
+| lossless gray | 4559ms | 1773ms | -61% | 0.96x -> 0.37x |
 | lossy RGB | 3661ms | 2455ms | -33% | 1.48x -> 0.99x |
 
 All output is bit-identical to before; 1245/1245 oracle comparisons, the 121
@@ -128,6 +128,21 @@ these pages is that general path: half of its samples have equal neighbours
 but nonzero true errors, which nothing short-cuts. Using the cached leaf for
 samples with zero true errors but unsettled sub-predictor sums was under 1%
 and was dropped.
+
+**Integer planes straight to the writer.** A Modular frame used to be copied
+into float planes (`(float)v * scale`, 12 bytes per gray sample written and
+read back) only for `write_pixels` to quantise it again. When the wanted
+frame replaces the whole canvas, is not kept as a reference, and nothing in
+`jxl_frame_decode` touches the samples afterwards (no XYB, YCbCr, patches,
+splines, noise or upsampling), `jxl_frame_state.lazy_int_ok` lets the frame
+hand over the Modular channel buffers as `jxl_fplane.idata`. `write_pixels`
+converts one row at a time into a scratch row with the same expression, so
+the output is unchanged, and the rest of its row code is untouched.
+Everything else -- transposed orientations, subsampled planes, blending, a
+reference copy -- calls `jxl_fimage_materialize` first and sees ordinary
+float planes. -8% on the gray pages, 2-8% on the lossless corpus files. The
+fallback was checked by forcing it on and re-running the lossless presets
+(244/244).
 
 `palette_inverse` replaces ordinary indices of a one-channel palette in
 place instead of going through the per-channel general code.
@@ -204,8 +219,7 @@ What is left on the lossy pages: EPF 30% (the pass-0 distances are the
 largest single function; the per-term absolute differences are shared between
 neighbouring samples and rows and could be computed once), the inverse
 transforms 20%, LF Modular 10%, gabor 7%. On the gray pages: ANS 20%+, the
-non-flat samples' general path, and the int -> float -> 8-bit round trip
-through the render planes (about 10%).
+non-flat samples' general path.
 
 ### Cross 1.10x: specialize responsive Modular and skip zero VarDCT work
 The effort-one prefix-RLE gradient loop now carries the west and northwest
