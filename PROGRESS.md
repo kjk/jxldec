@@ -95,20 +95,34 @@ on 14 pages of each, `-bgra`, pinned to one P-core:
 
 | set | before | after | change | vs libjxl before -> after |
 |---|---|---|---|---|
-| lossless gray | 4549ms | 3432ms | -24.6% | 0.96x -> 0.73x |
-| lossy RGB | 3615ms | 2885ms | -20.2% | 1.48x -> 1.16x |
+| lossless gray | 4536ms | 1990ms | -56% | 0.96x -> 0.42x |
+| lossy RGB | 3705ms | 2548ms | -31% | 1.41x -> 0.97x |
 
 All output is bit-identical to before; 1245/1245 oracle comparisons, the 121
 fuzz reproducers and a 300-file ASan sample pass. Large corpus photos
-(`flower.v_*`) also gain about 7%.
+(`flower.v_*`) also gain 11-15%; nothing in a 58-file corpus sample is
+measurably slower.
 
 **Weighted predictor.** `sc_predict` returns early when the four true errors
 and all twelve sub-predictor error terms are zero and N, NW, NE equal W (plus
 NN == N for a non-default predictor). Every sub-prediction is then W, and the
 final clamp to [min, max] of W, N, NE pins the weighted mean to W regardless
 of how the weights round, so the weights -- most of the function -- are never
-computed. That is nearly every sample of the paper background. This is the
-whole lossless gain.
+computed. That is nearly every sample of the paper background.
+
+**Flat runs in the gradient/WP track.** The same flat state fixes every
+property `modular_decode_grad_wp_nec` computes (9 is v, 10-12 and 15 are 0),
+so the MA leaf depends on v alone and every predictor returns v. The leaf for
+the last flat value is cached, and while the decoded sample is v again the
+state stays flat: an inner loop reads the token, stores zeros for the
+sample's errors and reloads only NE's errors and value. A sample that
+differs is recorded with the flat constants folded in and drops back to the
+general code. Steps, each bit-identical, on three pages: 948ms baseline, 721
+with the `sc_predict` shortcut, 571 with the cached leaf, 514 with the folded
+record, 454 with the inner loop, 430 with the palette path below.
+
+`palette_inverse` replaces ordinary indices of a one-channel palette in
+place instead of going through the per-channel general code.
 
 **EPF, in the order the profile led there.** `winperf` put EPF at 37% of the
 lossy decode, but 80% of these pages' 8x8 blocks have sigma 0, and the
@@ -139,30 +153,51 @@ two fixes showed almost nothing until the third:
   being overwritten) and the trailing pass's reach. This replaced the
   scratch-ownership swap, so `-DJXL_EPF_FORCE_COPY_BACK` is gone.
 
+Then, smaller, all on the lossy pages:
+
+- `jxl_calloc` (default allocator, blocks of 1MB and up) takes `calloc`'s
+  zero pages and writes one byte per page in order instead of `memset`. -4%.
+  This is the working form of the two calloc dead ends below: the zeroing is
+  free, but the faults have to be taken sequentially.
+- The generic dequant loop skips a channel whose `hf_nonzero_mask` bit is
+  clear, as the all-DCT8 batch path already did. -3.8%: on these pages most
+  chroma blocks have no HF at all.
+- `jxl_idct_2d_lf_only`: a varblock with no HF in the channel (and none in Y,
+  since chroma-from-luma adds Y's) has only its LF corner filled, so the row
+  pass runs over the first h/8 rows only. -2.6%.
+- `epf_row_pass2_avx2`, a row kernel for pass 2 like the ones passes 0 and 1
+  have, instead of one `epf_row8` call per octet. -4.5%.
+- `epf_pass0_fwd_row` written out with macros so the six distances and five
+  centre vectors stay in registers. -1.7%.
+
 Also: VarDCT plane rows get 64 floats of padding when the width is within 32
 samples of a multiple of 1024. At 3072 the stride was exactly three 4K pages
 and every large allocation shares a page offset, so a column of every row of
 every plane fell in one L1 set. Worth 2.5% here, mostly in the transforms.
 
 Dead ends worth not repeating:
-- `calloc` instead of `malloc` + `memset` for the coefficient planes (the
-  memset is 10% of the lossy decode) is **8% slower**, and clearing each
+- Plain `calloc` instead of `malloc` + `memset` for the coefficient planes
+  (the memset is 10% of the lossy decode) is **8% slower**, and clearing each
   group's rectangle just before its first HF pass is **14% slower**. Both move
   the page faults from one sequential sweep into sparse, interleaved access.
   On Windows a sequential `memset` over a fresh block is by far the cheapest
   way to fault it in.
 - Software prefetch of the EPF leading row: no effect.
 - An ANS fast path for single-symbol histograms (state is unchanged, nothing
-  is read): no measurable effect on the gray pages.
+  is read): no measurable effect on the gray pages. Nor did skipping the
+  entropy decoder outright for flat runs whose leaf has such a histogram --
+  the background's leaf does not.
 - Benchmark noise: this machine is a hybrid 12900F and unpinned A/B runs gave
   the wrong sign more than once. Pin to a P-core
   (`start /b /wait /high /affinity 10 jxl_bench.exe ...`) and take the minimum
   over alternating rounds.
 
-What is left on the lossy pages: `vardct_finish_blocks` 25% (generic
-`jxl_dct_2d` for the large transforms, no zero-AC skip outside the all-DCT8
-batch path), the coefficient-plane `memset` 10%, LF Modular 9%. On the gray
-pages: the MA-tree/property loop 40%, ANS 22%, `sc_predict` 11%.
+What is left on the lossy pages: EPF 30% (the pass-0 distances are the
+largest single function; the per-term absolute differences are shared between
+neighbouring samples and rows and could be computed once), the inverse
+transforms 20%, LF Modular 10%, gabor 7%. On the gray pages: ANS 20%+, the
+non-flat samples' general path, and the int -> float -> 8-bit round trip
+through the render planes (about 10%).
 
 ### Cross 1.10x: specialize responsive Modular and skip zero VarDCT work
 The effort-one prefix-RLE gradient loop now carries the west and northwest

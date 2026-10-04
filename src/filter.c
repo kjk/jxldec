@@ -531,38 +531,67 @@ static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
     const __m256 cs1 = _mm256_set1_ps(cscale[1]);
     const __m256 cs2 = _mm256_set1_ps(cscale[2]);
     const ptrdiff_t s = (ptrdiff_t)stride;
-    /* epf_dist_0 order, which fixes the order of each five-term sum. */
-    const ptrdiff_t doff[5] = {-s, 1, 0, -1, s};
-    /* (1,0) (2,0) (-1,1) (0,1) (1,1) (0,2) */
-    const ptrdiff_t foff[EPF_F_COUNT] = {1, 2, s - 1, s, s + 1, 2 * s};
     uint32_t j;
+
+/* One tap's five-term sum for the channel at p, in epf_dist_0 order (up,
+   right, centre, left, down), folded into its running distance. Written out
+   rather than looped so the six distances and five centre vectors stay in
+   registers: as loops over small arrays the compiler kept them in memory.
+   The sums start from their first term instead of from zero, which changes
+   no value. */
+#define EPF_FWD_ABS(off, cen) \
+    _mm256_and_ps(absmask, _mm256_sub_ps(_mm256_loadu_ps(p + (off)), cen))
+#define EPF_FWD_TAP(dist, off, FOLD) do {                                  \
+        __m256 acc = EPF_FWD_ABS((off) - s, cen0);                         \
+        acc = _mm256_add_ps(acc, EPF_FWD_ABS((off) + 1, cen1));            \
+        acc = _mm256_add_ps(acc, EPF_FWD_ABS((off), cen2));                \
+        acc = _mm256_add_ps(acc, EPF_FWD_ABS((off) - 1, cen3));            \
+        acc = _mm256_add_ps(acc, EPF_FWD_ABS((off) + s, cen4));            \
+        acc = _mm256_mul_ps(cs, acc);                                      \
+        dist = FOLD(dist, acc);                                            \
+    } while (0)
+#define EPF_FWD_FIRST(dist, acc) (acc)
+#define EPF_FWD_NEXT(dist, acc) _mm256_add_ps(dist, acc)
+/* The taps are (1,0) (2,0) (-1,1) (0,1) (1,1) (0,2), as EPF_F_*. */
+#define EPF_FWD_CHANNEL(c, scale, FOLD) do {                               \
+        const float *p = in[c] + row + q;                                  \
+        const __m256 cs = (scale);                                         \
+        const __m256 cen0 = _mm256_loadu_ps(p - s);                        \
+        const __m256 cen1 = _mm256_loadu_ps(p + 1);                        \
+        const __m256 cen2 = _mm256_loadu_ps(p);                            \
+        const __m256 cen3 = _mm256_loadu_ps(p - 1);                        \
+        const __m256 cen4 = _mm256_loadu_ps(p + s);                        \
+        EPF_FWD_TAP(d0, 1, FOLD);                                          \
+        EPF_FWD_TAP(d1, 2, FOLD);                                          \
+        EPF_FWD_TAP(d2, s - 1, FOLD);                                      \
+        EPF_FWD_TAP(d3, s, FOLD);                                          \
+        EPF_FWD_TAP(d4, s + 1, FOLD);                                      \
+        EPF_FWD_TAP(d5, 2 * s, FOLD);                                      \
+    } while (0)
+
     for (j = j0; j <= j1; j++) {
-        __m256 dist[EPF_F_COUNT];
+        __m256 d0, d1, d2, d3, d4, d5;
         uint32_t q = j * 8 - 2;
-        int c, k, d;
         if (sig_a[j - 1] == 0.0f && sig_b[j - 1] == 0.0f &&
             (j * 8 >= x1 || (sig_a[j] == 0.0f && sig_b[j] == 0.0f)))
             continue;
         if (q + 7 > x1) q = x1 - 7;
-        for (c = 0; c < 3; c++) {
-            const float *p = in[c] + row + q;
-            __m256 cs = c == 0 ? cs0 : (c == 1 ? cs1 : cs2);
-            __m256 cen[5];
-            for (d = 0; d < 5; d++) cen[d] = _mm256_loadu_ps(p + doff[d]);
-            for (k = 0; k < EPF_F_COUNT; k++) {
-                const float *pk = p + foff[k];
-                __m256 acc = _mm256_setzero_ps();
-                for (d = 0; d < 5; d++) {
-                    acc = _mm256_add_ps(acc, _mm256_and_ps(absmask,
-                        _mm256_sub_ps(_mm256_loadu_ps(pk + doff[d]), cen[d])));
-                }
-                acc = _mm256_mul_ps(cs, acc);
-                dist[k] = c == 0 ? _mm256_add_ps(_mm256_setzero_ps(), acc)
-                                 : _mm256_add_ps(dist[k], acc);
-            }
-        }
-        for (k = 0; k < EPF_F_COUNT; k++) _mm256_storeu_ps(dst[k] + q, dist[k]);
+        d0 = d1 = d2 = d3 = d4 = d5 = _mm256_setzero_ps();
+        EPF_FWD_CHANNEL(0, cs0, EPF_FWD_FIRST);
+        EPF_FWD_CHANNEL(1, cs1, EPF_FWD_NEXT);
+        EPF_FWD_CHANNEL(2, cs2, EPF_FWD_NEXT);
+        _mm256_storeu_ps(dst[EPF_F_H1] + q, d0);
+        _mm256_storeu_ps(dst[EPF_F_H2] + q, d1);
+        _mm256_storeu_ps(dst[EPF_F_VA] + q, d2);
+        _mm256_storeu_ps(dst[EPF_F_VB] + q, d3);
+        _mm256_storeu_ps(dst[EPF_F_VC] + q, d4);
+        _mm256_storeu_ps(dst[EPF_F_V2] + q, d5);
     }
+#undef EPF_FWD_CHANNEL
+#undef EPF_FWD_NEXT
+#undef EPF_FWD_FIRST
+#undef EPF_FWD_TAP
+#undef EPF_FWD_ABS
     _mm256_zeroupper();
 }
 
@@ -620,6 +649,75 @@ static void epf_row_pass0_avx2(float *in[3], float *out[3], size_t row,
         _mm256_storeu_ps(out[2] + row + x, sum2);
     }
     _mm256_zeroupper();
+}
+/* Pass 2 for a run of interior octets: four taps, each compared with the
+   centre sample alone. epf_row8 does the same arithmetic in the same order;
+   what this saves is entering it once per octet, with its tap and distance
+   counts as loop bounds, for the cheapest pass of the three. Adding the
+   first term to a zero accumulator is left out, which changes no value. */
+JXL_TARGET_AVX2
+static uint32_t epf_row_pass2_avx2(float *in[3], float *out[3], size_t row,
+                                   uint32_t x, uint32_t w, size_t stride,
+                                   const float *sigma_row,
+                                   const float cscale[3], float step_mul,
+                                   float border_mul, int is_y_border,
+                                   const uint8_t *copy_row) {
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 cs0 = _mm256_set1_ps(cscale[0]);
+    const __m256 cs1 = _mm256_set1_ps(cscale[1]);
+    const __m256 cs2 = _mm256_set1_ps(cscale[2]);
+    const __m256 smv = is_y_border
+        ? _mm256_set1_ps(border_mul)
+        : _mm256_setr_ps(border_mul, step_mul, step_mul, step_mul,
+                         step_mul, step_mul, step_mul, border_mul);
+    /* epf_kernel_1 order. */
+    const ptrdiff_t koff[4] = {-(ptrdiff_t)stride, (ptrdiff_t)stride, -1, 1};
+    for (; x + 8 < w; x += 8) {
+        const float *p0 = in[0] + row + x;
+        const float *p1 = in[1] + row + x;
+        const float *p2 = in[2] + row + x;
+        float sigma_val = sigma_row[x / 8];
+        __m256 c0, c1, c2, sum0, sum1, sum2, sw, nis;
+        int k;
+        if (sigma_val == 0.0f && !copy_row[x / 8]) continue;
+        c0 = _mm256_loadu_ps(p0);
+        c1 = _mm256_loadu_ps(p1);
+        c2 = _mm256_loadu_ps(p2);
+        sum0 = c0; sum1 = c1; sum2 = c2;
+        if (sigma_val != 0.0f) {
+            nis = _mm256_mul_ps(_mm256_set1_ps(sigma_val), smv);
+            sw = one;
+            for (k = 0; k < 4; k++) {
+                __m256 t0 = _mm256_loadu_ps(p0 + koff[k]);
+                __m256 t1 = _mm256_loadu_ps(p1 + koff[k]);
+                __m256 t2 = _mm256_loadu_ps(p2 + koff[k]);
+                __m256 dist, wgt;
+                dist = _mm256_mul_ps(cs0, _mm256_and_ps(absmask,
+                                                        _mm256_sub_ps(t0, c0)));
+                dist = _mm256_add_ps(dist, _mm256_mul_ps(cs1,
+                    _mm256_and_ps(absmask, _mm256_sub_ps(t1, c1))));
+                dist = _mm256_add_ps(dist, _mm256_mul_ps(cs2,
+                    _mm256_and_ps(absmask, _mm256_sub_ps(t2, c2))));
+                wgt = _mm256_add_ps(one, _mm256_mul_ps(dist, nis));
+                wgt = _mm256_max_ps(wgt, zero);
+                sw = _mm256_add_ps(sw, wgt);
+                sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(wgt, t0));
+                sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(wgt, t1));
+                sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(wgt, t2));
+            }
+            sw = _mm256_rcp_ps(sw);
+            sum0 = _mm256_mul_ps(sum0, sw);
+            sum1 = _mm256_mul_ps(sum1, sw);
+            sum2 = _mm256_mul_ps(sum2, sw);
+        }
+        _mm256_storeu_ps(out[0] + row + x, sum0);
+        _mm256_storeu_ps(out[1] + row + x, sum1);
+        _mm256_storeu_ps(out[2] + row + x, sum2);
+    }
+    _mm256_zeroupper();
+    return x;
 }
 #endif
 
@@ -754,6 +852,12 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                                        is_y_border, copy_row);
                     x = xe;
                 }
+                continue;
+            }
+            if (use_avx2 && step == 2 && y_inside && x == 8 && w > 16) {
+                x = epf_row_pass2_avx2(in, out, row, x, w, stride, sigma_row,
+                                       cscale, step_mul, border_mul,
+                                       is_y_border, copy_row);
                 continue;
             }
             if (use_avx2_fma && step == 1 && y_inside && (x & 7u) == 0 &&
