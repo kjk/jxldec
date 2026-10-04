@@ -791,6 +791,9 @@ uint32_t jxl_frame_blocks_h(const jxl_frame_header *fh);
 /* In-place separable 2D DCT over a w x h block (stride in floats).
    inverse == 0 is the analysis transform, 1 the synthesis transform. */
 void jxl_dct_2d(float *data, size_t stride, int w, int h, int inverse);
+/* Inverse transform of a block whose only nonzero coefficients are the
+   (w/8) x (h/8) LF corner. */
+void jxl_idct_2d_lf_only(float *data, size_t stride, int w, int h);
 float jxl_scale_f(int c, int logb);
 
 /* ===================================================================== */
@@ -960,6 +963,7 @@ void jxl_dequant_dct8_plane(float *coeff, size_t stride,
                             const jxl_quantizer *q, float qm_scale,
                             float quant_bias, float quant_bias_numerator);
 void jxl_transform_varblock(float *coeff, size_t stride, int tr);
+void jxl_transform_varblock_lf_only(float *coeff, size_t stride, int tr);
 void jxl_idct8x8_plane(float *data, size_t stride,
                        const jxl_block_info *blocks, int channel,
                        uint32_t blocks_w, uint32_t blocks_h);

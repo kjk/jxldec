@@ -809,7 +809,12 @@ void jxl_idct8x8_plane(float *data, size_t stride,
 }
 #endif /* JXL_DCT_SSE2 */
 
-void jxl_dct_2d(float *data, size_t stride, int w, int h, int inverse) {
+/* `nz_rows` is how many leading rows can hold a nonzero coefficient. The row
+   pass of an all-zero row leaves it zero, so those rows are skipped; a block
+   that received no HF coefficients has only its LF corner filled in, an
+   eighth of its rows. */
+static void dct_2d_rows(float *data, size_t stride, int w, int h, int inverse,
+                        int nz_rows) {
     float mul = inverse ? 1.0f : 0.5f;
     float scratch[256];
     float col[256];
@@ -878,13 +883,14 @@ void jxl_dct_2d(float *data, size_t stride, int w, int h, int inverse) {
     y = 0;
 #ifdef JXL_DCT_SSE2
     if (use_avx2) {
-        for (; y + 8 <= h; y += 8)
+        for (; y + 8 <= h && y < nz_rows; y += 8)
             dct_rows8(data + (size_t)y * stride, stride, w, inverse);
     }
-    for (; y + 4 <= h; y += 4)
+    for (; y + 4 <= h && y < nz_rows; y += 4)
         dct_rows4(data + (size_t)y * stride, stride, w, inverse);
 #endif
-    for (; y < h; y++) dct_1d(data + (size_t)y * stride, w, scratch, inverse);
+    for (; y < h && y < nz_rows; y++)
+        dct_1d(data + (size_t)y * stride, w, scratch, inverse);
     x = 0;
 #ifdef JXL_DCT_SSE2
     if (use_avx2) x = dct_cols8(data, stride, w, h, inverse);
@@ -904,4 +910,12 @@ void jxl_dct_2d(float *data, size_t stride, int w, int h, int inverse) {
         dct_1d(col, h, scratch, inverse);
         for (y = 0; y < h; y++) data[(size_t)y * stride + x] = col[y];
     }
+}
+
+void jxl_dct_2d(float *data, size_t stride, int w, int h, int inverse) {
+    dct_2d_rows(data, stride, w, h, inverse, h);
+}
+
+void jxl_idct_2d_lf_only(float *data, size_t stride, int w, int h) {
+    dct_2d_rows(data, stride, w, h, 1, h / 8);
 }

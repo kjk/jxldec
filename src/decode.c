@@ -502,6 +502,9 @@ static void vardct_finish_blocks(jxl_vardct_state *v,
                     uint32_t sbx = bx >> v->hs[c];
                     if ((sbx << v->hs[c]) != bx) continue;
                     if (bi->dct_select >= JXL_TR_COUNT) continue;
+                    /* No coefficient was decoded for this channel, so the
+                       block is still all zeros and stays that way. */
+                    if (!(bi->hf_nonzero_mask & (1u << c))) continue;
                     jxl_dequant_varblock(
                         v->coeff[c] + (size_t)(sby * 8) * v->ps + sbx * 8,
                         v->ps, bi->dct_select, bi->hf_mul, c, &v->dm,
@@ -569,7 +572,12 @@ static void vardct_finish_blocks(jxl_vardct_state *v,
                 blk = v->coeff[c] + (size_t)(sby * 8) * v->ps + sbx * 8;
                 jxl_fill_varblock_lf(blk, v->ps, bi->dct_select, v->lf[c], v->bw,
                                      sbx, sby);
-                jxl_transform_varblock(blk, v->ps, bi->dct_select);
+                /* Chroma-from-luma adds a multiple of Y's coefficients to X
+                   and B, so those are LF-only just when Y is too. */
+                if (!(bi->hf_nonzero_mask & ((1u << c) | (1u << 1))))
+                    jxl_transform_varblock_lf_only(blk, v->ps, bi->dct_select);
+                else
+                    jxl_transform_varblock(blk, v->ps, bi->dct_select);
             }
         }
     }

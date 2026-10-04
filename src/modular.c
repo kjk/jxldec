@@ -2145,8 +2145,18 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
     if (!need_delta) goto done;
 
     for (y = 0; y < height; y++) {
+        int32_t *row0 = targets[0].data + (size_t)y * targets[0].stride;
         for (x = 0; x < width; x++) {
-            int32_t index = chan_get(&targets[0], x, y);
+            int32_t index = row0[x];
+            /* One channel and an ordinary palette entry: the index is
+               replaced in place. This is every sample of a palettized gray
+               page, and the general code below re-derives the row and the
+               channel loop for each one. */
+            if (num_c == 1 && index >= nb_deltas &&
+                (uint32_t)index < (uint32_t)nb_colours) {
+                row0[x] = pal.data[index];
+                continue;
+            }
             if (index < nb_deltas) {
                 need_delta[(size_t)y * width + x] = 1;
                 any_delta = 1;

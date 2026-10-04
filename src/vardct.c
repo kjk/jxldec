@@ -1914,6 +1914,31 @@ void jxl_transform_varblock(float *coeff, size_t stride, int tr) {
     }
 }
 
+/* The same for a varblock that has no HF coefficients, only the LF corner
+   jxl_fill_varblock_lf wrote. Only the plain DCTs larger than 8x8 have a
+   shortcut for that. */
+void jxl_transform_varblock_lf_only(float *coeff, size_t stride, int tr) {
+    uint32_t bw, bh;
+    jxl_tr_select_size(tr, &bw, &bh);
+    switch (tr) {
+        case JXL_TR_DCT8:
+        case JXL_TR_DCT2:
+        case JXL_TR_DCT4:
+        case JXL_TR_HORNUSS:
+        case JXL_TR_DCT4X8:
+        case JXL_TR_DCT8X4:
+        case JXL_TR_AFV0:
+        case JXL_TR_AFV1:
+        case JXL_TR_AFV2:
+        case JXL_TR_AFV3:
+            jxl_transform_varblock(coeff, stride, tr);
+            break;
+        default:
+            jxl_idct_2d_lf_only(coeff, stride, (int)(bw * 8), (int)(bh * 8));
+            break;
+    }
+}
+
 /* Writes the varblock's DC coefficients from the LF image. For multi-block
    transforms the LF samples are themselves DCT'd and rescaled. */
 void jxl_fill_varblock_lf(float *coeff, size_t stride, int tr,
