@@ -95,8 +95,8 @@ on 14 pages of each, `-bgra`, pinned to one P-core:
 
 | set | before | after | change | vs libjxl before -> after |
 |---|---|---|---|---|
-| lossless gray | 4536ms | 1990ms | -56% | 0.96x -> 0.42x |
-| lossy RGB | 3705ms | 2548ms | -31% | 1.41x -> 0.97x |
+| lossless gray | 4523ms | 1903ms | -58% | 0.96x -> 0.40x |
+| lossy RGB | 3661ms | 2455ms | -33% | 1.48x -> 0.99x |
 
 All output is bit-identical to before; 1245/1245 oracle comparisons, the 121
 fuzz reproducers and a 300-file ASan sample pass. Large corpus photos
@@ -104,8 +104,8 @@ fuzz reproducers and a 300-file ASan sample pass. Large corpus photos
 measurably slower.
 
 **Weighted predictor.** `sc_predict` returns early when the four true errors
-and all twelve sub-predictor error terms are zero and N, NW, NE equal W (plus
-NN == N for a non-default predictor). Every sub-prediction is then W, and the
+are zero and N, NW, NE equal W (plus NN == N for a non-default predictor);
+the sub-predictor error sums only feed the weights, so they need not be zero. Every sub-prediction is then W, and the
 final clamp to [min, max] of W, N, NE pins the weighted mean to W regardless
 of how the weights round, so the weights -- most of the function -- are never
 computed. That is nearly every sample of the paper background.
@@ -120,6 +120,14 @@ differs is recorded with the flat constants folded in and drops back to the
 general code. Steps, each bit-identical, on three pages: 948ms baseline, 721
 with the `sc_predict` shortcut, 571 with the cached leaf, 514 with the folded
 record, 454 with the inner loop, 430 with the palette path below.
+
+The inner loop reads its tokens through `jxl_ans_read_symbol`, a header
+inline, with the coder state in a local (-2%). On page 50 the loop takes 8.7M
+samples and the general path 1.3M; on page 1, 5.2M and 4.8M. What remains on
+these pages is that general path: half of its samples have equal neighbours
+but nonzero true errors, which nothing short-cuts. Using the cached leaf for
+samples with zero true errors but unsettled sub-predictor sums was under 1%
+and was dropped.
 
 `palette_inverse` replaces ordinary indices of a one-channel palette in
 place instead of going through the per-channel general code.
