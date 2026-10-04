@@ -210,6 +210,13 @@ Dead ends worth not repeating:
   is read): no measurable effect on the gray pages. Nor did skipping the
   entropy decoder outright for flat runs whose leaf has such a histogram --
   the background's leaf does not.
+- Skipping chroma-from-luma on blocks whose Y has no HF coefficients (a
+  per-block map spread from each varblock's mask): about 1%, at the edge of
+  the noise, because luma has HF almost everywhere chroma does not. Dropped.
+- Sharing the pass-0 absolute differences between neighbouring samples was
+  costed but not built: within one row chunk it removes only two of the
+  five subtractions per term, and sharing across rows needs 54 row buffers
+  with per-block validity.
 - Benchmark noise: this machine is a hybrid 12900F and unpinned A/B runs gave
   the wrong sign more than once. Pin to a P-core
   (`start /b /wait /high /affinity 10 jxl_bench.exe ...`) and take the minimum
