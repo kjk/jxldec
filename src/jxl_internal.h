@@ -433,6 +433,32 @@ uint32_t jxl_dec_read_mult(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx,
 uint32_t jxl_dec_read_clustered(jxl_dec *dec, jxl_br *br, uint32_t cluster,
                                 uint32_t dist_multiplier);
 /* Literal-only entropy streams avoid the general LZ77 state machine. */
+/* One ANS symbol. In the header so a sample loop that stays on one cluster
+   can keep the state in a register across samples instead of going through
+   dec->state and two calls for each. */
+static JXL_INLINE_HINT uint32_t jxl_ans_read_symbol(const jxl_ans_hist *h,
+                                                    jxl_br *br,
+                                                    uint32_t *state) {
+    uint32_t idx = *state & 0xfff;
+    uint32_t i = idx >> h->log_bucket_size;
+    uint32_t pos = idx & h->bucket_mask;
+    const jxl_ans_bucket *b = &h->buckets[i];
+    int map_to_alias = pos >= b->alias_cutoff;
+    uint32_t symbol = map_to_alias ? b->alias_symbol : i;
+    uint32_t offset = (map_to_alias ? b->alias_offset : 0) + pos;
+    uint32_t dist = b->dist ^ (map_to_alias ? b->alias_dist_xor : 0);
+    uint32_t next_state = (*state >> 12) * dist + offset;
+
+    if (next_state < (1u << 16)) {
+        next_state = (next_state << 16) | jxl_br_peek(br, 16);
+        jxl_br_consume(br, 16);
+    }
+    *state = next_state;
+    return symbol;
+}
+/* The hybrid-uint tail of a token that is not its own value. */
+uint32_t jxl_dec_hybrid_uint(jxl_br *br, const jxl_int_config *cfg,
+                             uint32_t token);
 uint32_t jxl_dec_read_clustered_no_lz77(jxl_dec *dec, jxl_br *br,
                                         uint32_t cluster);
 /* Fast path for prefix-coded LZ77 streams whose distance histogram is the

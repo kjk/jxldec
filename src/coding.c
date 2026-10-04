@@ -636,24 +636,17 @@ done:
     return rc;
 }
 
+static uint32_t read_uint(jxl_br *br, const jxl_int_config *cfg,
+                          uint32_t token);
+
 static uint32_t ans_read_symbol(const jxl_ans_hist *h, jxl_br *br,
                                 uint32_t *state) {
-    uint32_t idx = *state & 0xfff;
-    uint32_t i = idx >> h->log_bucket_size;
-    uint32_t pos = idx & h->bucket_mask;
-    const jxl_ans_bucket *b = &h->buckets[i];
-    int map_to_alias = pos >= b->alias_cutoff;
-    uint32_t symbol = map_to_alias ? b->alias_symbol : i;
-    uint32_t offset = (map_to_alias ? b->alias_offset : 0) + pos;
-    uint32_t dist = b->dist ^ (map_to_alias ? b->alias_dist_xor : 0);
-    uint32_t next_state = (*state >> 12) * dist + offset;
+    return jxl_ans_read_symbol(h, br, state);
+}
 
-    if (next_state < (1u << 16)) {
-        next_state = (next_state << 16) | jxl_br_peek(br, 16);
-        jxl_br_consume(br, 16);
-    }
-    *state = next_state;
-    return symbol;
+uint32_t jxl_dec_hybrid_uint(jxl_br *br, const jxl_int_config *cfg,
+                             uint32_t token) {
+    return read_uint(br, cfg, token);
 }
 
 /* ===================================================================== */

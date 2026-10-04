@@ -606,22 +606,15 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
        for exactly this. */
     int64_t sp0, sp1, sp2, sp3, pred;
 
-    /* A flat neighbourhood that has been predicted exactly so far -- the
-       paper of a scanned page, for most of its samples. Every sub-prediction
-       is then W: the error terms vanish, W + NE - N is W, and with all the
-       true errors zero the final clamp to [min, max] of W, N, NE pins the
-       weighted mean to W whatever the weights round to. So the weights,
-       which are most of this function, never need computing. The individual
-       error terms are tested rather than their sums, which could in
-       principle wrap to zero. */
+    /* A flat neighbourhood whose samples were predicted exactly -- the paper
+       of a scanned page, for most of its samples. With the true errors zero
+       every sub-prediction is W (W + NE - N is W too), and the final clamp to
+       [min, max] of W, N, NE pins the weighted mean to W whatever the
+       weights are. So the weights, which are most of this function, never
+       need computing -- whether or not the sub-predictor error sums that
+       feed them have gone back to zero yet. */
     if ((te_w | te_n | te_nw | te_ne) == 0 && n == w && nw == w && ne == w &&
-        (sc->default_wp || nn == n) &&
-        (sc->subpred_err_nw_ww[0] | sc->subpred_err_nw_ww[1] |
-         sc->subpred_err_nw_ww[2] | sc->subpred_err_nw_ww[3] |
-         sc->subpred_err_n_w[0] | sc->subpred_err_n_w[1] |
-         sc->subpred_err_n_w[2] | sc->subpred_err_n_w[3] |
-         sc->subpred_err_ne[0] | sc->subpred_err_ne[1] |
-         sc->subpred_err_ne[2] | sc->subpred_err_ne[3]) == 0) {
+        (sc->default_wp || nn == n)) {
         w3 = (int64_t)w << 3;
         out->subpred[0] = w3;
         out->subpred[1] = w3;
@@ -2872,6 +2865,9 @@ modular_decode_grad_wp_nec(jxl_mchan *ch, jxl_pred_state *ps,
                     int32_t te_ne = 0, value;
                     uint32_t se0 = 0, se1 = 0, se2 = 0, se3 = 0;
                     uint32_t x0 = x;
+                    const jxl_ans_hist *hist;
+                    const jxl_int_config *cfg;
+                    uint32_t state = dec->state;
                     if (!flat_leaf || v != flat_v) {
                         jxl_props pr;
                         pr.cache[0] = channel;
@@ -2886,11 +2882,23 @@ modular_decode_grad_wp_nec(jxl_mchan *ch, jxl_pred_state *ps,
                         flat_pred =
                             flat_leaf->predictor == JXL_PRED_ZERO ? 0 : v;
                     }
+                    /* The run reads one cluster, so with ANS its histogram
+                       and the coder state are held here for the duration. */
+                    hist = dec->use_prefix ? NULL : &dec->ans[flat_leaf->cluster];
+                    cfg = &dec->configs[flat_leaf->cluster];
                     for (;;) {
                         uint32_t *se = se_row + (size_t)x * 4;
-                        uint32_t token = jxl_dec_read_clustered_no_lz77(
-                            dec, br, flat_leaf->cluster);
-                        int32_t diff = jxl_unpack_signed(token);
+                        uint32_t token;
+                        int32_t diff;
+                        if (hist) {
+                            token = jxl_ans_read_symbol(hist, br, &state);
+                            if (token >= cfg->split)
+                                token = jxl_dec_hybrid_uint(br, cfg, token);
+                        } else {
+                            token = jxl_dec_read_clustered_no_lz77(
+                                dec, br, flat_leaf->cluster);
+                        }
+                        diff = jxl_unpack_signed(token);
                         diff = (int32_t)(
                             (uint32_t)diff * flat_leaf->multiplier +
                             (uint32_t)flat_leaf->offset);
@@ -2911,6 +2919,7 @@ modular_decode_grad_wp_nec(jxl_mchan *ch, jxl_pred_state *ps,
                               ps->prev_row[x + 1] == v))
                             break;
                     }
+                    if (hist) dec->state = state;
                     if (x != x0) {
                         /* The exact samples left W, N and NW's terms as they
                            were; only NE's moved. */
