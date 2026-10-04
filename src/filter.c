@@ -461,7 +461,7 @@ static uint32_t epf_row_pass1_avx2(
     float *in[3], float *out[3], size_t row, uint32_t x, uint32_t w,
     size_t stride, const float *sigma_row, const float cscale[3],
     float step_mul, float border_mul, int is_y_border, float *prev_vsad,
-    const float *prev_sigma_row, int can_reuse_vtop) {
+    const float *prev_sigma_row, int can_reuse_vtop, const uint8_t *copy_row) {
     const __m256 absmask =
         _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
     const __m256 zero = _mm256_setzero_ps();
@@ -477,9 +477,11 @@ static uint32_t epf_row_pass1_avx2(
         float sigma_val = sigma_row[x / 8];
         if (sigma_val == 0.0f) {
             int c;
-            for (c = 0; c < 3; c++) {
-                _mm256_storeu_ps(out[c] + row + x,
-                                 _mm256_loadu_ps(in[c] + row + x));
+            if (copy_row[x / 8]) {
+                for (c = 0; c < 3; c++) {
+                    _mm256_storeu_ps(out[c] + row + x,
+                                     _mm256_loadu_ps(in[c] + row + x));
+                }
             }
             prev_valid = 0;
         } else {
@@ -495,6 +497,130 @@ static uint32_t epf_row_pass1_avx2(
     }
     return x;
 }
+
+/* Pass 0 measures twelve patch distances per sample, but they are six
+   mirrored pairs: the distance from p to p+k is the distance from p+k to p,
+   term for term and in the same order, so the float sums are bit-identical.
+   Only the six taps that point right or down are computed, one row at a
+   time; the other six are read back from the rows above and from the same
+   row shifted. Each buffer is indexed by the x of the patch the tap starts
+   from.
+ *
+ * Distances are computed in octets that start two samples left of a sigma
+ * block, [8j-2, 8j+6): block j then reads octets j and j+1 of its own row and
+ * of the two rows above, and nothing else. An octet is skipped when no block
+ * that could read it has a nonzero sigma, which is what keeps a mostly-flat
+ * page as cheap as it was -- a skipped octet leaves stale values behind that
+ * no active block looks at. */
+enum { EPF_F_H1, EPF_F_H2, EPF_F_VA, EPF_F_VB, EPF_F_VC, EPF_F_V2,
+       EPF_F_COUNT };
+#define EPF_P0_CHUNK 32u   /* blocks weighted per batch of distances */
+
+/* Octets j0..j1 inclusive of the row at `row`. sig_a and sig_b are the sigma
+   rows of this row and of the row two below, which between them cover the
+   three rows that read these distances. The octet past the last block is
+   pulled left to end at x1, the last sample any tap needs. */
+JXL_TARGET_AVX2
+static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
+                              uint32_t j1, uint32_t x1, size_t stride,
+                              const float *sig_a, const float *sig_b,
+                              const float cscale[3],
+                              float *dst[EPF_F_COUNT]) {
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    const __m256 cs0 = _mm256_set1_ps(cscale[0]);
+    const __m256 cs1 = _mm256_set1_ps(cscale[1]);
+    const __m256 cs2 = _mm256_set1_ps(cscale[2]);
+    const ptrdiff_t s = (ptrdiff_t)stride;
+    /* epf_dist_0 order, which fixes the order of each five-term sum. */
+    const ptrdiff_t doff[5] = {-s, 1, 0, -1, s};
+    /* (1,0) (2,0) (-1,1) (0,1) (1,1) (0,2) */
+    const ptrdiff_t foff[EPF_F_COUNT] = {1, 2, s - 1, s, s + 1, 2 * s};
+    uint32_t j;
+    for (j = j0; j <= j1; j++) {
+        __m256 dist[EPF_F_COUNT];
+        uint32_t q = j * 8 - 2;
+        int c, k, d;
+        if (sig_a[j - 1] == 0.0f && sig_b[j - 1] == 0.0f &&
+            (j * 8 >= x1 || (sig_a[j] == 0.0f && sig_b[j] == 0.0f)))
+            continue;
+        if (q + 7 > x1) q = x1 - 7;
+        for (c = 0; c < 3; c++) {
+            const float *p = in[c] + row + q;
+            __m256 cs = c == 0 ? cs0 : (c == 1 ? cs1 : cs2);
+            __m256 cen[5];
+            for (d = 0; d < 5; d++) cen[d] = _mm256_loadu_ps(p + doff[d]);
+            for (k = 0; k < EPF_F_COUNT; k++) {
+                const float *pk = p + foff[k];
+                __m256 acc = _mm256_setzero_ps();
+                for (d = 0; d < 5; d++) {
+                    acc = _mm256_add_ps(acc, _mm256_and_ps(absmask,
+                        _mm256_sub_ps(_mm256_loadu_ps(pk + doff[d]), cen[d])));
+                }
+                acc = _mm256_mul_ps(cs, acc);
+                dist[k] = c == 0 ? _mm256_add_ps(_mm256_setzero_ps(), acc)
+                                 : _mm256_add_ps(dist[k], acc);
+            }
+        }
+        for (k = 0; k < EPF_F_COUNT; k++) _mm256_storeu_ps(dst[k] + q, dist[k]);
+    }
+    _mm256_zeroupper();
+}
+
+/* The weighting half of epf_row8 for a run of interior octets, with the
+   distances taken from the rows epf_pass0_fwd_row filled. dist[k] + dx[k] is
+   the row and shift that holds kernel tap k. */
+JXL_TARGET_AVX2
+static void epf_row_pass0_avx2(float *in[3], float *out[3], size_t row,
+                               uint32_t x, uint32_t x1,
+                               const float *sigma_row,
+                               const ptrdiff_t koff[12],
+                               const float *const dist[12],
+                               float step_mul, float border_mul,
+                               int is_y_border, const uint8_t *copy_row) {
+    static const int8_t dx[12] = {0, -1, 0, 1, -2, -1, 0, 0, 0, 0, 0, 0};
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 smv = is_y_border
+        ? _mm256_set1_ps(border_mul)
+        : _mm256_setr_ps(border_mul, step_mul, step_mul, step_mul,
+                         step_mul, step_mul, step_mul, border_mul);
+    for (; x < x1; x += 8) {
+        const float *p0 = in[0] + row + x;
+        const float *p1 = in[1] + row + x;
+        const float *p2 = in[2] + row + x;
+        float sigma_val = sigma_row[x / 8];
+        __m256 sum0, sum1, sum2;
+        if (sigma_val == 0.0f && !copy_row[x / 8]) continue;
+        sum0 = _mm256_loadu_ps(p0);
+        sum1 = _mm256_loadu_ps(p1);
+        sum2 = _mm256_loadu_ps(p2);
+        if (sigma_val != 0.0f) {
+            __m256 nis = _mm256_mul_ps(_mm256_set1_ps(sigma_val), smv);
+            __m256 sw = one;
+            int k;
+            for (k = 0; k < 12; k++) {
+                __m256 wgt = _mm256_add_ps(one, _mm256_mul_ps(
+                    _mm256_loadu_ps(dist[k] + (ptrdiff_t)x + dx[k]), nis));
+                wgt = _mm256_max_ps(wgt, zero);
+                sw = _mm256_add_ps(sw, wgt);
+                sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(wgt,
+                    _mm256_loadu_ps(p0 + koff[k])));
+                sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(wgt,
+                    _mm256_loadu_ps(p1 + koff[k])));
+                sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(wgt,
+                    _mm256_loadu_ps(p2 + koff[k])));
+            }
+            sw = _mm256_rcp_ps(sw);
+            sum0 = _mm256_mul_ps(sum0, sw);
+            sum1 = _mm256_mul_ps(sum1, sw);
+            sum2 = _mm256_mul_ps(sum2, sw);
+        }
+        _mm256_storeu_ps(out[0] + row + x, sum0);
+        _mm256_storeu_ps(out[1] + row + x, sum1);
+        _mm256_storeu_ps(out[2] + row + x, sum2);
+    }
+    _mm256_zeroupper();
+}
 #endif
 
 /* A sample whose whole footprint is inside the image needs no mirroring, so
@@ -502,7 +628,9 @@ static uint32_t epf_row_pass1_avx2(
    offsets depend only on the pass, so they are tabulated once per pass. */
 static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                     size_t stride, const float *sigma, uint32_t sigma_stride,
-                    const jxl_epf *epf, int step, float *vsad_cache) {
+                    const jxl_epf *epf, int step, float *vsad_cache,
+                    float *fwd_cache, const uint8_t *copy_map,
+                    size_t copy_stride, uint32_t y_begin, uint32_t y_end) {
     const int8_t (*kernel)[2];
     const int8_t (*dist_off)[2];
     ptrdiff_t koff[12];      /* kernel tap -> sample offset */
@@ -516,8 +644,13 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
     __m128 epf_absmask, sm_border, sm_lo, sm_hi;
     const int use_avx2 = jxl_has_avx2();
     const int use_avx2_fma = jxl_has_avx2_fma();
+    /* Pass 0 octets run from x = 8 while x + 7 + pad < w. */
+    const uint32_t p0_x1 = (step == 0 && use_avx2 && fwd_cache && w > 18)
+        ? 8 + 8 * ((w - 19) / 8 + 1) : 0;
+    const size_t fwd_stride = stride + 16;
 #else
     (void)vsad_cache;
+    (void)fwd_cache;
 #endif
 
     if (step == 0) {
@@ -549,28 +682,87 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
     for (k = 0; k < nkernel; k++)
         koff[k] = (ptrdiff_t)kernel[k][1] * (ptrdiff_t)stride + kernel[k][0];
 
-    for (y = 0; y < h; y++) {
+    for (y = y_begin; y < y_end; y++) {
         int is_y_border = ((y + 1) & 6u) == 0;
         /* Rows this close to an edge mirror; they are O(pad) of the image. */
         int y_inside = (y >= (uint32_t)pad && y + (uint32_t)pad < h);
         const float *sigma_row = sigma + (size_t)(y / 8) * sigma_stride;
+        /* Nonzero where a block with sigma 0 still has to reach `out`. */
+        const uint8_t *copy_row = copy_map + (size_t)(y / 8) * copy_stride;
 #ifdef JXL_EPF_SSE2
         const float *prev_sigma_row = y
             ? sigma + (size_t)((y - 1) / 8) * sigma_stride
             : sigma_row;
 #endif
         size_t row = (size_t)y * stride;
+#ifdef JXL_EPF_SSE2
+        const float *p0_dist[12];
+        float *p0_f[EPF_F_COUNT];
+        if (p0_x1 && y_inside) {
+            /* Buffers: H1, H2, then two generations of VA/VB/VC by row
+               parity, then three of V2 by row mod 3. The first interior row
+               has no rows above it to inherit from, so those are filled
+               whole; its own distances are computed a chunk at a time just
+               ahead of the weighting, while the samples are in L1. */
+            float **f = p0_f;
+            uint32_t r;
+            for (r = (y == (uint32_t)pad) ? y - 2 : y; r <= y; r++) {
+                f[EPF_F_H1] = fwd_cache;
+                f[EPF_F_H2] = fwd_cache + fwd_stride;
+                f[EPF_F_VA] = fwd_cache + (2 + (r & 1u)) * fwd_stride;
+                f[EPF_F_VB] = fwd_cache + (4 + (r & 1u)) * fwd_stride;
+                f[EPF_F_VC] = fwd_cache + (6 + (r & 1u)) * fwd_stride;
+                f[EPF_F_V2] = fwd_cache + (8 + r % 3u) * fwd_stride;
+                if (r < y) {
+                    epf_pass0_fwd_row(
+                        in, (size_t)r * stride, 1, p0_x1 / 8, p0_x1, stride,
+                        sigma + (size_t)(r / 8) * sigma_stride,
+                        sigma + (size_t)((r + 2) / 8) * sigma_stride,
+                        cscale, f);
+                }
+            }
+            /* epf_kernel_2 order. */
+            p0_dist[0] = fwd_cache + (8 + (y - 2) % 3u) * fwd_stride;
+            p0_dist[1] = fwd_cache + (6 + ((y - 1) & 1u)) * fwd_stride;
+            p0_dist[2] = fwd_cache + (4 + ((y - 1) & 1u)) * fwd_stride;
+            p0_dist[3] = fwd_cache + (2 + ((y - 1) & 1u)) * fwd_stride;
+            p0_dist[4] = f[EPF_F_H2];
+            p0_dist[5] = f[EPF_F_H1];
+            p0_dist[6] = f[EPF_F_H1];
+            p0_dist[7] = f[EPF_F_H2];
+            p0_dist[8] = f[EPF_F_VA];
+            p0_dist[9] = f[EPF_F_VB];
+            p0_dist[10] = f[EPF_F_VC];
+            p0_dist[11] = f[EPF_F_V2];
+        }
+#endif
         for (x = 0; x < w; ) {
             float sigma_val = sigma_row[x / 8];
 
 #ifdef JXL_EPF_SSE2
+            if (p0_x1 && y_inside && x == 8) {
+                while (x < p0_x1) {
+                    uint32_t xe = JXL_MIN(x + 8 * EPF_P0_CHUNK, p0_x1);
+                    /* A chunk's first octet was the previous chunk's last. */
+                    epf_pass0_fwd_row(
+                        in, row, x == 8 ? 1 : x / 8 + 1, xe / 8, p0_x1,
+                        stride, sigma_row,
+                        sigma + (size_t)((y + 2) / 8) * sigma_stride,
+                        cscale, p0_f);
+                    epf_row_pass0_avx2(in, out, row, x, xe, sigma_row, koff,
+                                       p0_dist, step_mul, border_mul,
+                                       is_y_border, copy_row);
+                    x = xe;
+                }
+                continue;
+            }
             if (use_avx2_fma && step == 1 && y_inside && (x & 7u) == 0 &&
                 x >= 2 && x + 9 < w) {
                 x = epf_row_pass1_avx2(in, out, row, x, w, stride, sigma_row,
                                        cscale, step_mul, border_mul,
                                        is_y_border, vsad_cache,
                                        prev_sigma_row,
-                                       y > (uint32_t)pad);
+                                       y > (uint32_t)pad, copy_row);
                 continue;
             }
             /* Four samples at a time down the row. Vectorising across x (not
@@ -583,9 +775,11 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
             if (use_avx2 && y_inside && (x & 7u) == 0 &&
                 x >= (uint32_t)pad && x + 7 + (uint32_t)pad < w) {
                 if (sigma_val == 0.0f) {
-                    for (c = 0; c < 3; c++) {
-                        memcpy(out[c] + row + x, in[c] + row + x,
-                               8 * sizeof(float));
+                    if (copy_row[x / 8]) {
+                        for (c = 0; c < 3; c++) {
+                            memcpy(out[c] + row + x, in[c] + row + x,
+                                   8 * sizeof(float));
+                        }
                     }
                     x += 8;
                     continue;
@@ -600,9 +794,11 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                 x >= (uint32_t)pad && x + 3 + (uint32_t)pad < w) {
                 __m128 dist4[12], sum4[3], sw, nis;
                 if (sigma_val == 0.0f) {
-                    for (c = 0; c < 3; c++) {
-                        _mm_storeu_ps(out[c] + row + x,
-                                      _mm_loadu_ps(in[c] + row + x));
+                    if (copy_row[x / 8]) {
+                        for (c = 0; c < 3; c++) {
+                            _mm_storeu_ps(out[c] + row + x,
+                                          _mm_loadu_ps(in[c] + row + x));
+                        }
                     }
                     x += 4;
                     continue;
@@ -657,7 +853,9 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
             float sum_weights, inv_w, sm, neg_inv_sigma;
 
             if (sigma_val == 0.0f) {
-                for (c = 0; c < 3; c++) out[c][row + x] = in[c][row + x];
+                if (copy_row[x / 8]) {
+                    for (c = 0; c < 3; c++) out[c][row + x] = in[c][row + x];
+                }
                 x++;
                 continue;
             }
@@ -742,24 +940,147 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
     return 0;
 }
 
+/* Copies the filtered blocks of row y of `src` over `dst`. */
+static void epf_copy_active_row(float *dst[3], float *src[3], uint32_t w,
+                                uint32_t y, size_t stride,
+                                const float *sigma, uint32_t sigma_stride) {
+    const float *sigma_row = sigma + (size_t)(y / 8) * sigma_stride;
+    uint32_t bw = (w + 7) / 8, x;
+    size_t row = (size_t)y * stride;
+    int c;
+    for (x = 0; x < bw; x++) {
+        uint32_t n;
+        if (sigma_row[x] == 0.0f) continue;
+        n = JXL_MIN(8u, w - x * 8);
+        for (c = 0; c < 3; c++) {
+            memcpy(dst[c] + row + x * 8, src[c] + row + x * 8,
+                   n * sizeof(float));
+        }
+    }
+}
+
+/* A few rows of three planes that stand in for a full-size image. The passes
+   address a sample as plane + y * stride + x, so `p` is the buffer biased
+   back by the row its first slot currently holds: rows base .. base + rows - 1
+   are real, and writing the row past them slides the newest `keep` rows to
+   the front. The bias is applied as an integer because the biased pointer
+   itself lies outside the allocation. */
+#define EPF_RING_ROWS 48u
+typedef struct {
+    float *buf[3];
+    float *p[3];
+    uint32_t base, keep;
+} epf_ring;
+
+static void epf_ring_bias(epf_ring *r, size_t stride) {
+    int c;
+    for (c = 0; c < 3; c++) {
+        r->p[c] = (float *)((uintptr_t)r->buf[c] -
+                            (uintptr_t)r->base * stride * sizeof(float));
+    }
+}
+
+static int epf_ring_init(jxl_ctx *ctx, epf_ring *r, size_t stride,
+                         uint32_t keep) {
+    size_t n;
+    int c;
+    /* One spare row: the kernels load a vector that may start in the last
+       columns of a row and run on into the next. */
+    if (!jxl_size_mul(stride, (EPF_RING_ROWS + 1) * sizeof(float), &n))
+        return -1;
+    for (c = 0; c < 3; c++) {
+        r->buf[c] = (float *)jxl_malloc(ctx, n);
+        if (!r->buf[c]) return -1;
+    }
+    r->base = 0;
+    r->keep = keep;
+    epf_ring_bias(r, stride);
+    return 0;
+}
+
+/* Makes row y writable. Rows are written in order. */
+static void epf_ring_advance(epf_ring *r, uint32_t y, size_t stride) {
+    int c;
+    if (y - r->base < EPF_RING_ROWS) return;
+    for (c = 0; c < 3; c++) {
+        memmove(r->buf[c],
+                r->buf[c] + (size_t)(EPF_RING_ROWS - r->keep) * stride,
+                (size_t)r->keep * stride * sizeof(float));
+    }
+    r->base = y - r->keep;
+    epf_ring_bias(r, stride);
+}
+
+/* The passes used to run one after another over three full-size scratch
+   planes. Nothing about the filter needs that: a pass reads at most three
+   rows either side of the row it writes, so the passes can follow each other
+   down the image a few rows apart. The plane is then read once and written
+   once while its rows are still in cache, and the intermediates live in two
+   small row rings instead of in 12 bytes per sample of freshly faulted-in
+   memory -- on a 12-megapixel page the page faults alone cost more than the
+   arithmetic.
+ *
+ * Where sigma is 0 a sample passes through every pass unchanged, so only
+ * filtered blocks are ever written back. With three passes:
+ *
+ *   pass 0   plane  -> ring a   (plus the unfiltered rim pass 1 reads)
+ *   pass 1   ring a -> plane    3 rows behind pass 0
+ *   pass 2   plane  -> ring b   2 rows behind pass 1
+ *   copy     ring b -> plane    1 row behind pass 2
+ *
+ * Each lag is the larger of what the pass ahead still reads from the buffer
+ * being overwritten (its pad) and how far ahead the pass behind reads. */
 int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
                   size_t stride, const float *sigma, uint32_t sigma_stride,
                   const jxl_epf *epf) {
-    float *scratch[3];
+    static const uint32_t step_pad[3] = {3, 2, 1};
+    epf_ring ring_a, ring_b;
     float *vsad_cache = NULL;
-    float *in[3], *out[3], *t;
+    float *fwd_cache = NULL;
+    uint8_t *copy_map = NULL;
+    const uint32_t bw = (w + 7) / 8, bh = (h + 7) / 8;
+    int steps[3], nsteps = 0, i;
+    uint32_t lag[4], t, t_end;
     int c, rc = -1;
 
-    scratch[0] = scratch[1] = scratch[2] = NULL;
+    memset(&ring_a, 0, sizeof(ring_a));
+    memset(&ring_b, 0, sizeof(ring_b));
     if (!epf->enabled || w == 0 || h == 0) return 0;
-    for (c = 0; c < 3; c++) {
-        /* Every pass writes all w columns of every row, so there is nothing
-           to zero; only the row padding stays undefined, and the copy back
-           below is per row so it never travels. */
+
+    if (epf->iters == 3) steps[nsteps++] = 0;
+    steps[nsteps++] = 1;
+    if (epf->iters >= 2) steps[nsteps++] = 2;
+
+    /* Pass i reads the plane when i is even and ring a when it is odd; an
+       odd pass count leaves the last output in ring b. `keep` is how far
+       behind the newest row the reader of a ring still looks. */
+    if (nsteps > 1 && epf_ring_init(ctx, &ring_a, stride, 6) != 0) goto done;
+    if ((nsteps & 1) && epf_ring_init(ctx, &ring_b, stride, 3) != 0) goto done;
+
+    /* Row 0 of the map is all zeros, for a pass whose unfiltered blocks are
+       already where they belong; the rest marks, per block, an unfiltered
+       block that touches a filtered one, which is all pass 1 or 2 can reach
+       from a filtered sample. */
+    {
         size_t n;
-        if (!jxl_size_mul(stride * h, sizeof(float), &n)) goto done;
-        scratch[c] = (float *)jxl_malloc(ctx, n);
-        if (!scratch[c]) goto done;
+        uint32_t x, y;
+        if (!jxl_size_mul(bw, (size_t)bh + 1, &n)) goto done;
+        copy_map = (uint8_t *)jxl_calloc(ctx, n, 1);
+        if (!copy_map) goto done;
+        for (y = 0; y < bh; y++) {
+            uint8_t *halo = copy_map + (size_t)(y + 1) * bw;
+            uint32_t y0 = y ? y - 1 : 0, y1 = JXL_MIN(y + 1, bh - 1);
+            for (x = 0; x < bw; x++) {
+                uint32_t x0 = x ? x - 1 : 0, x1 = JXL_MIN(x + 1, bw - 1);
+                uint32_t xx, yy;
+                for (yy = y0; yy <= y1 && !halo[x]; yy++) {
+                    const float *srow = sigma + (size_t)yy * sigma_stride;
+                    for (xx = x0; xx <= x1; xx++) {
+                        if (srow[xx] != 0.0f) { halo[x] = 1; break; }
+                    }
+                }
+            }
+        }
     }
 #ifdef JXL_EPF_SSE2
     if (jxl_has_avx2()) {
@@ -768,49 +1089,51 @@ int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
             vsad_cache = (float *)jxl_malloc(ctx, n);
         /* This row is only a speed cache; allocation failure uses the
            register-only pass-1 path. */
+        if (epf->iters == 3 &&
+            jxl_size_mul(stride + 16, 11 * sizeof(float), &n))
+            fwd_cache = (float *)jxl_malloc(ctx, n);
+        /* Likewise: without it pass 0 computes all twelve distances. */
     }
 #endif
-    for (c = 0; c < 3; c++) { in[c] = plane[c]; out[c] = scratch[c]; }
 
-    if (epf->iters == 3) {
-        if (epf_pass(in, out, w, h, stride, sigma, sigma_stride, epf, 0,
-                     vsad_cache) != 0) goto done;
-        for (c = 0; c < 3; c++) { t = in[c]; in[c] = out[c]; out[c] = t; }
+    lag[0] = 0;
+    for (i = 1; i < nsteps; i++) {
+        lag[i] = lag[i - 1] +
+                 JXL_MAX(step_pad[steps[i - 1]], step_pad[steps[i]]);
     }
-    if (epf_pass(in, out, w, h, stride, sigma, sigma_stride, epf, 1,
-                 vsad_cache) != 0) goto done;
-    for (c = 0; c < 3; c++) { t = in[c]; in[c] = out[c]; out[c] = t; }
-    if (epf->iters >= 2) {
-        if (epf_pass(in, out, w, h, stride, sigma, sigma_stride, epf, 2,
-                     vsad_cache) != 0) goto done;
-        for (c = 0; c < 3; c++) { t = in[c]; in[c] = out[c]; out[c] = t; }
-    }
+    lag[nsteps] = lag[nsteps - 1] + step_pad[steps[nsteps - 1]];
+    t_end = h + lag[nsteps];
 
-    /* `in` holds the result. On an odd pass count that is the scratch
-       allocation, so hand it to the caller and free the old plane instead of
-       copying the full image back. The forced-copy build makes that ownership
-       change directly testable against the old path. */
-    for (c = 0; c < 3; c++) {
-        if (in[c] == plane[c]) continue;
-#ifdef JXL_EPF_FORCE_COPY_BACK
-        {
-            uint32_t y;
-            for (y = 0; y < h; y++) {
-                memcpy(plane[c] + (size_t)y * stride,
-                       in[c] + (size_t)y * stride,
-                       (size_t)w * sizeof(float));
-            }
+    for (t = 0; t < t_end; t++) {
+        for (i = 0; i < nsteps; i++) {
+            uint32_t y = t - lag[i];
+            int to_plane = (i & 1) != 0;
+            int last = i + 1 == nsteps;
+            epf_ring *dst = last ? &ring_b : &ring_a;
+            if (t < lag[i] || y >= h) continue;
+            if (!to_plane) epf_ring_advance(dst, y, stride);
+            /* Only a ring that a later pass reads needs the rim. */
+            if (epf_pass(to_plane ? ring_a.p : plane,
+                         to_plane ? plane : dst->p, w, h, stride, sigma,
+                         sigma_stride, epf, steps[i], vsad_cache, fwd_cache,
+                         (!to_plane && !last) ? copy_map + bw : copy_map,
+                         (!to_plane && !last) ? bw : 0, y, y + 1) != 0)
+                goto done;
         }
-#else
-        t = plane[c];
-        plane[c] = in[c];
-        scratch[c] = t;
-#endif
+        if ((nsteps & 1) && t >= lag[nsteps] && t - lag[nsteps] < h) {
+            epf_copy_active_row(plane, ring_b.p, w, t - lag[nsteps], stride,
+                                sigma, sigma_stride);
+        }
     }
     rc = 0;
 
 done:
     jxl_free(ctx, vsad_cache);
-    for (c = 0; c < 3; c++) jxl_free(ctx, scratch[c]);
+    jxl_free(ctx, fwd_cache);
+    jxl_free(ctx, copy_map);
+    for (c = 0; c < 3; c++) {
+        jxl_free(ctx, ring_a.buf[c]);
+        jxl_free(ctx, ring_b.buf[c]);
+    }
     return rc;
 }

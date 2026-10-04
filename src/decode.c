@@ -275,12 +275,13 @@ typedef struct {
 
     uint32_t bw, bh;              /* frame size in 8x8 blocks (rounded up) */
     uint32_t pw, ph;              /* pixel size == bw*8, bh*8              */
+    size_t ps;                    /* row stride of coeff[], >= pw           */
     float *lf[3];                 /* bw x bh, the dequantized LF image      */
     /* Chroma subsampling shifts; a subsampled channel uses only the top-left
        (bw >> hs) x (bh >> vs) corner of every bw-strided buffer. */
     int hs[3], vs[3];
     int32_t *lfq[3];              /* bw x bh, the raw quantized LF values    */
-    float *coeff[3];              /* pw x ph, coefficients then samples    */
+    float *coeff[3];              /* ps x ph, coefficients then samples    */
     jxl_block_info *block_info;   /* bw x bh                               */
     float *epf_sigma;             /* bw x bh                               */
     int32_t *x_from_y, *b_from_y; /* cfl_w x cfl_h                         */
@@ -324,9 +325,18 @@ static int vardct_state_alloc(jxl_ctx *ctx, jxl_vardct_state *v, uint32_t bw,
     v->bh = bh;
     v->pw = bw * 8;
     v->ph = bh * 8;
+    /* A row stride that is a whole number of 4K pages puts the same column
+       of every row -- and of every plane, since large allocations share a
+       page offset -- in one L1 set. The loop filters read seven rows of
+       three planes around each sample and a 64x64 transform walks 64 rows,
+       so on such a width (any multiple of 1024 samples) they evict their
+       own inputs continuously. A few lines of padding per row spreads the
+       rows over neighbouring sets. */
+    v->ps = v->pw;
+    if (v->ps % 1024 < 32 || v->ps % 1024 > 1024 - 32) v->ps += 64;
     v->cfl_w = (v->pw + 63) / 64;
     v->cfl_h = (v->ph + 63) / 64;
-    if (!jxl_size_mul(v->pw, v->ph, &coeff_count) ||
+    if (!jxl_size_mul(v->ps, v->ph, &coeff_count) ||
         !jxl_size_mul(coeff_count, sizeof(float), &coeff_bytes))
         return -1;
     for (c = 0; c < 3; c++) {
@@ -477,7 +487,7 @@ static void vardct_finish_blocks(jxl_vardct_state *v,
     if (batch_dct8) {
         for (c = skip_cb ? 1 : 0; c < 3; c++) {
             jxl_dequant_dct8_plane(
-                v->coeff[c], v->pw, v->block_info, v->bw, v->bh, c,
+                v->coeff[c], v->ps, v->block_info, v->bw, v->bh, c,
                 &v->dm, &v->quantizer, qm_scale[c], meta->quant_bias[c],
                 meta->quant_bias_numerator);
         }
@@ -493,8 +503,8 @@ static void vardct_finish_blocks(jxl_vardct_state *v,
                     if ((sbx << v->hs[c]) != bx) continue;
                     if (bi->dct_select >= JXL_TR_COUNT) continue;
                     jxl_dequant_varblock(
-                        v->coeff[c] + (size_t)(sby * 8) * v->pw + sbx * 8,
-                        v->pw, bi->dct_select, bi->hf_mul, c, &v->dm,
+                        v->coeff[c] + (size_t)(sby * 8) * v->ps + sbx * 8,
+                        v->ps, bi->dct_select, bi->hf_mul, c, &v->dm,
                         &v->quantizer, qm_scale[c], meta->quant_bias[c],
                         meta->quant_bias_numerator);
                 }
@@ -505,7 +515,7 @@ static void vardct_finish_blocks(jxl_vardct_state *v,
     /* Chroma-from-luma needs the three channels sample-aligned, so it only
        applies when nothing is subsampled -- as in libjxl's DequantDC. */
     if (!v->hs[0] && !v->vs[0] && !v->hs[2] && !v->vs[2]) {
-        jxl_cfl_hf(v->coeff[0], v->coeff[1], v->coeff[2], v->pw, v->pw, v->ph,
+        jxl_cfl_hf(v->coeff[0], v->coeff[1], v->coeff[2], v->ps, v->pw, v->ph,
                    v->x_from_y, v->b_from_y, v->cfl_w, &v->chan_corr, skip_cb);
     }
 
@@ -536,11 +546,11 @@ static void vardct_finish_blocks(jxl_vardct_state *v,
         }
         for (c = skip_cb ? 1 : 0; c < 3; c++) {
             for (by = 0; by < v->bh; by++) {
-                float *row = v->coeff[c] + (size_t)(by * 8) * v->pw;
+                float *row = v->coeff[c] + (size_t)(by * 8) * v->ps;
                 const float *lf_row = v->lf[c] + (size_t)by * v->bw;
                 for (bx = 0; bx < v->bw; bx++) row[bx * 8] = lf_row[bx];
             }
-            jxl_idct8x8_plane(v->coeff[c], v->pw, v->block_info, c,
+            jxl_idct8x8_plane(v->coeff[c], v->ps, v->block_info, c,
                               v->bw, v->bh);
         }
         return;
@@ -556,10 +566,10 @@ static void vardct_finish_blocks(jxl_vardct_state *v,
                 float *blk;
                 if ((sbx << v->hs[c]) != bx) continue;
                 if (bi->dct_select >= JXL_TR_COUNT) continue;
-                blk = v->coeff[c] + (size_t)(sby * 8) * v->pw + sbx * 8;
-                jxl_fill_varblock_lf(blk, v->pw, bi->dct_select, v->lf[c], v->bw,
+                blk = v->coeff[c] + (size_t)(sby * 8) * v->ps + sbx * 8;
+                jxl_fill_varblock_lf(blk, v->ps, bi->dct_select, v->lf[c], v->bw,
                                      sbx, sby);
-                jxl_transform_varblock(blk, v->pw, bi->dct_select);
+                jxl_transform_varblock(blk, v->ps, bi->dct_select);
             }
         }
     }
@@ -921,9 +931,9 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                         lfq_view[c].w = (bwid + ((1u << vd.hs[c]) - 1)) >> vd.hs[c];
                         lfq_view[c].h = (bhig + ((1u << vd.vs[c]) - 1)) >> vd.vs[c];
                         hp.lf_quant[c] = &lfq_view[c];
-                        outp[c] = vd.coeff[c] + (size_t)(sby0 * 8) * vd.pw +
+                        outp[c] = vd.coeff[c] + (size_t)(sby0 * 8) * vd.ps +
                                   sbx0 * 8;
-                        strides[c] = vd.pw;
+                        strides[c] = vd.ps;
                     }
                     hp.pass = &vd.passes[p];
                     hp.coeff_shift = p < 16 ? fh->passes.shift[p] : 0;
@@ -1004,7 +1014,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
             if (!vd.hs[c] && !vd.vs[c]) continue;
             jxl_chroma_upsample(vd.coeff[c],
                                 div_ceil32(color_w, 1u << vd.hs[c]),
-                                div_ceil32(color_h, 1u << vd.vs[c]), vd.pw,
+                                div_ceil32(color_h, 1u << vd.vs[c]), vd.ps,
                                 vd.hs[c], vd.vs[c], vd.pw, vd.ph);
         }
 
@@ -1018,12 +1028,12 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
            500x500 and 510x532 corpus file by up to 10 counts. */
         for (c = 0; c < 3; c++) planes[c] = vd.coeff[c];
         if (fh->gab.enabled) {
-            if (jxl_apply_gabor(ctx, planes, color_w, color_h, vd.pw,
+            if (jxl_apply_gabor(ctx, planes, color_w, color_h, vd.ps,
                                 fh->gab.weights) != 0)
                 goto done;
         }
         if (fh->epf.enabled) {
-            if (jxl_apply_epf(ctx, planes, color_w, color_h, vd.pw, vd.epf_sigma,
+            if (jxl_apply_epf(ctx, planes, color_w, color_h, vd.ps, vd.epf_sigma,
                               vd.bw, &fh->epf) != 0)
                 goto done;
             for (c = 0; c < 3; c++) vd.coeff[c] = planes[c];
@@ -1056,7 +1066,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                 out->plane[i].data = vd.coeff[i];
                 out->plane[i].w = color_w;
                 out->plane[i].h = color_h;
-                out->plane[i].stride = vd.pw;
+                out->plane[i].stride = vd.ps;
                 vd.coeff[i] = NULL;
             }
             base = 3;

@@ -87,6 +87,83 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
+### Scanned pages: row-interleaved EPF and a flat-neighbourhood WP shortcut
+Driven by two 143-page comic archives from SumatraPDF issue 6245, 3072x4096
+each: one lossless 8-bit gray (Modular, palette + weighted predictor), one
+lossy RGB (VarDCT, three EPF passes, mixed transforms up to DCT64). Measured
+on 14 pages of each, `-bgra`, pinned to one P-core:
+
+| set | before | after | change | vs libjxl before -> after |
+|---|---|---|---|---|
+| lossless gray | 4549ms | 3432ms | -24.6% | 0.96x -> 0.73x |
+| lossy RGB | 3615ms | 2885ms | -20.2% | 1.48x -> 1.16x |
+
+All output is bit-identical to before; 1245/1245 oracle comparisons, the 121
+fuzz reproducers and a 300-file ASan sample pass. Large corpus photos
+(`flower.v_*`) also gain about 7%.
+
+**Weighted predictor.** `sc_predict` returns early when the four true errors
+and all twelve sub-predictor error terms are zero and N, NW, NE equal W (plus
+NN == N for a non-default predictor). Every sub-prediction is then W, and the
+final clamp to [min, max] of W, N, NE pins the weighted mean to W regardless
+of how the weights round, so the weights -- most of the function -- are never
+computed. That is nearly every sample of the paper background. This is the
+whole lossless gain.
+
+**EPF, in the order the profile led there.** `winperf` put EPF at 37% of the
+lossy decode, but 80% of these pages' 8x8 blocks have sigma 0, and the
+arithmetic for the remaining 20% should have cost a fifth of what was
+measured. Three things were wrong, and the instructive part is that the first
+two fixes showed almost nothing until the third:
+
+- Pass 0 computed each patch distance twice. The twelve taps are six mirrored
+  pairs (distance p -> p+k equals p+k -> p term for term, in the same order,
+  so the sums are bit-identical). `epf_pass0_fwd_row` now computes the six
+  right/down taps per row into small row buffers and the other six are read
+  back from the two rows above and from the same row shifted. It must skip
+  octets no active block reads: computing them for the whole row made the
+  decode 7% *slower*, because the old code only ever touched the active 20%.
+- Each pass copied every sigma-0 block into its output plane: 450MB of memory
+  traffic per pass to move samples that do not change. Now only filtered
+  blocks are written, plus (into an intermediate) the one-block rim around
+  them that the next pass can reach.
+- The three full-size scratch planes were the real cost. They are fresh
+  allocations, so every page is a first-touch fault, and sparse first touches
+  are expensive: pre-touching the planes took pass 0's weighting half from
+  80ns to 26ns per octet. `jxl_apply_epf` now runs the passes in lockstep a
+  few rows apart (pass 1 three rows behind pass 0, pass 2 two behind that, the
+  final copy-back one more) with two 48-row sliding buffers for the
+  intermediates, so there is no full-size scratch at all and the plane is read
+  and written once while its rows are in L2. The lag between two passes is the
+  larger of the leading pass's pad (it still reads that far back in the buffer
+  being overwritten) and the trailing pass's reach. This replaced the
+  scratch-ownership swap, so `-DJXL_EPF_FORCE_COPY_BACK` is gone.
+
+Also: VarDCT plane rows get 64 floats of padding when the width is within 32
+samples of a multiple of 1024. At 3072 the stride was exactly three 4K pages
+and every large allocation shares a page offset, so a column of every row of
+every plane fell in one L1 set. Worth 2.5% here, mostly in the transforms.
+
+Dead ends worth not repeating:
+- `calloc` instead of `malloc` + `memset` for the coefficient planes (the
+  memset is 10% of the lossy decode) is **8% slower**, and clearing each
+  group's rectangle just before its first HF pass is **14% slower**. Both move
+  the page faults from one sequential sweep into sparse, interleaved access.
+  On Windows a sequential `memset` over a fresh block is by far the cheapest
+  way to fault it in.
+- Software prefetch of the EPF leading row: no effect.
+- An ANS fast path for single-symbol histograms (state is unchanged, nothing
+  is read): no measurable effect on the gray pages.
+- Benchmark noise: this machine is a hybrid 12900F and unpinned A/B runs gave
+  the wrong sign more than once. Pin to a P-core
+  (`start /b /wait /high /affinity 10 jxl_bench.exe ...`) and take the minimum
+  over alternating rounds.
+
+What is left on the lossy pages: `vardct_finish_blocks` 25% (generic
+`jxl_dct_2d` for the large transforms, no zero-AC skip outside the all-DCT8
+batch path), the coefficient-plane `memset` 10%, LF Modular 9%. On the gray
+pages: the MA-tree/property loop 40%, ANS 22%, `sc_predict` 11%.
+
 ### Cross 1.10x: specialize responsive Modular and skip zero VarDCT work
 The effort-one prefix-RLE gradient loop now carries the west and northwest
 samples in registers through each interior row. Alternating release runs

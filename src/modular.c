@@ -606,6 +606,32 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
        for exactly this. */
     int64_t sp0, sp1, sp2, sp3, pred;
 
+    /* A flat neighbourhood that has been predicted exactly so far -- the
+       paper of a scanned page, for most of its samples. Every sub-prediction
+       is then W: the error terms vanish, W + NE - N is W, and with all the
+       true errors zero the final clamp to [min, max] of W, N, NE pins the
+       weighted mean to W whatever the weights round to. So the weights,
+       which are most of this function, never need computing. The individual
+       error terms are tested rather than their sums, which could in
+       principle wrap to zero. */
+    if ((te_w | te_n | te_nw | te_ne) == 0 && n == w && nw == w && ne == w &&
+        (sc->default_wp || nn == n) &&
+        (sc->subpred_err_nw_ww[0] | sc->subpred_err_nw_ww[1] |
+         sc->subpred_err_nw_ww[2] | sc->subpred_err_nw_ww[3] |
+         sc->subpred_err_n_w[0] | sc->subpred_err_n_w[1] |
+         sc->subpred_err_n_w[2] | sc->subpred_err_n_w[3] |
+         sc->subpred_err_ne[0] | sc->subpred_err_ne[1] |
+         sc->subpred_err_ne[2] | sc->subpred_err_ne[3]) == 0) {
+        w3 = (int64_t)w << 3;
+        out->subpred[0] = w3;
+        out->subpred[1] = w3;
+        out->subpred[2] = w3;
+        out->subpred[3] = w3;
+        out->prediction = w3;
+        out->max_error = 0;
+        return;
+    }
+
     es0 = sc->subpred_err_nw_ww[0] + sc->subpred_err_n_w[0] + sc->subpred_err_ne[0];
     es1 = sc->subpred_err_nw_ww[1] + sc->subpred_err_n_w[1] + sc->subpred_err_ne[1];
     es2 = sc->subpred_err_nw_ww[2] + sc->subpred_err_n_w[2] + sc->subpred_err_ne[2];
