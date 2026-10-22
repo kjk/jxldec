@@ -1162,6 +1162,7 @@ int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,
 int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
                      const jxl_frame_header *fh, uint32_t visible_frames,
                      uint32_t invisible_frames, float corr_x, float corr_b);
+int jxl_output_buffer_size(int w, int h, int bpp, int *stride, size_t *total);
 
 /* upsample -- non-separable 2x/4x/8x upsampling                          */
 /* Replaces the plane with its upsample by 1 << shift, cropped to out_w x

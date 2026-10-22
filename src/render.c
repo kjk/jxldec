@@ -979,16 +979,43 @@ static int decode_frame_planes(jxl_doc *doc, int frame_no, jxl_fimage *img) {
     return walk_frames(doc, frame_no, img, NULL, NULL);
 }
 
+/* Output stride (bytes per row) and total buffer size for a w x h image at
+   bpp bytes per pixel, computed in 64 bits. Returns 0 and fills *stride /
+   *total on success, -1 if any argument is non-positive, the stride does not
+   fit the int stride field, or the buffer does not fit size_t. */
+int jxl_output_buffer_size(int w, int h, int bpp, int *stride, size_t *total) {
+    uint64_t stride64, total64;
+    if (w <= 0 || h <= 0 || bpp <= 0) return -1;
+    stride64 = (uint64_t)w * (uint64_t)bpp;
+    if (stride64 > (uint64_t)INT32_MAX) return -1;
+    total64 = stride64 * (uint64_t)h;
+    if (total64 > (uint64_t)SIZE_MAX) return -1;
+    *stride = (int)stride64;
+    *total = (size_t)total64;
+    return 0;
+}
+
 jxl_image *jxl_frame_render(jxl_doc *doc, int frame_no, jxl_format fmt) {
     jxl_ctx *ctx;
     jxl_render_info info;
     jxl_fimage img;
     jxl_image *out = NULL;
     size_t total;
+    int stride;
 
     if (!doc) return NULL;
     ctx = doc->ctx;
     if (jxl_frame_render_info(doc, frame_no, fmt, &info) != 0) return NULL;
+
+    /* Reject an output too large to represent before decoding. The size header
+       is uncapped (width/height up to 2^30), so info.width * bpp can overflow
+       the int stride and truncate to a tiny buffer that write_pixels then
+       overruns. Checking here also avoids a multi-gigabyte canvas decode for
+       an image that could never be emitted. */
+    if (jxl_output_buffer_size(info.width, info.height,
+                               jxl_format_bpp(info.format), &stride, &total) != 0)
+        return NULL;
+
     memset(&img, 0, sizeof(img));
     if (decode_frame_planes(doc, frame_no, &img) != 0) return NULL;
 
@@ -997,12 +1024,7 @@ jxl_image *jxl_frame_render(jxl_doc *doc, int frame_no, jxl_format fmt) {
     out->width = info.width;
     out->height = info.height;
     out->format = info.format;
-    out->stride = info.width * jxl_format_bpp(info.format);
-    if (!jxl_size_mul((size_t)out->stride, (size_t)out->height, &total)) {
-        jxl_free(ctx, out);
-        out = NULL;
-        goto done;
-    }
+    out->stride = stride;
     /* write_pixels covers every byte of every row -- stride is exactly
        width * bpp and it writes all of them -- so zeroing this first is
        pure cost. -DJXL_POISON_UNINIT fills this and the LZ77 window with
