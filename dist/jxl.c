@@ -1,3 +1,11 @@
+/* jxl.c -- jxldec, a plain-C JPEG XL decoder (amalgamated; do not edit).
+ * Generated from src/ by cmd/build-dist.ts: https://github.com/kjk/jxldec
+ *
+ * Copyright (c) 2026 Krzysztof Kowalczyk. MIT License.
+ * A port of jxl-oxide (MIT OR Apache-2.0); contains tables and constants
+ * from libjxl (BSD-3-Clause, Copyright (c) the JPEG XL Project Authors).
+ * See LICENSE.md for the full license texts.
+ */
 #ifndef JXLDEC_H
 #define JXLDEC_H
 
@@ -152,8 +160,33 @@ struct jxl_ctx {
     int bgr;
     int keep_orientation;
     int srgb_output;
-    volatile int abort_epoch;
+
+    volatile long abort_epoch;
+    long render_epoch;
 };
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+static inline long jxl_epoch_load(volatile long *p) {
+    return _InterlockedCompareExchange(p, 0, 0);
+}
+static inline void jxl_epoch_bump(volatile long *p) { _InterlockedIncrement(p); }
+#else
+static inline long jxl_epoch_load(volatile long *p) {
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+static inline void jxl_epoch_bump(volatile long *p) {
+    __atomic_fetch_add(p, 1, __ATOMIC_RELEASE);
+}
+#endif
+
+static inline void jxl_render_begin(jxl_ctx *ctx) {
+    ctx->render_epoch = jxl_epoch_load(&ctx->abort_epoch);
+}
+
+static inline int jxl_aborted(jxl_ctx *ctx) {
+    return jxl_epoch_load(&ctx->abort_epoch) != ctx->render_epoch;
+}
 
 void *jxl_malloc(jxl_ctx *ctx, size_t size);
 void *jxl_calloc(jxl_ctx *ctx, size_t count, size_t size);
@@ -1276,7 +1309,7 @@ void jxl_ctx_set_srgb_output(jxl_ctx *ctx, int enable) {
 }
 
 void jxl_request_abort(jxl_ctx *ctx) {
-    if (ctx) ctx->abort_epoch++;
+    if (ctx) jxl_epoch_bump(&ctx->abort_epoch);
 }
 
 void *jxl_malloc(jxl_ctx *ctx, size_t size) {
@@ -10193,6 +10226,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         uint32_t lf_per_row = jxl_frame_lf_groups_per_row(fh);
         for (i = 0; i < num_lf_groups; i++) {
             uint32_t lg_x = lf_per_row ? i % lf_per_row : 0;
+            if (jxl_aborted(ctx)) goto done;
             uint32_t lg_y = lf_per_row ? i / lf_per_row : 0;
 
             uint32_t blocks_w = jxl_frame_blocks_w(fh);
@@ -10254,6 +10288,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         for (p = 0; p < num_passes; p++) {
             for (g = 0; g < num_groups; g++) {
                 jxl_chanlist *cl = &gl.pass[(size_t)p * num_groups + g];
+                if (jxl_aborted(ctx)) goto done;
                 br = section_reader(&sec, JXL_TOC_GROUP_PASS, p, g);
                 if (!br) goto done;
                 if (is_vardct) {
@@ -10309,6 +10344,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         }
     }
 
+    if (jxl_aborted(ctx)) goto done;
     if (nspecs && jxl_modular_inverse(ctx, &gmod, &gcl) != 0) goto done;
 
     if (is_vardct) {
@@ -15332,6 +15368,7 @@ int jxl_doc_frame_count(jxl_doc *doc) {
     int count = 0;
     if (!doc) return 0;
     if (doc->frame_count > 0) return doc->frame_count;
+    jxl_render_begin(doc->ctx);
     if (walk_frames(doc, -1, NULL, &count, NULL) != 0) return 1;
     doc->frame_count = count > 0 ? count : 1;
     return doc->frame_count;
@@ -15346,6 +15383,7 @@ int jxl_doc_frame_info(jxl_doc *doc, int frame_no, jxl_frame_info *info) {
     info->tps_denominator = (int)doc->meta.animation.tps_denominator;
     info->is_last = 1;
     memset(&img, 0, sizeof(img));
+    jxl_render_begin(doc->ctx);
     rc = walk_frames(doc, frame_no, &img, NULL, info);
     jxl_fimage_free(doc->ctx, &img);
     return rc;
@@ -16076,6 +16114,10 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
 
         memset(&toc, 0, sizeof(toc));
         memset(&tmp, 0, sizeof(tmp));
+        if (jxl_aborted(ctx)) {
+            jxl_errorf(ctx, JXLDEC_SEVERITY_INFO, "render: aborted");
+            goto done;
+        }
         if (jxl_read_frame_header(ctx, &br, &doc->size, &doc->meta, &fh) != 0) {
             jxl_frame_header_free(ctx, &fh);
             goto done;
@@ -16242,6 +16284,7 @@ jxl_image *jxl_frame_render(jxl_doc *doc, int frame_no, jxl_format fmt) {
 
     if (!doc) return NULL;
     ctx = doc->ctx;
+    jxl_render_begin(ctx);
     if (jxl_frame_render_info(doc, frame_no, fmt, &info) != 0) return NULL;
 
     if (jxl_output_buffer_size(info.width, info.height,
@@ -16250,6 +16293,7 @@ jxl_image *jxl_frame_render(jxl_doc *doc, int frame_no, jxl_format fmt) {
 
     memset(&img, 0, sizeof(img));
     if (decode_frame_planes(doc, frame_no, &img) != 0) return NULL;
+    if (jxl_aborted(ctx)) goto done;
 
     out = (jxl_image *)jxl_calloc(ctx, 1, sizeof(jxl_image));
     if (!out) goto done;
@@ -16286,10 +16330,11 @@ int jxl_frame_render_into(jxl_doc *doc, int frame_no, jxl_format fmt,
 
     if (!doc || !dst) return -1;
     ctx = doc->ctx;
+    jxl_render_begin(ctx);
     if (jxl_frame_render_info(doc, frame_no, fmt, &info) != 0) return -1;
     memset(&img, 0, sizeof(img));
     if (decode_frame_planes(doc, frame_no, &img) != 0) return -1;
-    rc = write_pixels(ctx, doc, &img, info.format, dst, stride);
+    rc = jxl_aborted(ctx) ? -1 : write_pixels(ctx, doc, &img, info.format, dst, stride);
     jxl_fimage_free(ctx, &img);
     return rc;
 }
