@@ -157,7 +157,7 @@ void jxl_ctx_set_srgb_output(jxl_ctx *ctx, int enable) {
 }
 
 void jxl_request_abort(jxl_ctx *ctx) {
-    if (ctx) ctx->abort_epoch++;
+    if (ctx) jxl_epoch_bump(&ctx->abort_epoch);
 }
 
 void *jxl_malloc(jxl_ctx *ctx, size_t size) {

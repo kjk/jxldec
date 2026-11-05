@@ -13,6 +13,7 @@ int jxl_doc_frame_count(jxl_doc *doc) {
     int count = 0;
     if (!doc) return 0;
     if (doc->frame_count > 0) return doc->frame_count;
+    jxl_render_begin(doc->ctx);
     if (walk_frames(doc, -1, NULL, &count, NULL) != 0) return 1;
     doc->frame_count = count > 0 ? count : 1;
     return doc->frame_count;
@@ -27,6 +28,7 @@ int jxl_doc_frame_info(jxl_doc *doc, int frame_no, jxl_frame_info *info) {
     info->tps_denominator = (int)doc->meta.animation.tps_denominator;
     info->is_last = 1;
     memset(&img, 0, sizeof(img));
+    jxl_render_begin(doc->ctx);
     rc = walk_frames(doc, frame_no, &img, NULL, info);
     jxl_fimage_free(doc->ctx, &img);
     return rc;
@@ -820,6 +822,10 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
 
         memset(&toc, 0, sizeof(toc));
         memset(&tmp, 0, sizeof(tmp));
+        if (jxl_aborted(ctx)) {
+            jxl_errorf(ctx, JXLDEC_SEVERITY_INFO, "render: aborted");
+            goto done;
+        }
         if (jxl_read_frame_header(ctx, &br, &doc->size, &doc->meta, &fh) != 0) {
             jxl_frame_header_free(ctx, &fh);
             goto done;
@@ -1005,6 +1011,7 @@ jxl_image *jxl_frame_render(jxl_doc *doc, int frame_no, jxl_format fmt) {
 
     if (!doc) return NULL;
     ctx = doc->ctx;
+    jxl_render_begin(ctx);
     if (jxl_frame_render_info(doc, frame_no, fmt, &info) != 0) return NULL;
 
     /* Reject an output too large to represent before decoding. The size header
@@ -1018,6 +1025,7 @@ jxl_image *jxl_frame_render(jxl_doc *doc, int frame_no, jxl_format fmt) {
 
     memset(&img, 0, sizeof(img));
     if (decode_frame_planes(doc, frame_no, &img) != 0) return NULL;
+    if (jxl_aborted(ctx)) goto done;
 
     out = (jxl_image *)jxl_calloc(ctx, 1, sizeof(jxl_image));
     if (!out) goto done;
@@ -1060,10 +1068,11 @@ int jxl_frame_render_into(jxl_doc *doc, int frame_no, jxl_format fmt,
 
     if (!doc || !dst) return -1;
     ctx = doc->ctx;
+    jxl_render_begin(ctx);
     if (jxl_frame_render_info(doc, frame_no, fmt, &info) != 0) return -1;
     memset(&img, 0, sizeof(img));
     if (decode_frame_planes(doc, frame_no, &img) != 0) return -1;
-    rc = write_pixels(ctx, doc, &img, info.format, dst, stride);
+    rc = jxl_aborted(ctx) ? -1 : write_pixels(ctx, doc, &img, info.format, dst, stride);
     jxl_fimage_free(ctx, &img);
     return rc;
 }

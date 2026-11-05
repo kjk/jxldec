@@ -864,6 +864,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         uint32_t lf_per_row = jxl_frame_lf_groups_per_row(fh);
         for (i = 0; i < num_lf_groups; i++) {
             uint32_t lg_x = lf_per_row ? i % lf_per_row : 0;
+            if (jxl_aborted(ctx)) goto done;
             uint32_t lg_y = lf_per_row ? i / lf_per_row : 0;
             /* LF groups are group_dim *blocks* across, over the padded block
                grid -- not group_dim*8 pixels of the real image. */
@@ -928,6 +929,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         for (p = 0; p < num_passes; p++) {
             for (g = 0; g < num_groups; g++) {
                 jxl_chanlist *cl = &gl.pass[(size_t)p * num_groups + g];
+                if (jxl_aborted(ctx)) goto done;
                 br = section_reader(&sec, JXL_TOC_GROUP_PASS, p, g);
                 if (!br) goto done;
                 if (is_vardct) {
@@ -984,6 +986,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         }
     }
 
+    if (jxl_aborted(ctx)) goto done;
     if (nspecs && jxl_modular_inverse(ctx, &gmod, &gcl) != 0) goto done;
 
     /* ----- VarDCT rendering ----- */

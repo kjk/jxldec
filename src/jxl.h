@@ -72,9 +72,12 @@ void jxl_ctx_set_keep_orientation(jxl_ctx *ctx, int enable);
    Off by default, so `djxl`-compatible output stays the default. */
 void jxl_ctx_set_srgb_output(jxl_ctx *ctx, int enable);
 
-/* Reserved for cooperative decode abort. Currently a no-op: it bumps a counter
-   on ctx that no decode path reads, so in-flight renders are NOT interrupted
-   and run to completion. */
+/* Cooperative abort. Safe to call from any thread. Renders on ctx that are in
+   progress (jxl_frame_render, jxl_frame_render_into, jxl_decode,
+   jxl_doc_frame_info, jxl_doc_frame_count) stop at the next frame or group
+   boundary and fail: NULL / -1 (jxl_doc_frame_count returns 1). Renders that
+   start after the call run normally. The doc stays usable; render again to
+   get the frame. */
 void jxl_request_abort(jxl_ctx *ctx);
 
 /* ----- signature detection ----- */

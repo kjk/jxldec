@@ -26,8 +26,40 @@ struct jxl_ctx {
     int bgr;                 /* emit B,G,R[,A] instead of R,G,B[,A] */
     int keep_orientation;    /* skip the EXIF-style orientation fixup */
     int srgb_output;         /* encode linear-light output as sRGB */
-    volatile int abort_epoch;
+    /* Cooperative abort (jxl_request_abort). abort_epoch is bumped from any
+       thread; render_epoch is the value a render started with, set by
+       jxl_render_begin on the thread doing the render. A ctx renders on one
+       thread at a time, so render_epoch needs no synchronization. */
+    volatile long abort_epoch;
+    long render_epoch;
 };
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+static inline long jxl_epoch_load(volatile long *p) {
+    return _InterlockedCompareExchange(p, 0, 0);
+}
+static inline void jxl_epoch_bump(volatile long *p) { _InterlockedIncrement(p); }
+#else
+static inline long jxl_epoch_load(volatile long *p) {
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+static inline void jxl_epoch_bump(volatile long *p) {
+    __atomic_fetch_add(p, 1, __ATOMIC_RELEASE);
+}
+#endif
+
+/* Called at the start of each public render entry point: aborts requested
+   before this moment don't affect the render. */
+static inline void jxl_render_begin(jxl_ctx *ctx) {
+    ctx->render_epoch = jxl_epoch_load(&ctx->abort_epoch);
+}
+
+/* Non-zero once jxl_request_abort was called after jxl_render_begin. Checked
+   between frames and between LF / pass groups. */
+static inline int jxl_aborted(jxl_ctx *ctx) {
+    return jxl_epoch_load(&ctx->abort_epoch) != ctx->render_epoch;
+}
 
 void *jxl_malloc(jxl_ctx *ctx, size_t size);
 void *jxl_calloc(jxl_ctx *ctx, size_t count, size_t size);

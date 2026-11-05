@@ -34,6 +34,20 @@ no sample differs from libjxl by more than one 8-bit step.
 | EXIF orientation, all 8 values | within 1 |
 | animation (frames after the first) | done |
 | YCbCr / JPEG transcode frames | done, all subsampling modes |
+| cooperative abort (`jxl_request_abort`) | done: checked per frame and per LF / pass group |
+
+### Cooperative abort
+`jxl_request_abort(ctx)` bumps an atomic epoch on the ctx (callable from any
+thread). Each public render entry (`jxl_frame_render`, `_render_into`,
+`jxl_doc_frame_info`, `jxl_doc_frame_count`) snapshots it with
+`jxl_render_begin`; `jxl_aborted` is checked at the start of every frame in
+`walk_frames`, every LF group and pass group in `jxl_frame_decode`, before the
+Modular inverse transforms, and before pixels are written. On flower_alpha
+(2268x1512, Modular and VarDCT) an abort requested at 20% of the render stops
+it within about 15 ms; the next render on the same doc is byte-identical to an
+uninterrupted one. Not interruptible: a single group's decode, the global
+Modular stream of a small image, and the VarDCT rendering and filters (EPF,
+Gaborish) that run after a frame's last group.
 
 ### What "pixel perfect" means here
 Modular is integer arithmetic, so it is byte-identical to libjxl and any

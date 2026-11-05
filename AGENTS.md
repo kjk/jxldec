@@ -12,7 +12,7 @@ up-front as an in-memory buffer. We provide:
 - the embedded ICC profile, when present
 
 No encoder. No JPEG reconstruction (`jbrd` boxes are located but not applied).
-No multithreading — `jxl_ctx` is not shared across threads.
+No multithreading — `jxl_ctx` is not shared across threads. The one exception is `jxl_request_abort`, which another thread may call while a render runs (atomic epoch, see `jxl_render_begin` / `jxl_aborted` in jxl_internal.h).
 
 The consumer that drives the feature set is **SumatraPDF**
 (`sumatrapdf/src/shared/JxlReader.cpp`). It decodes the first frame two ways:
