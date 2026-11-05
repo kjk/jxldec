@@ -2,6 +2,10 @@
  *
  * Decode-only. The caller supplies the entire JPEG XL file up-front as an
  * in-memory buffer that must outlive the jxl_doc.
+ *
+ * Copyright (c) 2026 Krzysztof Kowalczyk. MIT License; see LICENSE.md, which
+ * also covers the jxl-oxide (MIT OR Apache-2.0) and libjxl (BSD-3-Clause)
+ * code this is derived from.
  */
 #ifndef JXLDEC_H
 #define JXLDEC_H
@@ -50,8 +54,8 @@ void jxl_ctx_set_bgr(jxl_ctx *ctx, int enable);
 
 /* By default the decoder applies the image's EXIF-style orientation field
    (like libjxl's JxlDecoder does), so the returned image is upright and
-   width/height may be swapped relative to the codestream dimensions. Disable
-   to get the raw codestream orientation. */
+   width/height may be swapped relative to the codestream dimensions. Enable
+   to keep the raw codestream orientation instead. */
 void jxl_ctx_set_keep_orientation(jxl_ctx *ctx, int enable);
 
 /* Decode to display-referred sRGB instead of the image's own colour encoding.
@@ -62,11 +66,15 @@ void jxl_ctx_set_keep_orientation(jxl_ctx *ctx, int enable);
    Only the transfer function is handled, and only for xyb-encoded images:
    primaries are left alone, and an image stored in its original colour space
    is left as-is (its samples are not ours to reinterpret).
+   An xyb-encoded image with an embedded ICC profile also counts as linear
+   here: like libjxl without a CMS, it decodes to linear sRGB, so this flag
+   gives it the sRGB curve too.
    Off by default, so `djxl`-compatible output stays the default. */
 void jxl_ctx_set_srgb_output(jxl_ctx *ctx, int enable);
 
-/* Bump the cooperative decode-abort epoch on ctx. All in-flight renders on
-   this ctx exit promptly. Thread-safe. */
+/* Reserved for cooperative decode abort. Currently a no-op: it bumps a counter
+   on ctx that no decode path reads, so in-flight renders are NOT interrupted
+   and run to completion. */
 void jxl_request_abort(jxl_ctx *ctx);
 
 /* ----- signature detection ----- */
@@ -97,8 +105,8 @@ typedef enum {
 } jxl_color_space;
 
 typedef struct {
-    int width;             /* display width in pixels (orientation applied) */
-    int height;            /* display height in pixels                      */
+    int width;             /* width in pixels; orientation applied unless   */
+    int height;            /* jxl_ctx_set_keep_orientation is enabled       */
     int bits_per_sample;   /* nominal bit depth of the color channels       */
     int exponent_bits;     /* >0 when samples are floating point            */
     int num_color_channels;/* 1 (gray) or 3 (color)                         */
@@ -122,7 +130,9 @@ int jxl_doc_info(jxl_doc *doc, jxl_image_info *info);
 int jxl_doc_frame_count(jxl_doc *doc);
 
 /* Embedded ICC profile of the original color space, or NULL if the image has
-   none (in which case the color encoding is enumerated -- see jxl_doc_info).
+   none (its color encoding is then enumerated in the codestream; only the
+   color_space part of it is exposed, via jxl_doc_info -- primaries, white
+   point and transfer function are not).
    The returned pointer is owned by the doc and valid until jxl_doc_close. */
 const uint8_t *jxl_doc_icc_profile(jxl_doc *doc, size_t *len);
 
@@ -152,9 +162,9 @@ typedef struct {
 } jxl_image;
 
 /* Decode a frame (0-based; 0 is the first/only frame of a still image).
-   Animation frames must be decoded in order -- the decoder keeps the previous
-   frame's state on the doc so blending works; asking for frame N decodes
-   frames 0..N as needed.
+   Frames may be requested in any order. No decode state is kept on the doc:
+   each call re-decodes frames 0..N (so blending and reference frames work),
+   which makes playing an N-frame animation O(N^2) in frame decodes.
    fmt == JXLDEC_FORMAT_NATIVE picks the format from the image metadata.
    Returns NULL on error; free with jxl_image_destroy. */
 jxl_image *jxl_frame_render(jxl_doc *doc, int frame_no, jxl_format fmt);
@@ -172,11 +182,15 @@ int jxl_frame_render_info(jxl_doc *doc, int frame_no, jxl_format fmt,
 
 /* Render directly into a caller-provided top-down buffer with `stride` bytes
    per row, eliminating one full-frame copy. The buffer must match the geometry
-   reported by jxl_frame_render_info. Returns 0 on success, -1 on error. */
+   reported by jxl_frame_render_info: stride >= width * jxl_format_bpp(format)
+   and at least height rows. Neither is checked -- that is the caller's job.
+   Returns 0 on success, -1 on error. */
 int jxl_frame_render_into(jxl_doc *doc, int frame_no, jxl_format fmt,
                           uint8_t *dst, int stride);
 
-/* Per-frame animation timing / identity. */
+/* Per-frame animation timing / identity. jxl_doc_frame_info fully decodes
+   frames 0..frame_no to get there (as jxl_frame_render does), so it costs as
+   much as a render. */
 typedef struct {
     int duration_ticks;  /* frame duration in animation ticks */
     int tps_numerator;   /* ticks per second = numerator / denominator */

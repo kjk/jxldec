@@ -8,7 +8,8 @@
 //                  header, then the internal header, then every src/*.c,
 //                  concatenated with the local #include "jxl.h" /
 //                  "jxl_internal.h" lines stripped; comments and trailing
-//                  whitespace removed.
+//                  whitespace removed, then a short license header
+//                  (DIST_C_LICENSE) prepended.
 //
 // A consumer drops both files into their tree and compiles jxl.c like any
 // other source. Verified with every available toolchain before finishing.
@@ -23,6 +24,10 @@ import { SRCS } from "./sources";
 const ROOT = `${import.meta.dir}/..`.replaceAll("\\", "/");
 const SRC = join(ROOT, "src");
 const DIST = join(ROOT, "dist");
+// Forward slashes for paths that go into a Bun shell command: the shell treats
+// backslashes as escapes, so a Windows join() path came out mangled (e.g.
+// "Userskjk...distjxl_verify_clang.o" written into the repo root).
+const shPath = (p: string): string => p.replaceAll("\\", "/");
 
 export const DIST_MODULES = SRCS.map((s) => s.replace(/^src\//, ""));
 export const DIST_H = join(DIST, "jxl.h");
@@ -124,6 +129,17 @@ function stripCComments(code: string): string {
   return normalizeSourceText(out);
 }
 
+// Comments are stripped from jxl.c, so the license notice is put back on top.
+const DIST_C_LICENSE = `/* jxl.c -- jxldec, a plain-C JPEG XL decoder (amalgamated; do not edit).
+ * Generated from src/ by cmd/build-dist.ts: https://github.com/kjk/jxldec
+ *
+ * Copyright (c) 2026 Krzysztof Kowalczyk. MIT License.
+ * A port of jxl-oxide (MIT OR Apache-2.0); contains tables and constants
+ * from libjxl (BSD-3-Clause, Copyright (c) the JPEG XL Project Authors).
+ * See LICENSE.md for the full license texts.
+ */
+`;
+
 async function runCmd(cmd: string, cwd?: string): Promise<number> {
   console.log(cwd ? `+ cd ${cwd} && ${cmd}` : `+ ${cmd}`);
   const shell = $`${{ raw: cmd }}`.nothrow();
@@ -194,7 +210,7 @@ function distVerifyVariants(): VerifyVariant[] {
       required: true,
       run: async () => {
         if (!(await haveCompiler("clang"))) return false;
-        const obj = join(DIST, "jxl_verify_clang.o");
+        const obj = shPath(join(DIST, "jxl_verify_clang.o"));
         const rc = await runCmd(
           `clang ${clangCFlags("-O1")} -c dist/jxl.c -o ${obj}`,
           ROOT,
@@ -208,7 +224,7 @@ function distVerifyVariants(): VerifyVariant[] {
       required: isWindows,
       run: async () => {
         if (!(await haveCompiler("cl"))) return false;
-        const obj = join(DIST, "jxl_verify_msvc.obj");
+        const obj = shPath(join(DIST, "jxl_verify_msvc.obj"));
         const rc = await runCmd(
           `cl ${JXLDEC_MSVC_CL_C} -c dist/jxl.c -Fo${obj}`,
           ROOT,
@@ -223,7 +239,7 @@ function distVerifyVariants(): VerifyVariant[] {
       run: async () => {
         const clx86 = await findMsvcClX86();
         if (!clx86) return false;
-        const obj = join(DIST, "jxl_verify_msvc_x86.obj");
+        const obj = shPath(join(DIST, "jxl_verify_msvc_x86.obj"));
         // -WX so an undeclared _BitScanReverse64 (C4013) fails the build.
         const rc = await runCmd(
           `"${clx86}" ${JXLDEC_MSVC_CL_C} -c dist/jxl.c -Fo${obj}`,
@@ -239,7 +255,7 @@ function distVerifyVariants(): VerifyVariant[] {
       run: async () => {
         const gcc = await findMingwGcc();
         if (!gcc) return false;
-        const obj = join(DIST, "jxl_verify_mingw.o");
+        const obj = shPath(join(DIST, "jxl_verify_mingw.o"));
         // No -mxsave: gcc's _xgetbv is always_inline and needs that target
         // flag unless we use inline asm (the path consumers / Wine CI use).
         const rc = await runCmd(
@@ -313,7 +329,7 @@ export async function buildDist(opts: { requireMingw?: boolean; requireMsvcX86?:
   }
 
   // Final pass also collapses blank runs left at module boundaries.
-  const amalgamated = stripCComments(parts.join("\n"));
+  const amalgamated = DIST_C_LICENSE + stripCComments(parts.join("\n"));
   writeFileSync(DIST_C, amalgamated);
   console.log(`wrote dist/jxl.h (${publicHeader.split("\n").length} lines)`);
   console.log(

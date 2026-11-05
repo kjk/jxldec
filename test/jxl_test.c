@@ -223,7 +223,7 @@ int main(int argc, char **argv) {
     if (!in_path) {
         fprintf(stderr,
                 "usage: jxl_test [-info] [-frames] [-bgr] [-srgb] [-frame N] "
-                "[-out out.pnm] in.jxl\n");
+                "[-fmt N] [-out out.pam] in.jxl\n");
         return 2;
     }
 

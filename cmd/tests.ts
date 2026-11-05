@@ -42,8 +42,8 @@ const useAsan = argv.includes("-asan");
 // that made peak<=1 flip on harmless rounding.
 const tolIdx = argv.indexOf("-tol");
 const PEAK_TOL = tolIdx >= 0 ? parseFloat(argv[tolIdx + 1]) : 3;
-// 0.6 is picked off the measured distribution, not by taste. Across the 440
-// non-byte-exact corpus files RMS runs dense up to 0.505 and then stops: when
+// 0.6 is picked off the measured distribution, not by taste. Across the
+// non-byte-exact corpus files (440 when this was measured, 858 now) RMS runs dense up to 0.505 and then stops: when
 // every differing sample is off by exactly one count, rms = sqrt(fraction
 // differing), so pure rounding noise saturates near 0.5 and cannot go higher.
 // 0.6 clears that ceiling while staying well under 1.0, which is what a

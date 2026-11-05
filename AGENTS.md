@@ -2,7 +2,7 @@
 
 Plain-C, decode-only JPEG XL (`.jxl`) library, ported from **jxl-oxide** (Rust)
 and verified pixel-for-pixel against **libjxl**. API style follows
-**jbig2dec** / the sibling project **djvudec** (`../../djvudec`).
+**jbig2dec** / the sibling project **djvudec** (`../djvudec`).
 
 ## Goal / scope
 Decode-only, single-threaded. The caller hands us the entire `.jxl` file
@@ -15,10 +15,11 @@ No encoder. No JPEG reconstruction (`jbrd` boxes are located but not applied).
 No multithreading — `jxl_ctx` is not shared across threads.
 
 The consumer that drives the feature set is **SumatraPDF**
-(`C:\Users\kjk\src\sumatrapdf`, `src/JxlReader.cpp`): it needs
-`JxlSignatureCheck` (→ `jxl_signature_check`), basic info for a size query
-(→ `jxl_decode_size`), and the first frame as RGBA8 (→ `jxl_frame_render` +
-`jxl_ctx_set_bgr` so no swizzle pass is needed).
+(`sumatrapdf/src/shared/JxlReader.cpp`). It decodes the first frame two ways:
+`jxl_decode` to `JXLDEC_FORMAT_RGBA32` with `jxl_ctx_set_bgr` (so no swizzle
+pass is needed), and `jxl_doc_open` + `jxl_doc_info` + `jxl_frame_render_info`
++ `jxl_frame_render_into` straight into its own RGB24/RGBA32 buffer. Both turn
+on `jxl_ctx_set_srgb_output`.
 
 ## Reference checkouts (local)
 - `deps/libjxl` — the reference C++ decoder AND the oracle. `deps/libjxl-build`
@@ -40,6 +41,64 @@ PNGs to PNM in TypeScript. Don't re-investigate this.
 
 ## Build & test
 
+- `bun cmd/build.ts` — fetch deps, build the decoder + `jxl_test`. **MSVC is
+  the default on Windows** (`out/msvc/jxl_test_msvc.exe`); `-clang` builds
+  with clang (`out/clang/jxl_test_clang.exe`). `-clean` wipes `out/`.
+  `-no-deps` skips cloning/building libjxl (local compile-only checks).
+  `bun cmd/build.ts asan` builds the clang+ASan harness.
+- `bun cmd/tests.ts <-all | -rand N | file.jxl ...>` — the test driver:
+  builds, then decodes each corpus file with both our decoder and `djxl`
+  and compares the PAM output.
+- `bun cmd/coverage.ts [-rand N] [-cpu N] [-all-fns] [-reuse]` — decodes the
+  corpus under clang source-based coverage and prints per-file line coverage
+  plus, more usefully, every function that never ran. Use it before assuming a
+  feature works: each decoder bug found so far lived in a path nothing
+  exercised, and a function on that list is one nothing verifies against
+  libjxl. `-reuse` re-reports from the profile already on disk (the decode is
+  the slow part, ~3 min).
+- `bun cmd/fuzz.ts -check` — replay every known reproducer once and exit:
+  `fuzz/crashes/` plus two external sets already sitting in `deps/`, libjxl's
+  OSS-Fuzz testcases and jxl-oxide's fuzz findings (about 120 inputs,
+  seconds). Run
+  it after touching a parser; it is the cheap half of the fuzzing story.
+- `bun cmd/fuzz.ts [-jobs N] [-runs N] [-repro FILE] [-minimize]` — libFuzzer
+  + ASan over `test/fuzz_target.c`, seeded from the corpus *and* those external
+  reproducers on first run.
+  `cmd/tests.ts` only ever feeds the decoder *valid* files, and a valid file
+  takes no error path — `jxl_errorf`, which every `JXL_ERR` funnels into, never
+  executes across the whole corpus. This covers what happens when the bytes
+  lie. `fuzz/corpus/` is the checkpoint (gitignored): Ctrl-C to stop, rerun to
+  resume. Artifacts land in `fuzz/crashes/`, which **is** tracked — replay one
+  with `-repro`.
+- `bun cmd/fuzz-afl.ts` — same harness via **AFL++** (macOS/*nix; needs
+  `brew install afl++`). Shares `fuzz/corpus/` with libFuzzer; AFL state is in
+  `fuzz/afl-out/` (gitignored). On exit (and with `-import`), queue/crashes
+  merge into the shared dirs. On macOS run once: `sudo afl-system-config`.
+- `bun cmd/bench.ts <selection> [-runs N]` — times our decode against libjxl's,
+  both in one process, single-threaded, best of N. Windows/MSVC only: it links
+  libjxl's static libraries, which need `-MD` and `-DJXL_STATIC_DEFINE`.
+- `bun cmd/prof.ts <file.jxl> [-runs N] [-hz N] [-vs]` — sampling profile of
+  *our* decoder alone on one file, via the sibling **winperf** (see
+  "Windows sampling profiles" below).
+  It builds `jxl_prof` with `-Zi` into `out/prof/` and passes winperf
+  `-print-agent`, which prints the top self-time functions, the hot source
+  lines and the heaviest call path. `-vs` profiles ours *and* libjxl in one
+  process with both symbolized, by linking the benchmark harness against a
+  debug-info libjxl (built on demand into `deps/libjxl-dbg`); that is how to
+  see which side of a ratio is slow.
+- `bun cmd/build-dist.ts` — regenerate the `dist/jxl.c` + `dist/jxl.h`
+  amalgamation and verify it compiles with every available toolchain:
+  host clang, host MSVC, MSVC x86 (`Host*/x86/cl` when the PATH cl is x64),
+  and mingw-w64 gcc **without** `-mxsave` (catches the `_xgetbv` always_inline
+  trap that broke SumatraPDF's Wine CI). Optional `-require-mingw` /
+  `-require-msvc-x86` fail the script if that compiler is missing (used by CI).
+
+**Script convention** (from djvudec): every script that operates on `.jxl`
+files does nothing by default — it prints its options plus the available
+corpus file count. Select work explicitly: `file.jxl ...`, `-rand N`, `-all`.
+The one exception is `cmd/coverage.ts`, which decodes the whole corpus when
+given no `-rand N`.
+
 ### Windows sampling profiles (winperf)
 
 The profiling harness vendors `test/winperf_control.h`, so a **winperf**
@@ -52,8 +111,9 @@ git clone https://github.com/kjk/winperf ..\winperf
 cd ..\winperf && bun cmd/build.ts -release
 ```
 
-The clone requires access to the private repository. Keep the vendored header
-in sync with `..\winperf\client\winperf_control.h`.
+The clone requires access to the private repository. The vendored header is a
+copy of `..\winperf\client\winperf_control.h` and has drifted from it (the
+two currently differ); re-copy it before relying on newer winperf features.
 
 ```
 bun cmd/prof.ts <file.jxl> [-runs N] [-hz N] [-vs]
@@ -82,60 +142,6 @@ Manual equivalent:
 
 (This tool used to be called `samply`; older PROGRESS.md entries name it that.)
 
-- `bun cmd/build.ts` — fetch deps, build the decoder + `jxl_test`. **MSVC is
-  the default on Windows** (`out/msvc/jxl_test_msvc.exe`); `-clang` builds
-  with clang (`out/clang/jxl_test_clang.exe`). `-clean` wipes `out/`.
-  `-no-deps` skips cloning/building libjxl (local compile-only checks).
-  `bun cmd/build.ts asan` builds the clang+ASan harness.
-- `bun cmd/tests.ts <-all | -rand N | file.jxl ...>` — the test driver:
-  builds, then decodes each corpus file with both our decoder and `djxl`
-  and compares the PNM output.
-- `bun cmd/coverage.ts [-rand N] [-cpu N] [-all-fns] [-reuse]` — decodes the
-  corpus under clang source-based coverage and prints per-file line coverage
-  plus, more usefully, every function that never ran. Use it before assuming a
-  feature works: each decoder bug found so far lived in a path nothing
-  exercised, and a function on that list is one nothing verifies against
-  libjxl. `-reuse` re-reports from the profile already on disk (the decode is
-  the slow part, ~3 min).
-- `bun cmd/fuzz.ts -check` — replay every known reproducer once and exit:
-  `fuzz/crashes/` plus two external sets already sitting in `deps/`, libjxl's
-  OSS-Fuzz testcases and jxl-oxide's fuzz findings (115 inputs, seconds). Run
-  it after touching a parser; it is the cheap half of the fuzzing story.
-- `bun cmd/fuzz.ts [-jobs N] [-runs N] [-repro FILE] [-minimize]` — libFuzzer
-  + ASan over `test/fuzz_target.c`, seeded from the corpus *and* those external
-  reproducers on first run.
-  `cmd/tests.ts` only ever feeds the decoder *valid* files, and a valid file
-  takes no error path — `jxl_errorf`, which every `JXL_ERR` funnels into, never
-  executes across the whole corpus. This covers what happens when the bytes
-  lie. `fuzz/corpus/` is the checkpoint (gitignored): Ctrl-C to stop, rerun to
-  resume. Artifacts land in `fuzz/crashes/`, which **is** tracked — replay one
-  with `-repro`.
-- `bun cmd/fuzz-afl.ts` — same harness via **AFL++** (macOS/*nix; needs
-  `brew install afl++`). Shares `fuzz/corpus/` with libFuzzer; AFL state is in
-  `fuzz/afl-out/` (gitignored). On exit (and with `-import`), queue/crashes
-  merge into the shared dirs. On macOS run once: `sudo afl-system-config`.
-- `bun cmd/bench.ts <selection> [-runs N]` — times our decode against libjxl's,
-  both in one process, single-threaded, best of N. Windows/MSVC only: it links
-  libjxl's static libraries, which need `-MD` and `-DJXL_STATIC_DEFINE`.
-- `bun cmd/prof.ts <file.jxl> [-runs N] [-hz N] [-vs]` — sampling profile of
-  *our* decoder alone on one file, via the sibling **winperf** (see below).
-  It builds `jxl_prof` with `-Zi` into `out/prof/` and passes winperf
-  `-print-agent`, which prints the top self-time functions, the hot source
-  lines and the heaviest call path. `-vs` profiles ours *and* libjxl in one
-  process with both symbolized, by linking the benchmark harness against a
-  debug-info libjxl (built on demand into `deps/libjxl-dbg`); that is how to
-  see which side of a ratio is slow.
-- `bun cmd/build-dist.ts` — regenerate the `dist/jxl.c` + `dist/jxl.h`
-  amalgamation and verify it compiles with every available toolchain:
-  host clang, host MSVC, MSVC x86 (`Host*/x86/cl` when the PATH cl is x64),
-  and mingw-w64 gcc **without** `-mxsave` (catches the `_xgetbv` always_inline
-  trap that broke SumatraPDF's Wine CI). Optional `-require-mingw` /
-  `-require-msvc-x86` fail the script if that compiler is missing (used by CI).
-
-**Script convention** (from djvudec): every script that operates on `.jxl`
-files does nothing by default — it prints its options plus the available
-corpus file count. Select work explicitly: `file.jxl ...`, `-rand N`, `-all`.
-
 ## Corpus
 libjxl's `testdata/` holds only a handful of `.jxl` files; the corpus is
 *generated* by encoding the testdata source images with `cjxl` across a matrix
@@ -154,11 +160,16 @@ corpus with any directory of `.jxl` files.
 | `coding.c` | `jxl-coding/*` (prefix, ans, permutation, lib) |
 | `frame.c` | `jxl-frame/src/header.rs`, `filter.rs`, `data/toc.rs` |
 | `modular.c` | `jxl-modular/*` (ma, predictor, transform, image) |
+| `decode.c` | `jxl-render/src/{render,modular}.rs` (per-frame decode: LfGlobal, Modular streams, filters, colour transform) |
+| `patch.c` | `jxl-frame/src/data/patch.rs` |
+| `spline.c` | `jxl-frame/src/data/spline.rs`, `jxl-render/src/features/spline.rs` |
+| `noise.c` | `jxl-frame/src/data/noise.rs`, `jxl-render/src/features/noise.rs` |
+| `upsample.c` | `jxl-render/src/features/upsampling.rs` (2x/4x/8x) |
 | `vardct.c` | `jxl-frame/src/data/{lf_global,lf_group,hf_global,pass_group}.rs` |
 | `dct.c` | `jxl-vardct` transforms |
 | `filter.c` | gabor/EPF application |
 | `color.c` | `jxl-color/src/{xyb,tf,convert}.rs` |
-| `render.c` | `jxl-render` (frame blending, upsampling, output) |
+| `render.c` | `jxl-render` (frame walk, blending, output, orientation) |
 | `doc.c` | `jxl-oxide/src/lib.rs` (top-level API) |
 | `tables.c` | constant tables (upsampling kernels, quant weights) |
 
@@ -190,7 +201,7 @@ section per module. Every source file includes just that one header.
 A codestream is a sequence of frames. Only *displayed* frames (normal type,
 and either `is_last` or a non-zero duration) are visible; LF frames
 (progressive DC) and reference-only frames are decoded for their side effects.
-`decode_frame_planes` in `render.c` walks the chain, keeping a
+`walk_frames` in `render.c` (called through `decode_frame_planes`) walks the chain, keeping a
 `jxl_frame_state` with four reference slots and the most recent LF image.
 Frames saved "before CT" (every LF frame) skip the XYB -> color-space step.
 
