@@ -1,6 +1,6 @@
 # jxldec — a plain-C JPEG XL decoder
 
-A decode-only JPEG XL library, in the spirit of
+A decode-only [JPEG XL](https://fileformats.dev/jxl) library, in the spirit of
 [djvudec](https://github.com/kjk/djvudec):
 
 * plain C, no dependencies (vs. libjxl's C++ plus highway, brotli and skcms)
