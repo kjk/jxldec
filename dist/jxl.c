@@ -11180,6 +11180,13 @@ static void read_fixed(jxl_br *br, float out[3][9], int n) {
     }
 }
 
+static void scale_fixed64(float out[3][9], int n) {
+    int c, i;
+    for (c = 0; c < 3; c++) {
+        for (i = 0; i < n; i++) out[c][i] *= 64.0f;
+    }
+}
+
 static const uint8_t dq_slot_tr[17] = {
     JXL_TR_DCT8, JXL_TR_HORNUSS, JXL_TR_DCT2, JXL_TR_DCT4, JXL_TR_DCT16,
     JXL_TR_DCT32, JXL_TR_DCT8X16, JXL_TR_DCT8X32, JXL_TR_DCT16X32,
@@ -11227,8 +11234,16 @@ int jxl_dequant_matrices_read(jxl_ctx *ctx, jxl_br *br,
             memset(e, 0, sizeof(*e));
             switch (mode) {
                 case 0: dq_default(e, tr); break;
-                case 1: e->mode = 1; read_fixed(br, e->fixed, 3); break;
-                case 2: e->mode = 2; read_fixed(br, e->fixed, 6); break;
+                case 1:
+                    e->mode = 1;
+                    read_fixed(br, e->fixed, 3);
+                    scale_fixed64(e->fixed, 3);
+                    break;
+                case 2:
+                    e->mode = 2;
+                    read_fixed(br, e->fixed, 6);
+                    scale_fixed64(e->fixed, 6);
+                    break;
                 case 3:
                     e->mode = 3;
                     read_fixed(br, e->fixed, 2);
