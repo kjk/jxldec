@@ -4,6 +4,7 @@
 //   bun cmd/coverage.ts -rand 200    a sample, for a quick look
 //   bun cmd/coverage.ts -cpu N       worker count (default: cores - 1)
 //   bun cmd/coverage.ts -all-fns     list every uncovered function, not the top 40
+//   bun cmd/coverage.ts -reuse       re-report from the profile already on disk
 //
 // Builds the clang coverage variant, decodes the corpus with it, merges the
 // profiles and prints two things: per-file line coverage, and the functions
@@ -18,7 +19,7 @@ import { existsSync, mkdirSync, readdirSync, rmSync } from "fs";
 import { cpus, tmpdir } from "os";
 import { dirname, join } from "path";
 import { buildCoverage } from "./build";
-import { corpusFiles, fileLabel } from "./corpus";
+import { corpusFiles } from "./corpus";
 import { getDeps } from "./get-deps";
 
 const ROOT = dirname(import.meta.dir);
@@ -38,14 +39,15 @@ let files = corpusFiles();
 if (randIdx >= 0) {
   const n = parseInt(argv[randIdx + 1] ?? "");
   if (!(n > 0)) {
-    console.error("usage: bun cmd/coverage.ts [-rand N] [-cpu N] [-all-fns]");
+    console.error("usage: bun cmd/coverage.ts [-rand N] [-cpu N] [-all-fns] [-reuse]");
     process.exit(2);
   }
   // Deterministic stride rather than a shuffle: a sample that changes between
   // runs would make the uncovered list move for no reason.
-  const step = Math.max(1, Math.floor(files.length / n));
+  const total = files.length;
+  const step = Math.max(1, Math.floor(total / n));
   files = files.filter((_, i) => i % step === 0).slice(0, n);
-  console.log(`(${files.length} of ${corpusFiles().length} corpus files)`);
+  console.log(`(${files.length} of ${total} corpus files)`);
 }
 
 // Decoding the corpus under -O0 instrumentation is the slow part by far, so
@@ -180,5 +182,3 @@ printGroup("public API the harness never calls", api,
 
 console.log(`\nprofile: ${MERGED}`);
 console.log(`drill in with:  llvm-cov show ${EXE} -instr-profile=${MERGED} src/<file>.c`);
-void fileLabel;
-void existsSync;

@@ -76,9 +76,10 @@ static uint32_t noise_mirror(int64_t v, uint32_t len) {
     }
 }
 
-/* SSE2 is baseline on x64, so no runtime dispatch and no scalar/vector output
-   divergence to worry about: the same lanes are summed in the same order
-   either way, only four at a time. */
+/* SSE2 is baseline on x64, so the SSE2 kernels need no runtime dispatch and
+   cannot diverge from scalar: the same lanes are summed in the same order
+   either way, only four at a time. The AVX2 kernels further down are selected
+   at run time with jxl_has_avx2(). */
 #if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
     (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #define JXL_NOISE_SSE2 1
@@ -379,7 +380,7 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
     groups_per_row = (width + group_dim - 1) / group_dim;
     group_rows = (height + group_dim - 1) / group_dim;
 
-    /* Groups tile the frame and each writes its whole extent, and every
+    /* Groups tile the frame and each writes its whole extent, and
        every sample is assigned before it is read, so none of these need
        zeroing first -- calloc was clearing bytes the next loop overwrote. */
     {
@@ -552,10 +553,11 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
                 float fx, fy, sxv, syv, nx, ny;
                 if (sx_ < 0.0f) sx_ = 0.0f;
                 if (sy_ < 0.0f) sy_ = 0.0f;
-                ix = (uint32_t)sx_;
-                iy = (uint32_t)sy_;
-                if (ix > 7) ix = 7;
-                if (iy > 7) iy = 7;
+                /* Clamp the operand, not just the index: converting a
+                   corrupt, enormous (or NaN) value is undefined, and the
+                   AVX2 twin clamps here too. */
+                ix = (uint32_t)(sx_ < 7.0f ? sx_ : 7.0f);
+                iy = (uint32_t)(sy_ < 7.0f ? sy_ : 7.0f);
                 fx = sx_ - (float)ix;
                 fy = sy_ - (float)iy;
                 sxv = (lut[ix + 1] - lut[ix]) * fx + lut[ix];

@@ -30,10 +30,18 @@ static void read_bit_depth(jxl_br *br, jxl_bit_depth *bd) {
         bd->float_sample = 1;
         bd->bits_per_sample = jxl_br_u32(br, 32, 0, 16, 0, 24, 0, 1, 6);
         bd->exp_bits = jxl_br_read(br, 4) + 1;
+        /* Same limits as libjxl's BitDepth: exponent 2..8, mantissa 2..23. */
+        if (bd->exp_bits < 2 || bd->exp_bits > 8 ||
+            bd->bits_per_sample < bd->exp_bits + 3 ||
+            bd->bits_per_sample > bd->exp_bits + 24) {
+            br->err = 1;
+        }
     } else {
         bd->float_sample = 0;
         bd->bits_per_sample = jxl_br_u32(br, 8, 0, 10, 0, 12, 0, 1, 6);
         bd->exp_bits = 0;
+        /* 1 + u(6) reaches 64; everything downstream shifts by this. */
+        if (bd->bits_per_sample > 31) br->err = 1;
     }
 }
 
@@ -123,15 +131,10 @@ static void preview_header_read(jxl_br *br, jxl_size_header *sz) {
 static void read_extensions(jxl_br *br) {
     uint64_t bits = jxl_br_u64(br);
     uint64_t lens[64];
-    int idx[64];
     int n = 0, i;
 
     for (i = 0; i < 64; i++) {
-        if ((bits >> i) & 1) {
-            idx[n] = i;
-            lens[n] = jxl_br_u64(br);
-            n++;
-        }
+        if ((bits >> i) & 1) lens[n++] = jxl_br_u64(br);
     }
     for (i = 0; i < n; i++) jxl_br_skip(br, (size_t)lens[i]);
 }

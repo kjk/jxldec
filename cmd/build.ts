@@ -45,7 +45,6 @@ function binName(base: string): string {
 const INTERNAL_H = `${ROOT}/src/jxl_internal.h`;
 const PUBLIC_H = `${ROOT}/src/jxl.h`;
 
-
 const objBase = (src: string) => src.replace(/^src\//, "").replace(/\.c$/, "");
 
 function needsRebuild(output: string, ...inputs: string[]): boolean {
@@ -407,49 +406,6 @@ export async function copyAsanRuntimeDll(dir: string): Promise<void> {
   copyFileSync(src, dst);
 }
 
-// Build the harness from the dist/ amalgamation (single translation unit).
-export async function buildBench(useClang = defaultUseClang): Promise<string> {
-  await ensureDist();
-  const dir = outDir(useClang);
-  const exePath = `${dir}/${harnessExeName(useClang)}`;
-  mkdirSync(dir, { recursive: true });
-  const ext = useClang ? "o" : "obj";
-  const libObj = `${dir}/jxl.${ext}`;
-  const testObj = `${dir}/jxl_test.${ext}`;
-
-  if (useClang) {
-    if (needsRebuild(libObj, DIST_C, DIST_H)) {
-      await runCmd(`clang ${clangCFlags()} -I${ROOT}/dist -c -o ${libObj} ${DIST_C}`);
-    }
-    if (needsRebuild(testObj, `${ROOT}/test/jxl_test.c`, DIST_H, INTERNAL_H)) {
-      await runCmd(
-        `clang ${clangCFlags()} -I${ROOT}/dist -I${ROOT}/src -c -o ${testObj} ${ROOT}/test/jxl_test.c`,
-      );
-    }
-    if (needsRebuild(exePath, libObj, testObj)) {
-      const libm = isWindows ? "" : " -lm";
-      await runCmd(`clang ${libObj} ${testObj} -o ${exePath}${libm}`);
-    }
-  } else {
-    if (needsRebuild(libObj, DIST_C, DIST_H)) {
-      await runCmd(`cl ${JXLDEC_MSVC_CL_C} -Idist -Fo${libObj} -c dist/jxl.c`, ROOT);
-    }
-    if (needsRebuild(testObj, `${ROOT}/test/jxl_test.c`, DIST_H, INTERNAL_H)) {
-      await runCmd(
-        `cl ${JXLDEC_MSVC_CL_C} -Idist -Isrc -Fo${testObj} -c test/jxl_test.c`,
-        ROOT,
-      );
-    }
-    if (needsRebuild(exePath, libObj, testObj)) {
-      await runCmd(
-        `cl -nologo ${libObj} ${testObj} -Fe:${exePath} -link -LTCG`,
-        ROOT,
-      );
-    }
-  }
-  return exePath;
-}
-
 // libjxl's static libraries, in link order, for the benchmark harness.
 function libjxlLibs(): string[] {
   const b = `${ROOT}/deps/libjxl-build`;
@@ -463,8 +419,6 @@ function libjxlLibs(): string[] {
   ];
 }
 
-/** Build jxl_bench: our amalgamation and libjxl in one process, MSVC only
- *  (libjxl is built as C++ with the MSVC runtime). */
 /* The benchmark harness linked against the debug-info libjxl, so a profile
    attributes libjxl's own time to its own functions instead of one opaque
    module. Same harness, so both decoders run the same work in one process
@@ -507,6 +461,8 @@ export async function buildBenchHarnessDbg(): Promise<string> {
   return exePath;
 }
 
+/** Build jxl_bench: our amalgamation and libjxl in one process, MSVC only
+ *  (libjxl is built as C++ with the MSVC runtime). */
 export async function buildBenchHarness(): Promise<string> {
   if (!isWindows) throw new Error("the benchmark harness needs the MSVC toolchain");
   await ensureDist();

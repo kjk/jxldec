@@ -103,7 +103,7 @@ static int cmd_frames(jxl_ctx *ctx, const uint8_t *data, size_t len) {
     for (;;) {
         jxl_frame_header fh;
         jxl_toc toc;
-        size_t end;
+        uint64_t end;
         if (jxl_read_frame_header(ctx, &br, &doc->size, &doc->meta, &fh) != 0) break;
         if (jxl_read_toc(ctx, &br, &fh, &toc) != 0) {
             jxl_frame_header_free(ctx, &fh);
@@ -123,7 +123,7 @@ static int cmd_frames(jxl_ctx *ctx, const uint8_t *data, size_t len) {
                fh.save_before_ct, fh.do_ycbcr,
                (unsigned)fh.jpeg_upsampling[0], (unsigned)fh.jpeg_upsampling[1],
                (unsigned)fh.jpeg_upsampling[2]);
-        end = toc.end_off + toc.total_size;
+        end = (uint64_t)toc.end_off + toc.total_size;
         idx++;
         {
             int last = fh.is_last;
@@ -132,7 +132,7 @@ static int cmd_frames(jxl_ctx *ctx, const uint8_t *data, size_t len) {
             if (last) break;
         }
         if (end >= doc->container.cs_len) break;
-        jxl_br_seek_byte(&br, end);
+        jxl_br_seek_byte(&br, (size_t)end);
     }
     jxl_doc_close(doc);
     return 0;

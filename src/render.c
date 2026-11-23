@@ -51,9 +51,10 @@ static jxl_format resolve_format(const jxl_image_info *ii, jxl_format fmt) {
 int jxl_frame_render_info(jxl_doc *doc, int frame_no, jxl_format fmt,
                           jxl_render_info *info) {
     jxl_image_info ii;
-    if (!doc || !info) return -1;
+    /* A negative index can never match a frame; without this the renderers
+       decoded every frame in the file before reporting "no such frame". */
+    if (!doc || !info || frame_no < 0) return -1;
     if (jxl_doc_info(doc, &ii) != 0) return -1;
-    (void)frame_no;
     info->width = ii.width;
     info->height = ii.height;
     info->format = resolve_format(&ii, fmt);
@@ -816,7 +817,7 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
     for (;;) {
         jxl_frame_header fh;
         jxl_toc toc;
-        size_t end;
+        uint64_t end;
         int last, keyframe, want, apply_ct;
         jxl_fimage tmp;
 
@@ -834,7 +835,9 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
             jxl_frame_header_free(ctx, &fh);
             goto done;
         }
-        end = toc.end_off + toc.total_size;
+        /* 64-bit: 65536 sections of up to 2^30 bytes wrap a 32-bit size_t,
+           and a wrapped `end` pointing back at this frame would loop forever. */
+        end = (uint64_t)toc.end_off + toc.total_size;
         last = fh.is_last;
         keyframe = frame_is_keyframe(&fh);
         want = keyframe && idx == frame_no;
@@ -859,7 +862,7 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
             jxl_toc_free(ctx, &toc);
             jxl_frame_header_free(ctx, &fh);
             if (last || end >= doc->container.cs_len) break;
-            jxl_br_seek_byte(&br, end);
+            jxl_br_seek_byte(&br, (size_t)end);
             continue;
         }
 
@@ -941,9 +944,8 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
                 uint32_t slot = fh.save_as_reference;
                 jxl_fimage_free(ctx, &st.refs[slot]);
                 memset(&st.refs[slot], 0, sizeof(st.refs[slot]));
-                if (jxl_fimage_copy(ctx, &st.refs[slot], &canvas) == 0) {
-                    st.refs_valid[slot] = 1;
-                }
+                st.refs_valid[slot] =
+                    jxl_fimage_copy(ctx, &st.refs[slot], &canvas) == 0;
             }
         }
 
@@ -965,7 +967,7 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
         jxl_toc_free(ctx, &toc);
         jxl_frame_header_free(ctx, &fh);
         if (last || end >= doc->container.cs_len) break;
-        jxl_br_seek_byte(&br, end);
+        jxl_br_seek_byte(&br, (size_t)end);
     }
 
     if (count_out) {

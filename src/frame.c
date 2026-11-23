@@ -111,7 +111,7 @@ static int computes_resets_canvas(jxl_blend_mode mode,
 }
 
 static void read_blending_info(jxl_br *br, jxl_blending_info *bi,
-                               int have_extra, const jxl_blend_mode *first_mode,
+                               uint32_t num_extra,
                                const jxl_frame_header *fh,
                                const jxl_size_header *sz) {
     uint32_t m = jxl_br_u32(br, 0, 0, 1, 0, 2, 0, 3, 2);
@@ -123,14 +123,22 @@ static void read_blending_info(jxl_br *br, jxl_blending_info *bi,
         br->err = 1;
         return;
     }
-    if (have_extra && (m == JXL_BLEND_BLEND || m == JXL_BLEND_MULADD)) {
+    if (num_extra && (m == JXL_BLEND_BLEND || m == JXL_BLEND_MULADD)) {
         bi->alpha_channel = jxl_br_u32(br, 0, 0, 1, 0, 2, 0, 3, 3);
+        if (bi->alpha_channel >= num_extra) {
+            br->err = 1;
+            return;
+        }
     }
-    if ((have_extra && (m == JXL_BLEND_BLEND || m == JXL_BLEND_MULADD)) ||
+    if ((num_extra && (m == JXL_BLEND_BLEND || m == JXL_BLEND_MULADD)) ||
         m == JXL_BLEND_MUL) {
         bi->clamp = jxl_br_bool(br);
     }
-    if (!computes_resets_canvas(first_mode ? *first_mode : bi->mode, fh, sz)) {
+    /* Each BlendingInfo decides from its *own* mode, as libjxl's
+       BlendingInfo::VisitFields does (mode != kReplace || is_partial_frame).
+       jxl-oxide keys the extra channels on the colour channels' mode, which
+       misparses a frame whose extra channel blends differently. */
+    if (!computes_resets_canvas(bi->mode, fh, sz)) {
         bi->source = jxl_br_read(br, 2);
     }
 }
@@ -314,11 +322,9 @@ int jxl_read_frame_header(jxl_ctx *ctx, jxl_br *br, const jxl_size_header *size,
 
     fh->blending.mode = JXL_BLEND_REPLACE;
     if (!all_default && frame_type_is_normal(fh->frame_type)) {
-        jxl_blend_mode first;
-        read_blending_info(br, &fh->blending, nec != 0, NULL, fh, size);
-        first = fh->blending.mode;
+        read_blending_info(br, &fh->blending, nec, fh, size);
         for (i = 0; i < nec; i++) {
-            read_blending_info(br, &fh->ec_blending[i], nec != 0, &first, fh, size);
+            read_blending_info(br, &fh->ec_blending[i], nec, fh, size);
         }
         if (meta->have_animation) {
             fh->duration = jxl_br_u32(br, 0, 0, 1, 0, 0, 8, 0, 32);

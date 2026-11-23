@@ -664,6 +664,14 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         JXL_ERR(ctx, "frame: LF frame referenced but not decoded");
         return -1;
     }
+    /* The VarDCT path below reads three LF planes. A Modular LF frame of a
+       gray image carries one colour plane, so its plane array is shorter. */
+    if (is_vardct && (fh->flags & JXL_FF_USE_LF_FRAME) &&
+        (st->lf_image.nplane < 3 || !st->lf_image.plane[0].data ||
+         !st->lf_image.plane[1].data || !st->lf_image.plane[2].data)) {
+        JXL_ERR(ctx, "frame: LF frame does not have three colour planes");
+        return -1;
+    }
 
     /* Two things about extra channels we decline rather than get wrong.
        Every other type -- depth, selection mask, CFA, thermal, black -- is
@@ -925,7 +933,6 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     {
         uint32_t p, g;
         uint32_t groups_per_row = jxl_frame_groups_per_row(fh);
-        uint32_t lf_per_row = jxl_frame_lf_groups_per_row(fh);
         for (p = 0; p < num_passes; p++) {
             for (g = 0; g < num_groups; g++) {
                 jxl_chanlist *cl = &gl.pass[(size_t)p * num_groups + g];
@@ -944,7 +951,6 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                     float *outp[3];
                     size_t strides[3];
                     int c;
-                    (void)lf_per_row;
 
                     memset(&hp, 0, sizeof(hp));
                     hp.num_hf_presets = vd.num_hf_presets;

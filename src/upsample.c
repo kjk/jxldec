@@ -106,9 +106,7 @@ static float up_dot25(const float *a, const float *b) {
    has to be gathered into nb[] at all, each tap is one unaligned load, and
    the 25 products accumulate in the plain scalar order -- no horizontal
    reduction per output, and the result is bit-identical to the scalar path
-   rather than merely close to it, which the per-tap version was not.
-
-   Returns the number of input samples consumed, always 4. */
+   rather than merely close to it, which the per-tap version was not. */
 static void up_block4(const float *const *srow, uint32_t x, uint32_t N,
                       const float *kernel, float *dst_rows[8], uint32_t ny) {
     __m128 vlo, vhi;

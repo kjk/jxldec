@@ -38,6 +38,12 @@ void jxl_splines_free(jxl_ctx *ctx, jxl_splines *sp) {
     memset(sp, 0, sizeof(*sp));
 }
 
+/* libjxl's kSplinePosLimit (ValidateSplinePointPos): not in the spec, but it
+   rejects anything outside, and it is what keeps the int64 accumulation below
+   and the float-to-int conversions in the renderer from overflowing. */
+#define SPLINE_POS_LIMIT ((int64_t)1 << 23)
+#define SPLINE_POS_OK(v) ((v) > -SPLINE_POS_LIMIT && (v) < SPLINE_POS_LIMIT)
+
 int jxl_splines_read(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
                      jxl_splines *out) {
     jxl_dec dec;
@@ -76,6 +82,12 @@ int jxl_splines_read(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
         sx[i] = prev_x;
         sy[i] = prev_y;
     }
+    for (i = 0; i < num_splines; i++) {
+        if (!SPLINE_POS_OK(sx[i]) || !SPLINE_POS_OK(sy[i])) {
+            JXL_ERR(ctx, "splines: coordinates out of bounds");
+            goto done;
+        }
+    }
 
     out->quant_adjust = jxl_unpack_signed(jxl_dec_read(&dec, br, 0));
     out->splines = (jxl_quant_spline *)jxl_calloc(ctx, num_splines,
@@ -109,6 +121,11 @@ int jxl_splines_read(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
             dy_acc += jxl_unpack_signed(jxl_dec_read(&dec, br, 4));
             cx += dx_acc;
             cy += dy_acc;
+            if (!SPLINE_POS_OK(dx_acc) || !SPLINE_POS_OK(dy_acc) ||
+                !SPLINE_POS_OK(cx) || !SPLINE_POS_OK(cy)) {
+                JXL_ERR(ctx, "splines: coordinates out of bounds");
+                goto done;
+            }
             if (cx == prev_px && cy == prev_py) {
                 JXL_ERR(ctx, "splines: duplicate control point");
                 goto done;
@@ -337,6 +354,14 @@ static int upsample_points(jxl_ctx *ctx, const jxl_quant_spline *qs,
     return 0;
 }
 
+/* (int32_t)v clamped to [0, hi], without converting an out-of-range or NaN
+   float (undefined behaviour). hi is at most 2^30. */
+static int32_t spline_clamp_to(float v, uint32_t hi) {
+    if (!(v > 0.0f)) return 0;
+    if ((double)v >= (double)hi) return (int32_t)hi;
+    return (int32_t)v;
+}
+
 int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,
                        const jxl_frame_header *fh, float corr_x, float corr_b) {
     uint32_t si, cw, ch;
@@ -439,9 +464,10 @@ int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,
             }
             if (nsamples >= cap) break;
         }
-        if (nsamples == 0) continue;
-
         total_arclength = (float)nsamples - 2.0f + arc_len[nsamples - 1];
+        /* A zero-length spline draws nothing (libjxl skips it too); letting
+           it through divides 0 by 0 below and adds NaN to the image. */
+        if (!(total_arclength > 0.0f)) continue;
         for (i = 0; i < nsamples; i++) {
             float from_start = (float)i / total_arclength;
             float t, sigma, inv_sigma, values[3], max_color, max_distance;
@@ -472,14 +498,13 @@ int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,
 
             px = arc_pt[i].x;
             py = arc_pt[i].y;
-            xb = (int32_t)floorf(px - max_distance + 0.5f);
-            xe = (int32_t)floorf(px + max_distance + 1.5f);
-            yb = (int32_t)floorf(py - max_distance + 0.5f);
-            ye = (int32_t)floorf(py + max_distance + 1.5f);
-            if (xb < 0) xb = 0;
-            if (yb < 0) yb = 0;
-            if (xe > (int32_t)cw) xe = (int32_t)cw;
-            if (ye > (int32_t)ch) ye = (int32_t)ch;
+            /* Clamped as floats: sigma comes from the file and can make
+               max_distance huge or infinite, which must not reach the int
+               conversion. In range this is the same box as before. */
+            xb = spline_clamp_to(floorf(px - max_distance + 0.5f), cw);
+            xe = spline_clamp_to(floorf(px + max_distance + 1.5f), cw);
+            yb = spline_clamp_to(floorf(py - max_distance + 0.5f), ch);
+            ye = spline_clamp_to(floorf(py + max_distance + 1.5f), ch);
 
             for (c = 0; c < 3; c++) vs[c] = 0.25f * values[c] * sigma;
 

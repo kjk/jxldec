@@ -112,8 +112,8 @@ cd ..\winperf && bun cmd/build.ts -release
 ```
 
 The clone requires access to the private repository. The vendored header is a
-copy of `..\winperf\client\winperf_control.h` and has drifted from it (the
-two currently differ); re-copy it before relying on newer winperf features.
+copy of `..\winperf\client\winperf_control.h` plus a three-line "vendored
+from" note at the top; re-copy it before relying on newer winperf features.
 
 ```
 bun cmd/prof.ts <file.jxl> [-runs N] [-hz N] [-vs]

@@ -1531,16 +1531,14 @@ static void rct_inverse(jxl_transform *tr, jxl_chanlist *cl) {
         &cl->chans[begin + (permutation + 2 - permutation / 3) % 3];
     uint32_t x, y;
 
-    /* A zero custom transform is only a channel permutation. Moving the
-       channel views avoids touching the image and matches the same shortcut
-       in libjxl. */
-    if (type == 0) {
-        jxl_mchan ia = *a, ib = *b, ic = *c;
-        *od = ia;
-        *oe = ib;
-        *of = ic;
-        return;
-    }
+    /* rct_type 0 is the identity. A pure permutation (type 0, permutation
+       != 0) must go through the kernels below and move the samples: swapping
+       the jxl_mchan views instead is invisible to the callers, which read the
+       image through jxl_modular.base[], and it breaks squeeze_inverse's
+       assumption that a residual sits right after its channel in one buffer.
+       The kernels load all three samples before storing, so they are safe
+       in place. */
+    if (tr->rct_type == 0) return;
 
 #ifdef JXL_MODULAR_AVX2
     if (jxl_has_avx2()) {
@@ -1582,18 +1580,21 @@ static void rct_inverse(jxl_transform *tr, jxl_chanlist *cl) {
     }
 }
 
-static int32_t squeeze_tendency(int32_t a, int32_t b, int32_t c) {
+/* All in 64 bits, like libjxl's SmoothTendency: a - b alone overflows int32
+   for extreme (corrupt) samples. The result is truncated as before. */
+static int32_t squeeze_tendency(int32_t a32, int32_t b32, int32_t c32) {
+    int64_t a = a32, b = b32, c = c32;
     if (a >= b && b >= c) {
-        int32_t x = (int32_t)((4 * (int64_t)a - 3 * (int64_t)c - b + 6) / 12);
+        int64_t x = (4 * a - 3 * c - b + 6) / 12;
         if (x - (x & 1) > 2 * (a - b)) x = 2 * (a - b) + 1;
         if (x + (x & 1) > 2 * (b - c)) x = 2 * (b - c);
-        return x;
+        return (int32_t)x;
     }
     if (a <= b && b <= c) {
-        int32_t x = (int32_t)((4 * (int64_t)a - 3 * (int64_t)c - b - 6) / 12);
+        int64_t x = (4 * a - 3 * c - b - 6) / 12;
         if (x + (x & 1) < 2 * (a - b)) x = 2 * (a - b) - 1;
         if (x - (x & 1) < 2 * (b - c)) x = 2 * (b - c);
-        return x;
+        return (int32_t)x;
     }
     return 0;
 }
@@ -2119,6 +2120,9 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
     int rc = -1;
 
     if (cl->n == 0) return -1;
+    /* libjxl computes every implicit palette value at min(bit_depth, 24),
+       which also keeps the shifts and products below inside int32. */
+    if (bit_depth > 24) bit_depth = 24;
     pal = cl->chans[0];
     chanlist_remove_range(cl, 0, 1);
     begin = tr->begin_c;
@@ -2161,9 +2165,17 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
                 }
             } else if (index >= nb_colours) {
                 int32_t idx = index - nb_colours;
+                /* Implicit colours are RGB only: libjxl returns 0 for any
+                   further channel, and idx >> (2 * c) is not even defined
+                   once c reaches 16. */
                 if (idx < 64) {
                     for (c = 0; c < num_c; c++) {
-                        int32_t v = ((idx >> (2 * c)) % 4) *
+                        int32_t v;
+                        if (c >= 3) {
+                            targets[c].data[(size_t)y * targets[c].stride + x] = 0;
+                            continue;
+                        }
+                        v = ((idx >> (2 * c)) % 4) *
                                         ((int32_t)(1u << bit_depth) - 1) / 4 +
                                     (int32_t)(1u << (bit_depth >= 3 ? bit_depth - 3 : 0));
                         targets[c].data[(size_t)y * targets[c].stride + x] = v;
@@ -2171,6 +2183,10 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
                 } else {
                     int32_t k = idx - 64;
                     for (c = 0; c < num_c; c++) {
+                        if (c >= 3) {
+                            targets[c].data[(size_t)y * targets[c].stride + x] = 0;
+                            continue;
+                        }
                         targets[c].data[(size_t)y * targets[c].stride + x] =
                             (k % 5) * ((int32_t)(1u << bit_depth) - 1) / 4;
                         k /= 5;
@@ -2810,7 +2826,9 @@ modular_decode_grad_wp_nec(jxl_mchan *ch, jxl_pred_state *ps,
        every predictor error term zero -- also fixes the properties this
        track computes: 9 is v, 10 to 12 and 15 are 0. The leaf then depends
        on v alone, and every predictor it can name returns v (or 0 for the
-       zero predictor), so both are kept for the last flat value. While the
+       zero predictor) -- except JXL_PRED_AVG_ALL, which also reads NN and
+       NEE and so takes the general path -- so both are kept for the last
+       flat value. While the
        decoded sample is v again the state stays flat, and the only things
        that change from one sample to the next are the errors and the value
        at NE: that is the inner loop below, which is where the background of
@@ -2818,6 +2836,7 @@ modular_decode_grad_wp_nec(jxl_mchan *ch, jxl_pred_state *ps,
     const int flat_ok = ps->use_sc && ps->sc.default_wp;
     const jxl_ma_leaf *flat_leaf = NULL;
     int32_t flat_v = 0, flat_pred = 0;
+    int flat_usable = 0;
 
 #define JXL_GRAD_WP_SAMPLE(COMPUTE_PROPS, PREDICT_SAMPLE, RECORD_SAMPLE) do { \
         jxl_props pr;                                                         \
@@ -2881,7 +2900,12 @@ modular_decode_grad_wp_nec(jxl_mchan *ch, jxl_pred_state *ps,
                         flat_v = v;
                         flat_pred =
                             flat_leaf->predictor == JXL_PRED_ZERO ? 0 : v;
+                        /* The one predictor the flat test does not pin down:
+                           it also reads NN and NEE. */
+                        flat_usable =
+                            flat_leaf->predictor != JXL_PRED_AVG_ALL;
                     }
+                    if (!flat_usable) goto not_flat;
                     /* The run reads one cluster, so with ANS its histogram
                        and the coder state are held here for the duration. */
                     hist = dec->use_prefix ? NULL : &dec->ans[flat_leaf->cluster];
@@ -2966,6 +2990,7 @@ modular_decode_grad_wp_nec(jxl_mchan *ch, jxl_pred_state *ps,
                     x--;
                     continue;
                 }
+            not_flat:
                 JXL_GRAD_WP_SAMPLE(
                     props_compute_grad_wp_nec(
                         ps, &pr, channel, stream_idx),

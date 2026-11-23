@@ -70,7 +70,6 @@ void jxl_free(jxl_ctx *ctx, void *ptr);
 void jxl_errorf(jxl_ctx *ctx, jxl_severity sev, const char *fmt, ...);
 
 #define JXL_ERR(ctx, ...)  jxl_errorf((ctx), JXLDEC_SEVERITY_ERROR, __VA_ARGS__)
-#define JXL_WARN(ctx, ...) jxl_errorf((ctx), JXLDEC_SEVERITY_WARNING, __VA_ARGS__)
 
 /* Overflow-checked multiply for allocation sizes. Returns 0 on overflow. */
 int jxl_size_mul(size_t a, size_t b, size_t *out);
@@ -144,8 +143,6 @@ uint64_t jxl_br_u64(jxl_br *br);
 float jxl_br_f16(jxl_br *br);
 uint32_t jxl_br_enum(jxl_br *br);
 void jxl_br_zero_pad_to_byte(jxl_br *br);
-/* Bytes consumed so far, rounded up (valid right after zero_pad_to_byte). */
-size_t jxl_br_byte_pos(const jxl_br *br);
 /* Reposition to an absolute byte offset in the underlying buffer. */
 void jxl_br_seek_byte(jxl_br *br, size_t byte_off);
 
@@ -805,7 +802,7 @@ typedef enum {
 } jxl_toc_kind;
 
 typedef struct {
-    size_t offset;     /* byte offset from the start of the frame header */
+    size_t offset;     /* absolute byte offset into the codestream buffer */
     uint32_t size;
 } jxl_toc_entry;
 
@@ -815,7 +812,7 @@ typedef struct {
     uint32_t num_lf_groups;
     uint32_t num_groups;
     uint32_t num_passes;
-    size_t total_size;        /* sum of all section sizes */
+    uint64_t total_size;      /* sum of all section sizes */
     size_t end_off;           /* byte offset just past the TOC */
 } jxl_toc;
 

@@ -153,10 +153,6 @@ void jxl_br_zero_pad_to_byte(jxl_br *br) {
     }
 }
 
-size_t jxl_br_byte_pos(const jxl_br *br) {
-    return (jxl_br_bits_read(br) + 7) / 8;
-}
-
 void jxl_br_seek_byte(jxl_br *br, size_t byte_off) {
     if (byte_off > br->len) {
         br->err = 1;

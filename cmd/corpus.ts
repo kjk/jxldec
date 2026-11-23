@@ -9,7 +9,7 @@
 // JXL_SPECS=<dir> overrides the corpus with any directory of .jxl files
 // (scanned recursively), the way DJVU_SPECS does in djvudec.
 import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "fs";
-import { basename, dirname, isAbsolute, join, relative } from "path";
+import { basename, dirname, join, relative } from "path";
 import { DEPS_DIR, LIBJXL_DIR, refTool } from "./get-deps";
 import { pngToPam } from "./png";
 
@@ -303,28 +303,17 @@ export function selectFiles(usageText: string, valueFlags = ["-rand", "-cpu", "-
   process.exit(2);
 }
 
-export function fmtBytesHuman(n: number): string {
-  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(2)} GB`;
-  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MB`;
-  if (n >= 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${n} B`;
-}
-
-export function fileLabel(f: string, root: string): string {
-  let rel = relative(root, f);
-  if (rel.startsWith("..") || isAbsolute(rel)) rel = f;
-  rel = rel.replaceAll("\\", "/");
-  return `${rel} (${fmtBytesHuman(statSync(f).size)})`;
-}
-
 export function corpusSummary(): string {
   const src = process.env.JXL_SPECS
     ? `JXL_SPECS=${process.env.JXL_SPECS}`
     : `deps/corpus (generated from libjxl testdata; ${PRESETS.length} presets)`;
-  const dir = process.env.JXL_SPECS ?? GEN_DIR;
-  const n = existsSync(dir)
-    ? walk(dir, (x) => x.toLowerCase().endsWith(".jxl")).length
-    : 0;
+  // The set corpusFiles() returns, counted without generating anything: the
+  // cached gen/ files plus the .jxl files that ship in libjxl's testdata.
+  const isJxl = (x: string) => x.toLowerCase().endsWith(".jxl");
+  const n = process.env.JXL_SPECS
+    ? walk(process.env.JXL_SPECS, isJxl).length
+    : walk(GEN_DIR, isJxl).length +
+      walk(join(LIBJXL_DIR, "testdata", "jxl"), isJxl).length;
   return `${n} .jxl file(s) available from ${src}`;
 }
 

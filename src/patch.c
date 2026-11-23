@@ -31,20 +31,11 @@ int jxl_patches_read(jxl_ctx *ctx, jxl_br *br, const jxl_image_metadata *meta,
     uint32_t num_refs, i;
     uint32_t max_refs, max_patches, total = 0;
     uint32_t nblend = meta->num_extra + 1;
-    uint32_t first_alpha = 0;
-    uint32_t nalpha = 0;
     int rc = -1;
 
     memset(out, 0, sizeof(*out));
     memset(&dec, 0, sizeof(dec));
     out->nblend = nblend;
-
-    for (i = 0; i < meta->num_extra; i++) {
-        if (meta->ec_info[i].type == JXL_EC_ALPHA) {
-            if (nalpha == 0) first_alpha = i;
-            nalpha++;
-        }
-    }
 
     if (jxl_dec_init(ctx, &dec, br, 10) != 0) return -1;
     jxl_dec_begin(&dec, br);
@@ -79,12 +70,15 @@ int jxl_patches_read(jxl_ctx *ctx, jxl_br *br, const jxl_image_metadata *meta,
         pr->y0 = jxl_dec_read(&dec, br, 3);
         pr->width = jxl_dec_read(&dec, br, 2) + 1;
         pr->height = jxl_dec_read(&dec, br, 2) + 1;
-        count = jxl_dec_read(&dec, br, 7) + 1;
-        total += count;
-        if (total > max_patches || br->err || dec.err) {
+        count = jxl_dec_read(&dec, br, 7);
+        /* Checked before the +1 and before the sum, so neither can wrap
+           past the cap (total <= max_patches holds on entry). */
+        if (count >= max_patches - total || br->err || dec.err) {
             JXL_ERR(ctx, "patches: too many patches");
             goto done;
         }
+        count += 1;
+        total += count;
         pr->targets = (jxl_patch_target *)jxl_calloc(ctx, count,
                                                      sizeof(jxl_patch_target));
         if (!pr->targets) goto done;
@@ -116,10 +110,20 @@ int jxl_patches_read(jxl_ctx *ctx, jxl_br *br, const jxl_image_metadata *meta,
                     goto done;
                 }
                 tg->blending[b].mode = (uint8_t)raw;
-                if (raw >= 4 && nalpha >= 2) {
-                    tg->blending[b].alpha_channel = jxl_dec_read(&dec, br, 8);
+                /* libjxl (and the spec) key this on the number of extra
+                   channels, not of alpha channels, and default to channel 0;
+                   jxl-oxide counts alpha channels, which desyncs the stream
+                   for e.g. alpha + depth. */
+                if (raw >= 4 && meta->num_extra > 1) {
+                    uint32_t ac = jxl_dec_read(&dec, br, 8);
+                    if (ac >= meta->num_extra) {
+                        JXL_ERR(ctx, "patches: invalid alpha channel %u",
+                                (unsigned)ac);
+                        goto done;
+                    }
+                    tg->blending[b].alpha_channel = ac;
                 } else {
-                    tg->blending[b].alpha_channel = first_alpha;
+                    tg->blending[b].alpha_channel = 0;
                 }
                 tg->blending[b].clamp =
                     (raw >= 3) ? (jxl_dec_read(&dec, br, 9) != 0) : 0;

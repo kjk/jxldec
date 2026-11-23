@@ -349,7 +349,9 @@ static int decode_icc(jxl_ctx *ctx, const uint8_t *stream, size_t stream_len,
                 char tagbuf[4];
                 uint32_t tagstart, tagsize;
 
-                if (bc_u8(&cmds, &command) != 0) goto finish;
+                /* Running out of commands here is a valid end, as in libjxl;
+                   the size check after the main loop still has to hold. */
+                if (bc_u8(&cmds, &command) != 0) break;
                 tagcode = command & 63;
                 if (tagcode == 0) break;
                 if (tagcode == 1) {
@@ -409,7 +411,10 @@ static int decode_icc(jxl_ctx *ctx, const uint8_t *stream, size_t stream_len,
                     bb_push_be32(&out, tagstart + tagsize * 2);
                     bb_push_be32(&out, tagsize);
                 }
-                if (cmds.err) goto finish;
+                if (cmds.err || out.err || out.len > (size_t)output_size) {
+                    JXL_ERR(ctx, "icc: invalid tag table");
+                    goto done;
+                }
             }
         }
     }
@@ -453,7 +458,9 @@ static int decode_icc(jxl_ctx *ctx, const uint8_t *stream, size_t stream_len,
             } else {
                 stride = width;
             }
-            if (stride * 4 >= out.len) {
+            /* stride * 4 >= out.len, written so a huge stride cannot wrap the
+               product to something small (libjxl spells it the same way). */
+            if (out.len == 0 || ((out.len - 1) >> 2) < stride) {
                 JXL_ERR(ctx, "icc: stride too large");
                 goto done;
             }
@@ -508,6 +515,8 @@ static int decode_icc(jxl_ctx *ctx, const uint8_t *stream, size_t stream_len,
             goto done;
         }
         if (cmds.err || out.err) goto done;
+        /* Output only grows, so past the declared size it can never match. */
+        if (out.len > (size_t)output_size) break;
     }
 
     if (out.len != (size_t)output_size) {

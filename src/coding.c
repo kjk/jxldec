@@ -769,7 +769,10 @@ int jxl_read_clusters(jxl_ctx *ctx, jxl_br *br, uint32_t num_dist,
                 JXL_ERR(ctx, "context map: LZ77 not allowed");
                 return -1;
             }
-            if (dec_parse_inner(ctx, &sub, br, 1) != 0) return -1;
+            if (dec_parse_inner(ctx, &sub, br, 1) != 0) {
+                jxl_dec_free(&sub);
+                return -1;
+            }
         } else {
             if (jxl_dec_init(ctx, &sub, br, 1) != 0) return -1;
         }
@@ -909,7 +912,14 @@ int jxl_dec_init(jxl_ctx *ctx, jxl_dec *dec, jxl_br *br, uint32_t num_dist) {
         }
         num_dist += 1;
     }
-    return dec_parse_inner(ctx, dec, br, num_dist);
+    /* dec_parse_inner bails out mid-way with whatever it had allocated, and
+       most callers just return on failure, so release it here: a failed init
+       leaves *dec zeroed and safe to pass to jxl_dec_free again. */
+    if (dec_parse_inner(ctx, dec, br, num_dist) != 0) {
+        jxl_dec_free(dec);
+        return -1;
+    }
+    return 0;
 }
 
 /* Lazily allocated: only LZ77 streams need the 4 MB window, and it does

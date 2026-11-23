@@ -204,6 +204,11 @@ int jxl_hf_block_ctx_read(jxl_ctx *ctx, jxl_br *br, jxl_hf_block_ctx *bc) {
     if (jxl_read_clusters(ctx, br, bc->block_ctx_map_len, bc->block_ctx_map,
                           &bc->num_block_clusters) != 0)
         return -1;
+    /* libjxl's limit (entropy_coder.cc). */
+    if (bc->num_block_clusters > 16) {
+        JXL_ERR(ctx, "vardct: too many block contexts");
+        return -1;
+    }
     return 0;
 }
 
@@ -252,7 +257,6 @@ typedef struct jxl_dq_encoding {
     float fixed[3][9];
     float denominator;
     int32_t *raw[3];
-    uint32_t raw_w, raw_h;
 } jxl_dq_encoding;
 
 static void dq_seq(jxl_dq_encoding *e, float a, float b, float c) {
@@ -639,7 +643,6 @@ int jxl_dequant_matrices_read(jxl_ctx *ctx, jxl_br *br,
     for (slot = 0; slot < 17; slot++) {
         int tr = dq_slot_tr[slot];
         uint32_t mw, mh;
-        int c;
 
         memset(&mod, 0, sizeof(mod));
         memset(&cl, 0, sizeof(cl));
@@ -660,8 +663,19 @@ int jxl_dequant_matrices_read(jxl_ctx *ctx, jxl_br *br,
             memset(e, 0, sizeof(*e));
             switch (mode) {
                 case 0: dq_default(e, tr); break;
-                case 1: e->mode = 1; read_fixed(br, e->fixed, 3); break;
-                case 2: e->mode = 2; read_fixed(br, e->fixed, 6); break;
+                /* libjxl scales both by 64 after reading (quant_weights.cc,
+                   kQuantModeID / kQuantModeDCT2); the built-in defaults are
+                   already in that domain. jxl-oxide omits it. */
+                case 1:
+                case 2: {
+                    int ci, i, nw = mode == 1 ? 3 : 6;
+                    e->mode = (int)mode;
+                    read_fixed(br, e->fixed, nw);
+                    for (ci = 0; ci < 3; ci++) {
+                        for (i = 0; i < nw; i++) e->fixed[ci][i] *= 64.0f;
+                    }
+                    break;
+                }
                 case 3:
                     e->mode = 3;
                     read_fixed(br, e->fixed, 2);
@@ -707,8 +721,6 @@ int jxl_dequant_matrices_read(jxl_ctx *ctx, jxl_br *br,
                         goto done;
                     if (jxl_modular_inverse(ctx, &mod, &cl) != 0) goto done;
                     for (k = 0; k < 3; k++) e->raw[k] = mod.base[k].data;
-                    e->raw_w = mw;
-                    e->raw_h = mh;
                     break;
                 }
             }
@@ -720,7 +732,6 @@ int jxl_dequant_matrices_read(jxl_ctx *ctx, jxl_br *br,
         if (e->mode == 7) {
             if (jxl_dequant_matrices_ensure(ctx, dm, tr) != 0) goto done;
         }
-        (void)c;
         jxl_chanlist_free(ctx, &cl);
         jxl_modular_free(ctx, &mod);
     }
@@ -833,6 +844,12 @@ int jxl_hf_pass_read(jxl_ctx *ctx, jxl_br *br, jxl_hf_pass *hp,
         goto done;
     }
 
+    /* 495 * presets * clusters must not wrap: the per-group cluster_base
+       check in jxl_write_hf_coeff relies on num_dist being the true product. */
+    if ((uint64_t)495 * num_hf_presets * bc->num_block_clusters > 0x7fffffffu) {
+        JXL_ERR(ctx, "vardct: too many HF distributions");
+        goto done;
+    }
     if (jxl_dec_init(ctx, &hp->dist, br,
                      495 * num_hf_presets * bc->num_block_clusters) != 0)
         goto done;

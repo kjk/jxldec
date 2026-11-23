@@ -1750,6 +1750,58 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Whole-project audit: two decode bugs, parser hardening, libjxl divergences
+A read of every source file against libjxl and jxl-oxide. None of what follows
+was visible to `cmd/tests.ts`: the corpus still decodes 1245/1245 with the
+same per-file numbers before and after, which is the point -- each item lives
+in a path no corpus file takes.
+
+Wrong pixels on valid files (both reproduced against `djxl`, then fixed):
+- **Permutation-only RCT** (`cjxl -d 0 -C 7`, also 14/21/28/35). `rct_inverse`
+  "applied" a type-0 RCT by swapping `jxl_mchan` views in the chanlist, but
+  every consumer reads `jxl_modular.base[]`, so the permutation was dropped
+  (max diff 120 on a 64px test image). It also broke `squeeze_inverse`'s
+  assumption that a residual sits right behind its channel in one buffer. The
+  shortcut is gone; the kernels move the samples.
+- **`JXL_PRED_AVG_ALL` in the flat-run fast path** (`cjxl -d 0 -e 5 -P 13`):
+  "bad ANS final state". The flat test pins W, N, NW, NE but AVG_ALL also
+  reads NN and NEE; such leaves now take the general path.
+
+Memory safety / undefined behaviour reachable from a crafted file:
+- ICC predictor `stride * 4 >= out.len` wrapped for a huge stride, giving a
+  wild `memcpy` source. Now libjxl's overflow-safe form.
+- A VarDCT frame with `USE_LF_FRAME` after a one-colour-plane (gray, Modular)
+  LF frame read `lf_image.plane[1..2]` past the plane array.
+- Patch count `total += count` wrapped past `max_patches`.
+- `bits_per_sample` was never range-checked (1..64, then `1u << bits`); now
+  libjxl's limits. Palette implicit colours clamp the bit depth to 24 and
+  write 0 for channels past RGB, as libjxl does.
+- `495 * presets * clusters` could wrap in 32 bits; block-context clusters
+  are capped at 16 (libjxl's limit) and the product is checked.
+- Splines: libjxl's +-2^23 position limit, a zero-arc-length spline is
+  skipped instead of adding NaN, and the splat box is clamped as floats.
+- `squeeze_tendency` in int64; noise LUT index clamped before conversion.
+- The frame walk computed a frame's end in `size_t`; on 32-bit a wrapped
+  value could re-parse the same frame forever. Now 64-bit.
+- `jxl_dec_init` leaked its partial allocations on a bad histogram (most
+  callers just return); it frees them itself now.
+
+Header parsing brought in line with libjxl where jxl-oxide differs:
+- extra-channel `BlendingInfo.source` is conditional on that channel's own
+  mode, not the colour channels';
+- the patch alpha-channel symbol is read when `num_extra_channels > 1`, not
+  when there are two alpha channels;
+- custom Hornuss / DCT2 dequant weights are scaled by 64;
+- an ICC command stream that ends inside the tag table still has to produce
+  `output_size` bytes.
+
+Still open (found, not fixed -- each needs a test file or a design decision):
+frame compositing for zero-duration layers and the reference-slot rule
+(`walk_frames`), the preview frame is not skipped, extra channels are scaled
+with the colour bit depth, float samples are read as integers, Modular frames
+never get Gaborish/EPF, palette `nb_deltas` channel width, and the quadratic
+Lehmer decode in `jxl_read_permutation`.
+
 ### Optional sRGB output for linear-light images
 SumatraPDF issue #5919: a 6000x4000 photo came out dark and over-contrasty
 next to the Windows Photos app. The file is xyb-encoded, 16-bit, no ICC, sRGB
