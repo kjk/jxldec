@@ -77,7 +77,10 @@ void jxl_ctx_set_srgb_output(jxl_ctx *ctx, int enable);
    jxl_doc_frame_info, jxl_doc_frame_count) stop at the next frame or group
    boundary and fail: NULL / -1 (jxl_doc_frame_count returns 1). Renders that
    start after the call run normally. The doc stays usable; render again to
-   get the frame. */
+   get the frame.
+   The frame count of an animation is found by a walk over its frame headers
+   that the same abort interrupts, so jxl_doc_info and jxl_decode_size, which
+   report it, then say num_frames = 1 for that one call. */
 void jxl_request_abort(jxl_ctx *ctx);
 
 /* ----- signature detection ----- */
@@ -129,7 +132,10 @@ typedef struct {
 /* Fill *info. Returns 0 on success, -1 on error. */
 int jxl_doc_info(jxl_doc *doc, jxl_image_info *info);
 
-/* Number of animation frames (>= 1). Still images report 1. */
+/* Number of animation frames: 1 for a still image, without looking past the
+   image header. For an animation the first call reads every frame header
+   (no pixels) and the answer is cached; a truncated animation reports the
+   frames it could find, at least 1. Returns 0 only for a NULL doc. */
 int jxl_doc_frame_count(jxl_doc *doc);
 
 /* Embedded ICC profile of the original color space, or NULL if the image has
@@ -164,7 +170,8 @@ typedef struct {
     uint8_t *data;     /* top-down */
 } jxl_image;
 
-/* Decode a frame (0-based; 0 is the first/only frame of a still image).
+/* Decode a frame (0-based; 0 is the first/only frame of a still image). Each
+   frame comes back composited onto the full canvas, as it is displayed.
    Frames may be requested in any order. No decode state is kept on the doc:
    each call re-decodes frames 0..N (so blending and reference frames work),
    which makes playing an N-frame animation O(N^2) in frame decodes.
@@ -191,9 +198,9 @@ int jxl_frame_render_info(jxl_doc *doc, int frame_no, jxl_format fmt,
 int jxl_frame_render_into(jxl_doc *doc, int frame_no, jxl_format fmt,
                           uint8_t *dst, int stride);
 
-/* Per-frame animation timing / identity. jxl_doc_frame_info fully decodes
-   frames 0..frame_no to get there (as jxl_frame_render does), so it costs as
-   much as a render. */
+/* Per-frame animation timing / identity. Reads the frame headers up to
+   frame_no; no pixels are decoded. Returns 0 on success, -1 on error
+   (including a frame_no past the last frame). */
 typedef struct {
     int duration_ticks;  /* frame duration in animation ticks */
     int tps_numerator;   /* ticks per second = numerator / denominator */
@@ -209,7 +216,8 @@ int jxl_doc_frame_info(jxl_doc *doc, int frame_no, jxl_frame_info *info);
 jxl_image *jxl_decode(jxl_ctx *ctx, const uint8_t *data, size_t len,
                       jxl_format fmt);
 
-/* Header-only size query. Returns 0 on success, -1 on error. */
+/* Size query: jxl_doc_open + jxl_doc_info, so the image header only for a
+   still image. Returns 0 on success, -1 on error. */
 int jxl_decode_size(jxl_ctx *ctx, const uint8_t *data, size_t len,
                     int *width, int *height);
 
