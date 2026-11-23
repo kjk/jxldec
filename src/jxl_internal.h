@@ -472,6 +472,27 @@ static JXL_INLINE_HINT uint32_t jxl_ans_read_symbol(const jxl_ans_hist *h,
     *state = next_state;
     return symbol;
 }
+/* jxl_br_refill for a bit reader a hot loop holds in registers: the loop
+   copies a jxl_br's byte_pos, buf and nbits into three scalar locals and
+   passes their addresses only to inline helpers, so they never escape. Not a
+   local jxl_br: MSVC splits one only partly, and reloading the half it keeps
+   in memory as one 16-byte load, after two narrower stores, defeats store
+   forwarding -- a stall on every symbol. Only the fast case: in a stream's
+   last 8 bytes it does nothing, and the loop, finding too few bits, falls
+   back to the jxl_br functions on the synced jxl_br. */
+static JXL_INLINE_HINT void jxl_rbr_refill(const uint8_t *data, size_t len,
+                                           size_t *pos, uint64_t *buf,
+                                           int *nbits) {
+    uint64_t bits;
+    if (*pos + 8 > len) return;
+    memcpy(&bits, data + *pos, sizeof(bits));
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    bits = __builtin_bswap64(bits);
+#endif
+    *buf |= bits << *nbits;
+    *pos += (size_t)((63 - *nbits) >> 3);
+    *nbits |= 56;
+}
 /* The hybrid-uint tail of a token that is not its own value. */
 uint32_t jxl_dec_hybrid_uint(jxl_br *br, const jxl_int_config *cfg,
                              uint32_t token);
@@ -484,6 +505,63 @@ uint32_t jxl_dec_read_clustered_no_lz77(jxl_dec *dec, jxl_br *br,
 int jxl_dec_is_prefix_rle1(const jxl_dec *dec);
 uint32_t jxl_dec_read_prefix_rle1(jxl_dec *dec, jxl_br *br, uint32_t cluster,
                                   uint32_t *last, uint32_t *run, int *have);
+
+/* jxl_dec_read_prefix_rle1 for the effort-1 loop, on a bit reader held in
+   registers (jxl_rbr_refill). A symbol takes at most 46 bits -- a code of at
+   most 15 plus at most 31 raw bits -- so one refill when fewer remain covers
+   it and nothing after it is checked, as in libjxl's
+   ReadHybridUintClusteredHuffRleOnly. Returns 0 without consuming anything
+   when it cannot guarantee that (the last 8 bytes of the buffer) or when the
+   symbol is an error; the caller then takes jxl_dec_read_prefix_rle1, which
+   decodes the same symbol and reports the error. */
+static JXL_INLINE_HINT int jxl_dec_read_prefix_rle1_fast(
+    const jxl_dec *dec, const jxl_pfx_hist *h, const uint8_t *data,
+    size_t data_len, size_t *pos, uint64_t *bufp, int *nbitsp,
+    uint32_t *last, uint32_t *run, int *have) {
+    uint64_t buf;
+    int nbits;
+    uint32_t e, token, nb, len;
+    if (*nbitsp < 46) {
+        jxl_rbr_refill(data, data_len, pos, bufp, nbitsp);
+        if (*nbitsp < 46) return 0;
+    }
+    buf = *bufp;
+    nbits = *nbitsp;
+    e = h->root[buf & h->root_mask].bits;
+    if (e >> 24) {
+        e = h->sub[(e & 0xffff) +
+                   ((uint32_t)(buf >> h->root_bits) & ((e >> 16) & 0xff))].bits;
+    }
+    len = (e >> 16) & 0xff;
+    token = e & 0xffff;
+    buf >>= len;
+    if (token >= dec->min_symbol) {
+        const jxl_int_config *cfg = &dec->lz_len_conf;
+        uint32_t n;
+        if (!*have) return 0;
+        token -= dec->min_symbol;
+        if (token < cfg->split) {
+            n = token;
+            nb = 0;
+        } else {
+            nb = (cfg->split_exponent + token - cfg->split) & 31;
+            n = (1u << nb) | ((uint32_t)buf & ((1u << nb) - 1));
+        }
+        if (n > 0xffffffffu - dec->min_length) return 0;
+        *run = n + dec->min_length - 1;
+    } else if (token == 0) {
+        nb = 0;
+        *last = 0;
+        *have = 1;
+    } else {
+        nb = (token - 1) & 31;
+        *last = (1u << nb) | ((uint32_t)buf & ((1u << nb) - 1));
+        *have = 1;
+    }
+    *bufp = buf >> nb;
+    *nbitsp = nbits - (int)(len + nb);
+    return 1;
+}
 int jxl_dec_finalize(jxl_dec *dec);
 
 int jxl_read_clusters(jxl_ctx *ctx, jxl_br *br, uint32_t num_dist,

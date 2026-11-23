@@ -130,6 +130,12 @@ corpus file count. Select work explicitly: `file.jxl ...`, `-rand N`, `-all`.
 The one exception is `cmd/coverage.ts`, which decodes the whole corpus when
 given no `-rand N`.
 
+**Helper scripts are Bun TypeScript** — every one, saved or temporary: the
+`cmd/*.ts` tools, and also throwaway scripts for a single investigation
+(editing sources, comparing hashes, summarising benchmark output, driving a
+timing loop). Run them with `bun`. No Python, no multi-line shell scripts;
+a one-line shell command is fine.
+
 ### Windows sampling profiles (winperf)
 
 The profiling harness vendors `test/winperf_control.h`, so a **winperf**

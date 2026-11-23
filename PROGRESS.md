@@ -1774,6 +1774,37 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Lossless alpha: the effort-1 loop, and a store-forwarding stall
+Subtracting each decoder's time on `flower.<preset>` from its time on
+`flower_alpha.<preset>` gives the alpha channel's own cost. For most presets
+that is within 0.94-1.09x of libjxl's. The VarDCT presets' remaining gap is
+colour, not alpha. Their alpha goes through the generic WP tree path, whose
+hottest instructions are the MA tree walk (dependent loads, one per level)
+and the ANS table lookup -- libjxl's `PredictTreeWPNEC` design, left alone.
+The outlier was effort 1 (`m_e1`, alpha 1.36x), and it was the effort-1
+loop as a whole, colour included.
+
+That loop called `pfx_read` and `jxl_br_refill` out of line and checked the
+bit reader three times per symbol. It now refills inline once whenever
+fewer than 46 bits are buffered (the most one symbol can take) and decodes
+with no further checks, as libjxl's `ReadHybridUintClusteredHuffRleOnly`
+does; a stream's last 8 bytes fall back to the checked reader. **-23%** on
+every effort-1 file (`flower.m_e1` 86 -> 67 ms, `flower_alpha.m_e1` 117 ->
+90, `hdr_room.m_e1` 5.6 -> 4.3). Pixels identical on all 1580 files, and
+identical results to the old build on 631 truncations of 8 `m_e1` files.
+
+The first version held the bit reader in a local `jxl_br` and made
+`hdr_room.m_e1` **60% slower** while `flower` got faster. Sampling by
+instruction address put two-thirds of the time on two instructions: MSVC
+split the struct only partly, storing `buf` (8 bytes) and `nbits` (4)
+separately each symbol and then reloading them as one 16-byte `movups`,
+which store forwarding cannot serve. A loop that keeps a bit reader in
+registers must use three scalar locals (`jxl_rbr_refill`), never a struct.
+
+Applying the same scalar reader to the VarDCT HF-coefficient loop was 1-2%
+*slower*: ANS consumes bits only on renormalisation, so the reader is not
+on that loop's critical path. Not kept.
+
 ### The four slowest file kinds: PQ, JPEG transcodes, resampled, 1/8 alpha
 Profiled first, two ways that need no Administrator prompt: stage timers in
 a scratch copy of the sources, and a 50 us sampler (a second thread suspends
