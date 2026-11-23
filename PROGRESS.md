@@ -94,10 +94,11 @@ for the exceptions.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1580-file corpus we are **about 0.99x libjxl** (0.988x after the HLG and
-gray-EPF work, 0.993x before it; see "Re-measured after the conformance
-work" in the log for the method, and the entry above it for the latest
-per-preset numbers). Before
+1580-file corpus we are **about 0.97x libjxl** (0.973x after the PQ,
+HF-coefficient and 8x-upsampling work; 0.988x after the HLG and gray-EPF
+work, 0.993x before that -- see "Re-measured after the conformance work" in
+the log for the method, and the two entries above it for per-preset
+numbers). Before
 that, over the 1245-file corpus, **about 1.10x libjxl** (the best-of-five sweep
 measured 18089.84ms against 16470.12ms, **1.0983x**; an immediately preceding
 best-of-three sweep measured 18195.22ms against 16560.84ms, **1.0987x**;
@@ -1787,6 +1788,13 @@ differs only in that change, pinned, interleaved, best of five.
 | 8x upsampling: one walk of the 25 inputs per output row, 8x8 transpose store | `v_ec8` 4-7% | bit-identical to scalar |
 
 Every corpus file renders bit-identically to before.
+
+Whole corpus afterwards (`31010b4` against `11d7830`, same method as before,
+all 1580 files): **0.9805x -> 0.9731x libjxl** -- lossless Modular 0.94x,
+lossy VarDCT 1.06x. PQ went 1.35x -> 1.06x; nothing else moved outside the
++-2% noise band in a run where libjxl's own total moved 8% between rounds.
+The slowest presets are now `v_ec8` (1.24x), `jpeg` (1.22x), `v_rs4` and
+`v_rs2` (1.22x, 1.21x).
 
 What did not work, and why the rest is where it is:
 - **JPEG transcodes** are half ANS symbol decoding -- the alias-table lookup

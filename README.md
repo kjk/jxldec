@@ -94,10 +94,12 @@ not decoded — untested, since no available file has one.
 ## Performance
 `bun cmd/bench.ts -all` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both single-threaded, best of N. Over the
-1580-file corpus this decoder takes **about 0.99x** libjxl's decode time
-(0.988x, best of two pinned rounds of best-of-three): lossless Modular
-0.94x, lossy VarDCT 1.08x. The slowest kinds of file are PQ (1.34x), JPEG
-transcodes (1.28x) and resampled frames (1.21-1.26x). libjxl is AVX2 throughout; the hot
+1580-file corpus this decoder takes **about 0.97x** libjxl's decode time
+(0.973x, best of two pinned rounds of best-of-three): lossless Modular
+0.94x, lossy VarDCT 1.06x. The slowest kinds of file are alpha stored at
+1/8 resolution (1.24x), JPEG transcodes (1.22x) and resampled frames
+(1.21-1.22x); for the last, the cost is memory rather than arithmetic (see
+PROGRESS.md). libjxl is AVX2 throughout; the hot
 loops here use runtime-selected SSE2/AVX2 kernels (noise, upsampling, EPF,
 gaborish, both DCT passes, YCbCr and XYB conversion, the sRGB transfer
 function and the output quantiser), so a constant factor is expected. Each
