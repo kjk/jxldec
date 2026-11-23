@@ -1771,6 +1771,36 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### HLG and gray Modular EPF, the two costs the re-measure found
+**HLG** (66 `v_hlg` files: 880 -> 627 ms, 1.47x -> 1.05x libjxl). The
+inverse OOTF did a `powf` per pixel and the HLG curve a `logf` per sample.
+libjxl evaluates both with FastLog2f / FastPow2f, which `color.c` already had
+for the 709 curve (scalar, SSE2, AVX2), so the OOTF ratio is now
+pow2(log2(y) * e) and the curve's log is ln 2 * fast_log2f, each with SSE2
+and AVX2 forms checked bit-identical to the scalar one (`-DJXL_COLOR_FORCE_SCALAR`
+against both, all 66 files). Against libjxl nothing moved: every HLG file
+has the same peak and RMS as before.
+
+**Gray Modular with Gaborish/EPF** (`grayscale_public_university`, 2880x1620:
+115 -> ~87 ms, already ahead of libjxl's ~135). Gray goes through the loop
+filters as three identical channels, as in libjxl, and they stay identical:
+Gaborish is per channel with (by default) the same weights, and EPF applies
+one set of weights per sample, computed from the distance summed over the
+channels, to each. So:
+- one buffer instead of three copies, and Gaborish once (custom weights that
+  differ by channel keep the old three-buffer path);
+- EPF has a `gray` form that reads and writes channel 0 and folds its
+  distance in as cs0 * a + cs1 * a + cs2 * a -- the operations the
+  three-channel code performs on equal channels, in the same order -- so
+  the output is bit-identical to filtering three copies. EPF went from ~47
+  to ~27 ms on this file.
+
+Each AVX2 EPF kernel body is written once with `gray` as a compile-time
+constant and instantiated twice through a force-inlined wrapper, so the
+three-channel path compiles to what it was. Checked: every non-HLG corpus
+file renders bit-identically to before in the default, `-DJXL_NO_AVX2` and
+`-DJXL_EPF_FORCE_SCALAR` builds.
+
 ### Re-measured after the conformance work
 The last numbers (1.10x) were from before the audit and the conformance
 fixes, on the 1245-file corpus. Measured again: `5fe3b66` (the last commit

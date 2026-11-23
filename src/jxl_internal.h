@@ -1014,11 +1014,15 @@ void jxl_fill_varblock_lf(float *coeff, size_t stride, int tr,
 /* filter -- gaborish and the edge-preserving filter                      */
 /* ===================================================================== */
 
-int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
-                    size_t stride, const float weights[3][2]);
-int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
-                  size_t stride, const float *sigma, uint32_t sigma_stride,
-                  const jxl_epf *epf);
+/* Filters plane[0..nchan-1] in place, each with its own weights. */
+int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], int nchan, uint32_t w,
+                    uint32_t h, size_t stride, const float weights[3][2]);
+/* gray: plane[0] is a grayscale image that libjxl would filter as three
+   identical channels; only plane[0] is read or written, and the result is
+   what filtering three identical channels gives. */
+int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], int gray, uint32_t w,
+                  uint32_t h, size_t stride, const float *sigma,
+                  uint32_t sigma_stride, const jxl_epf *epf);
 
 /* ===================================================================== */
 /* color -- XYB and transfer functions                                    */

@@ -224,7 +224,7 @@ static int modular_loop_filters(jxl_ctx *ctx, jxl_fimage *out,
     uint32_t w, h, bw, bh, ps, ph, x, y;
     uint32_t nc = out->ncolor;
     size_t count;
-    int c, rc = -1;
+    int c, rc = -1, shared;
 
     if (nc != 1 && nc != 3) return 0;
     if (out->nplane < nc) return 0;
@@ -241,7 +241,24 @@ static int modular_loop_filters(jxl_ctx *ctx, jxl_fimage *out,
     ph = bh * 8;
     if (ps % 1024 < 32 || ps % 1024 > 1024 - 32) ps += 64;
     if (!jxl_size_mul(ps, ph, &count)) return -1;
-    for (c = 0; c < 3; c++) {
+    /* Gray: the three channels start identical and stay identical. Gaborish
+       treats each channel alone, so with the same weights for all three it
+       makes the same plane three times; EPF takes one set of weights per
+       sample from the distance summed over the channels and applies it to
+       each, so identical inputs give identical outputs, pass after pass.
+       So one buffer stands for all three: Gaborish runs once, and EPF runs
+       in its gray form, which computes channel 0 and folds its distances
+       in with all three channel scales (jxl_apply_epf). Both are
+       bit-identical to filtering three copies, at a third of the work and
+       memory. Custom Gaborish weights that differ by channel break the
+       premise, and take the three-buffer path. */
+    shared = nc == 1 &&
+             (!fh->gab.enabled ||
+              (fh->gab.weights[1][0] == fh->gab.weights[0][0] &&
+               fh->gab.weights[1][1] == fh->gab.weights[0][1] &&
+               fh->gab.weights[2][0] == fh->gab.weights[0][0] &&
+               fh->gab.weights[2][1] == fh->gab.weights[0][1]));
+    for (c = 0; c < (shared ? 1 : 3); c++) {
         const jxl_fplane *src = &out->plane[nc == 1 ? 0 : c];
         buf[c] = (float *)jxl_calloc(ctx, count, sizeof(float));
         if (!buf[c]) goto done;
@@ -250,8 +267,11 @@ static int modular_loop_filters(jxl_ctx *ctx, jxl_fimage *out,
                    (size_t)w * sizeof(float));
         }
     }
+    if (shared) buf[1] = buf[2] = buf[0];
     if (fh->gab.enabled) {
-        if (jxl_apply_gabor(ctx, buf, w, h, ps, fh->gab.weights) != 0) goto done;
+        if (jxl_apply_gabor(ctx, buf, shared ? 1 : 3, w, h, ps,
+                            fh->gab.weights) != 0)
+            goto done;
     }
     if (fh->epf.enabled) {
         float s = fh->epf.sigma_for_modular;
@@ -259,7 +279,9 @@ static int modular_loop_filters(jxl_ctx *ctx, jxl_fimage *out,
         sigma = (float *)jxl_malloc(ctx, (size_t)bw * bh * sizeof(float));
         if (!sigma) goto done;
         for (x = 0; x < bw * bh; x++) sigma[x] = v;
-        if (jxl_apply_epf(ctx, buf, w, h, ps, sigma, bw, &fh->epf) != 0) goto done;
+        if (jxl_apply_epf(ctx, buf, shared, w, h, ps, sigma, bw,
+                          &fh->epf) != 0)
+            goto done;
     }
     for (c = 0; c < (int)nc; c++) {
         jxl_free(ctx, out->plane[c].data);
@@ -270,6 +292,7 @@ static int modular_loop_filters(jxl_ctx *ctx, jxl_fimage *out,
     rc = 0;
 
 done:
+    if (shared) buf[1] = buf[2] = NULL;   /* one allocation, freed once */
     for (c = 0; c < 3; c++) jxl_free(ctx, buf[c]);
     jxl_free(ctx, sigma);
     return rc;
@@ -1220,13 +1243,13 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
            500x500 and 510x532 corpus file by up to 10 counts. */
         for (c = 0; c < 3; c++) planes[c] = vd.coeff[c];
         if (fh->gab.enabled) {
-            if (jxl_apply_gabor(ctx, planes, color_w, color_h, vd.ps,
+            if (jxl_apply_gabor(ctx, planes, 3, color_w, color_h, vd.ps,
                                 fh->gab.weights) != 0)
                 goto done;
         }
         if (fh->epf.enabled) {
-            if (jxl_apply_epf(ctx, planes, color_w, color_h, vd.ps, vd.epf_sigma,
-                              vd.bw, &fh->epf) != 0)
+            if (jxl_apply_epf(ctx, planes, 0, color_w, color_h, vd.ps,
+                              vd.epf_sigma, vd.bw, &fh->epf) != 0)
                 goto done;
             for (c = 0; c < 3; c++) vd.coeff[c] = planes[c];
         }

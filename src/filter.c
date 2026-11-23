@@ -110,8 +110,8 @@ static void gabor_plane_avx2(float *plane, uint32_t w, uint32_t h,
 }
 #endif
 
-int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
-                    size_t stride, const float weights[3][2]) {
+int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], int nchan, uint32_t w,
+                    uint32_t h, size_t stride, const float weights[3][2]) {
     float *ring;
     int c;
 #ifdef JXL_EPF_SSE2
@@ -128,7 +128,7 @@ int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
     ring = (float *)jxl_malloc(ctx, (size_t)w * 2 * sizeof(float));
     if (!ring) return -1;
 
-    for (c = 0; c < 3; c++) {
+    for (c = 0; c < nchan; c++) {
         float w0 = weights[c][0], w1 = weights[c][1];
         float gw = 1.0f / (1.0f + w0 * 4.0f + w1 * 4.0f);
         uint32_t x, y;
@@ -213,7 +213,20 @@ static const int8_t epf_dist_2[1][2] = {{0,0}};
 
 /* The weight is 1 + dist * (a negative constant / sigma * step_mul). Sigma
    and step_mul are fixed for a whole sample, so the reciprocal is hoisted out
-   of the tap loop; only the multiply-add stays per tap. */
+   of the tap loop; only the multiply-add stays per tap.
+
+   Gray. A grayscale Modular frame is filtered as three identical channels
+   (that is what libjxl's pipeline does), and they stay identical through
+   every pass: the weights come from the distance summed over the channels
+   and are applied to each. So every kernel below has a `gray` form that
+   reads and writes channel 0 only. Its distance is still folded in as
+   cs0 * a + cs1 * a + cs2 * a, term by term in channel order -- exactly the
+   operations the three-channel code performs on three equal channels -- so
+   the result is bit-identical to filtering all three, at about a third of
+   the work. Each AVX2 kernel body is written once with `gray` as a
+   compile-time constant and instantiated twice through a force-inlined
+   wrapper, so the three-channel path compiles to what it was. */
+#define JXL_EPF_NCH(gray) ((gray) ? 1 : 3)
 #ifdef JXL_EPF_SSE2
 /* epf_pass, eight samples at a time. This is the densest arithmetic in the
    decoder -- step 0 is 12 kernel taps x 5 SAD offsets x 3 channels per
@@ -225,11 +238,11 @@ static const int8_t epf_dist_2[1][2] = {{0,0}};
  * wide, so an 8-aligned run is exactly one block, and border_sad_mul applies
  * to lanes 0 and 7 only -- a single fixed pattern rather than two. */
 JXL_TARGET_AVX2
-static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
-                     const ptrdiff_t koff[12], const ptrdiff_t doff[5],
-                     int nkernel, int ndist, const float cscale[3],
-                     float sigma_val, float step_mul, float border_mul,
-                     int is_y_border) {
+static JXL_INLINE_HINT void epf_row8_impl(
+    float *in[3], float *out[3], size_t row, uint32_t x,
+    const ptrdiff_t koff[12], const ptrdiff_t doff[5], int nkernel, int ndist,
+    const float cscale[3], float sigma_val, float step_mul, float border_mul,
+    int is_y_border, const int gray) {
     const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
     const __m256 one = _mm256_set1_ps(1.0f);
     __m256 dist8[12], sum8[3], sw, nis, smv;
@@ -244,7 +257,7 @@ static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
     nis = _mm256_mul_ps(_mm256_set1_ps(sigma_val), smv);
 
     for (k = 0; k < nkernel; k++) dist8[k] = _mm256_setzero_ps();
-    for (c = 0; c < 3; c++) {
+    for (c = 0; c < JXL_EPF_NCH(gray); c++) {
         const float *p = in[c] + row + x;
         __m256 cs = _mm256_set1_ps(cscale[c]);
         __m256 cen[5];
@@ -257,15 +270,22 @@ static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
                     _mm256_sub_ps(_mm256_loadu_ps(pk + doff[d]), cen[d])));
             }
             dist8[k] = _mm256_add_ps(dist8[k], _mm256_mul_ps(cs, acc));
+            if (gray) {
+                dist8[k] = _mm256_add_ps(dist8[k], _mm256_mul_ps(
+                    _mm256_set1_ps(cscale[1]), acc));
+                dist8[k] = _mm256_add_ps(dist8[k], _mm256_mul_ps(
+                    _mm256_set1_ps(cscale[2]), acc));
+            }
         }
     }
-    for (c = 0; c < 3; c++) sum8[c] = _mm256_loadu_ps(in[c] + row + x);
+    for (c = 0; c < JXL_EPF_NCH(gray); c++)
+        sum8[c] = _mm256_loadu_ps(in[c] + row + x);
     sw = one;
     for (k = 0; k < nkernel; k++) {
         __m256 wgt = _mm256_add_ps(one, _mm256_mul_ps(dist8[k], nis));
         wgt = _mm256_max_ps(wgt, _mm256_setzero_ps());
         sw = _mm256_add_ps(sw, wgt);
-        for (c = 0; c < 3; c++) {
+        for (c = 0; c < JXL_EPF_NCH(gray); c++) {
             sum8[c] = _mm256_add_ps(sum8[c], _mm256_mul_ps(wgt,
                 _mm256_loadu_ps(in[c] + row + x + koff[k])));
         }
@@ -274,9 +294,23 @@ static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
        avoiding the expensive vector divide, matching the reference estimate
        makes the filtered floats converge before the later color transform. */
     sw = _mm256_rcp_ps(sw);
-    for (c = 0; c < 3; c++)
+    for (c = 0; c < JXL_EPF_NCH(gray); c++)
         _mm256_storeu_ps(out[c] + row + x, _mm256_mul_ps(sum8[c], sw));
     _mm256_zeroupper();
+}
+
+JXL_TARGET_AVX2
+static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
+                     const ptrdiff_t koff[12], const ptrdiff_t doff[5],
+                     int nkernel, int ndist, const float cscale[3],
+                     float sigma_val, float step_mul, float border_mul,
+                     int is_y_border, int gray) {
+    if (gray)
+        epf_row8_impl(in, out, row, x, koff, doff, nkernel, ndist, cscale,
+                      sigma_val, step_mul, border_mul, is_y_border, 1);
+    else
+        epf_row8_impl(in, out, row, x, koff, doff, nkernel, ndist, cscale,
+                      sigma_val, step_mul, border_mul, is_y_border, 0);
 }
 
 /* Horizontal patch distances are symmetric: the right-neighbour SAD of one
@@ -291,18 +325,20 @@ static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
 
 static JXL_EPF_NOINLINE float epf_hsad_one(
     float *in[3], size_t row, uint32_t x, size_t stride,
-    const float cscale[3]) {
-    float dist = 0.0f;
+    const float cscale[3], int gray) {
+    float dist = 0.0f, acc = 0.0f;
     int c;
     for (c = 0; c < 3; c++) {
-        const float *p = in[c] + row + x;
-        float acc = fabsf(p[-(ptrdiff_t)stride + 1] -
-                          p[-(ptrdiff_t)stride]);
-        acc += fabsf(p[1] - p[0]);
-        acc += fabsf(p[(ptrdiff_t)stride + 1] -
-                     p[(ptrdiff_t)stride]);
-        acc += fabsf(p[0] - p[-1]);
-        acc += fabsf(p[2] - p[1]);
+        if (c == 0 || !gray) {
+            const float *p = in[c] + row + x;
+            acc = fabsf(p[-(ptrdiff_t)stride + 1] -
+                        p[-(ptrdiff_t)stride]);
+            acc += fabsf(p[1] - p[0]);
+            acc += fabsf(p[(ptrdiff_t)stride + 1] -
+                         p[(ptrdiff_t)stride]);
+            acc += fabsf(p[0] - p[-1]);
+            acc += fabsf(p[2] - p[1]);
+        }
         dist += cscale[c] * acc;
     }
     return dist;
@@ -314,7 +350,7 @@ static JXL_INLINE_HINT float epf_row8_pass1(
     float *in[3], float *out[3], size_t row, uint32_t x, size_t stride,
     const float cscale[3], float sigma_val, __m256 smv, __m256 absmask,
     __m256 zero, __m256 one, float prev_hsad, float *prev_vsad,
-    int reuse_vtop) {
+    int reuse_vtop, const int gray) {
     __m256 dist0 = reuse_vtop ? _mm256_loadu_ps(prev_vsad + x) : zero;
     __m256 dist1 = zero, dist2, dist3 = zero;
     __m256 sum0, sum1, sum2, sw, nis, wgt;
@@ -323,7 +359,7 @@ static JXL_INLINE_HINT float epf_row8_pass1(
     nis = _mm256_mul_ps(_mm256_set1_ps(sigma_val), smv);
 
     if (!reuse_vtop) {
-        for (c = 0; c < 3; c++) {
+        for (c = 0; c < JXL_EPF_NCH(gray); c++) {
             const float *p = in[c] + row + x;
             const __m256 p20 =
                 _mm256_loadu_ps(p - 2 * (ptrdiff_t)stride);
@@ -352,10 +388,14 @@ static JXL_INLINE_HINT float epf_row8_pass1(
             acc0 = _mm256_add_ps(acc0,
                 _mm256_and_ps(absmask, _mm256_sub_ps(p31, p32)));
             dist0 = _mm256_fmadd_ps(cs, acc0, dist0);
+            if (gray) {
+                dist0 = _mm256_fmadd_ps(_mm256_set1_ps(cscale[1]), acc0, dist0);
+                dist0 = _mm256_fmadd_ps(_mm256_set1_ps(cscale[2]), acc0, dist0);
+            }
         }
     }
 
-    for (c = 0; c < 3; c++) {
+    for (c = 0; c < JXL_EPF_NCH(gray); c++) {
         const float *p = in[c] + row + x;
         const __m256 p21 = _mm256_loadu_ps(p - (ptrdiff_t)stride);
         const __m256 p22 = _mm256_loadu_ps(p);
@@ -397,6 +437,14 @@ static JXL_INLINE_HINT float epf_row8_pass1(
 
         dist1 = _mm256_fmadd_ps(cs, acc1, dist1);
         dist3 = _mm256_fmadd_ps(cs, acc3, dist3);
+        if (gray) {
+            const __m256 cs1 = _mm256_set1_ps(cscale[1]);
+            const __m256 cs2 = _mm256_set1_ps(cscale[2]);
+            dist1 = _mm256_fmadd_ps(cs1, acc1, dist1);
+            dist3 = _mm256_fmadd_ps(cs1, acc3, dist3);
+            dist1 = _mm256_fmadd_ps(cs2, acc1, dist1);
+            dist3 = _mm256_fmadd_ps(cs2, acc3, dist3);
+        }
     }
     if (prev_vsad) _mm256_storeu_ps(prev_vsad + x, dist1);
 
@@ -413,8 +461,8 @@ static JXL_INLINE_HINT float epf_row8_pass1(
     dist2 = _mm256_blend_ps(dist2, _mm256_set1_ps(prev_hsad), 0x01);
 
     sum0 = _mm256_loadu_ps(in[0] + row + x);
-    sum1 = _mm256_loadu_ps(in[1] + row + x);
-    sum2 = _mm256_loadu_ps(in[2] + row + x);
+    sum1 = gray ? zero : _mm256_loadu_ps(in[1] + row + x);
+    sum2 = gray ? zero : _mm256_loadu_ps(in[2] + row + x);
     sw = one;
 
     wgt = _mm256_fmadd_ps(dist0, nis, one);
@@ -422,39 +470,49 @@ static JXL_INLINE_HINT float epf_row8_pass1(
     sw = _mm256_add_ps(sw, wgt);
     sum0 = _mm256_fmadd_ps(
         wgt, _mm256_loadu_ps(in[0] + row + x - (ptrdiff_t)stride), sum0);
-    sum1 = _mm256_fmadd_ps(
-        wgt, _mm256_loadu_ps(in[1] + row + x - (ptrdiff_t)stride), sum1);
-    sum2 = _mm256_fmadd_ps(
-        wgt, _mm256_loadu_ps(in[2] + row + x - (ptrdiff_t)stride), sum2);
+    if (!gray) {
+        sum1 = _mm256_fmadd_ps(
+            wgt, _mm256_loadu_ps(in[1] + row + x - (ptrdiff_t)stride), sum1);
+        sum2 = _mm256_fmadd_ps(
+            wgt, _mm256_loadu_ps(in[2] + row + x - (ptrdiff_t)stride), sum2);
+    }
 
     wgt = _mm256_fmadd_ps(dist1, nis, one);
     wgt = _mm256_max_ps(wgt, zero);
     sw = _mm256_add_ps(sw, wgt);
     sum0 = _mm256_fmadd_ps(
         wgt, _mm256_loadu_ps(in[0] + row + x + stride), sum0);
-    sum1 = _mm256_fmadd_ps(
-        wgt, _mm256_loadu_ps(in[1] + row + x + stride), sum1);
-    sum2 = _mm256_fmadd_ps(
-        wgt, _mm256_loadu_ps(in[2] + row + x + stride), sum2);
+    if (!gray) {
+        sum1 = _mm256_fmadd_ps(
+            wgt, _mm256_loadu_ps(in[1] + row + x + stride), sum1);
+        sum2 = _mm256_fmadd_ps(
+            wgt, _mm256_loadu_ps(in[2] + row + x + stride), sum2);
+    }
 
     wgt = _mm256_fmadd_ps(dist2, nis, one);
     wgt = _mm256_max_ps(wgt, zero);
     sw = _mm256_add_ps(sw, wgt);
     sum0 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[0] + row + x - 1), sum0);
-    sum1 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[1] + row + x - 1), sum1);
-    sum2 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[2] + row + x - 1), sum2);
+    if (!gray) {
+        sum1 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[1] + row + x - 1), sum1);
+        sum2 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[2] + row + x - 1), sum2);
+    }
 
     wgt = _mm256_fmadd_ps(dist3, nis, one);
     wgt = _mm256_max_ps(wgt, zero);
     sw = _mm256_add_ps(sw, wgt);
     sum0 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[0] + row + x + 1), sum0);
-    sum1 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[1] + row + x + 1), sum1);
-    sum2 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[2] + row + x + 1), sum2);
+    if (!gray) {
+        sum1 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[1] + row + x + 1), sum1);
+        sum2 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[2] + row + x + 1), sum2);
+    }
 
     sw = _mm256_rcp_ps(sw);
     _mm256_storeu_ps(out[0] + row + x, _mm256_mul_ps(sum0, sw));
-    _mm256_storeu_ps(out[1] + row + x, _mm256_mul_ps(sum1, sw));
-    _mm256_storeu_ps(out[2] + row + x, _mm256_mul_ps(sum2, sw));
+    if (!gray) {
+        _mm256_storeu_ps(out[1] + row + x, _mm256_mul_ps(sum1, sw));
+        _mm256_storeu_ps(out[2] + row + x, _mm256_mul_ps(sum2, sw));
+    }
     {
         __m128 hi = _mm256_extractf128_ps(dist3, 1);
         hi = _mm_shuffle_ps(hi, hi, _MM_SHUFFLE(3, 3, 3, 3));
@@ -466,11 +524,12 @@ static JXL_INLINE_HINT float epf_row8_pass1(
    call and one AVX/SSE handoff per octet, this lets the compiler keep the
    channel scales and fixed border pattern live for a whole interior row. */
 JXL_TARGET_AVX2_FMA
-static uint32_t epf_row_pass1_avx2(
+static JXL_INLINE_HINT uint32_t epf_row_pass1_avx2_impl(
     float *in[3], float *out[3], size_t row, uint32_t x, uint32_t w,
     size_t stride, const float *sigma_row, const float cscale[3],
     float step_mul, float border_mul, int is_y_border, float *prev_vsad,
-    const float *prev_sigma_row, int can_reuse_vtop, const uint8_t *copy_row) {
+    const float *prev_sigma_row, int can_reuse_vtop, const uint8_t *copy_row,
+    const int gray) {
     const __m256 absmask =
         _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
     const __m256 zero = _mm256_setzero_ps();
@@ -487,7 +546,7 @@ static uint32_t epf_row_pass1_avx2(
         if (sigma_val == 0.0f) {
             int c;
             if (copy_row[x / 8]) {
-                for (c = 0; c < 3; c++) {
+                for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                     _mm256_storeu_ps(out[c] + row + x,
                                      _mm256_loadu_ps(in[c] + row + x));
                 }
@@ -497,14 +556,32 @@ static uint32_t epf_row_pass1_avx2(
             int reuse_vtop =
                 have_vtop && prev_sigma_row[x / 8] != 0.0f;
             if (!prev_valid)
-                prev_hsad = epf_hsad_one(in, row, x - 1, stride, cscale);
+                prev_hsad = epf_hsad_one(in, row, x - 1, stride, cscale, gray);
             prev_hsad = epf_row8_pass1(
                 in, out, row, x, stride, cscale, sigma_val, smv, absmask,
-                zero, one, prev_hsad, prev_vsad, reuse_vtop);
+                zero, one, prev_hsad, prev_vsad, reuse_vtop, gray);
             prev_valid = 1;
         }
     }
     return x;
+}
+
+JXL_TARGET_AVX2_FMA
+static uint32_t epf_row_pass1_avx2(
+    float *in[3], float *out[3], size_t row, uint32_t x, uint32_t w,
+    size_t stride, const float *sigma_row, const float cscale[3],
+    float step_mul, float border_mul, int is_y_border, float *prev_vsad,
+    const float *prev_sigma_row, int can_reuse_vtop, const uint8_t *copy_row,
+    int gray) {
+    if (gray)
+        return epf_row_pass1_avx2_impl(in, out, row, x, w, stride, sigma_row,
+                                       cscale, step_mul, border_mul,
+                                       is_y_border, prev_vsad, prev_sigma_row,
+                                       can_reuse_vtop, copy_row, 1);
+    return epf_row_pass1_avx2_impl(in, out, row, x, w, stride, sigma_row,
+                                   cscale, step_mul, border_mul, is_y_border,
+                                   prev_vsad, prev_sigma_row, can_reuse_vtop,
+                                   copy_row, 0);
 }
 
 /* Pass 0 measures twelve patch distances per sample, but they are six
@@ -530,11 +607,10 @@ enum { EPF_F_H1, EPF_F_H2, EPF_F_VA, EPF_F_VB, EPF_F_VC, EPF_F_V2,
    three rows that read these distances. The octet past the last block is
    pulled left to end at x1, the last sample any tap needs. */
 JXL_TARGET_AVX2
-static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
-                              uint32_t j1, uint32_t x1, size_t stride,
-                              const float *sig_a, const float *sig_b,
-                              const float cscale[3],
-                              float *dst[EPF_F_COUNT]) {
+static JXL_INLINE_HINT void epf_pass0_fwd_row_impl(
+    float *in[3], size_t row, uint32_t j0, uint32_t j1, uint32_t x1,
+    size_t stride, const float *sig_a, const float *sig_b,
+    const float cscale[3], float *dst[EPF_F_COUNT], const int gray) {
     const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
     const __m256 cs0 = _mm256_set1_ps(cscale[0]);
     const __m256 cs1 = _mm256_set1_ps(cscale[1]);
@@ -577,6 +653,32 @@ static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
         JXL_EPF_FWD_TAP(d4, s + 1, FOLD);                                      \
         JXL_EPF_FWD_TAP(d5, 2 * s, FOLD);                                      \
     } while (0)
+/* Gray: one channel's five-term sum, folded in with all three scales in
+   channel order -- the same products and sums as three equal channels. */
+#define JXL_EPF_FWD_TAP_GRAY(dist, off) do {                                   \
+        __m256 acc = JXL_EPF_FWD_ABS((off) - s, cen0);                         \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off) + 1, cen1));            \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off), cen2));                \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off) - 1, cen3));            \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off) + s, cen4));            \
+        dist = _mm256_mul_ps(cs0, acc);                                        \
+        dist = _mm256_add_ps(dist, _mm256_mul_ps(cs1, acc));                   \
+        dist = _mm256_add_ps(dist, _mm256_mul_ps(cs2, acc));                   \
+    } while (0)
+#define JXL_EPF_FWD_CHANNEL_GRAY() do {                                        \
+        const float *p = in[0] + row + q;                                  \
+        const __m256 cen0 = _mm256_loadu_ps(p - s);                        \
+        const __m256 cen1 = _mm256_loadu_ps(p + 1);                        \
+        const __m256 cen2 = _mm256_loadu_ps(p);                            \
+        const __m256 cen3 = _mm256_loadu_ps(p - 1);                        \
+        const __m256 cen4 = _mm256_loadu_ps(p + s);                        \
+        JXL_EPF_FWD_TAP_GRAY(d0, 1);                                           \
+        JXL_EPF_FWD_TAP_GRAY(d1, 2);                                           \
+        JXL_EPF_FWD_TAP_GRAY(d2, s - 1);                                       \
+        JXL_EPF_FWD_TAP_GRAY(d3, s);                                           \
+        JXL_EPF_FWD_TAP_GRAY(d4, s + 1);                                       \
+        JXL_EPF_FWD_TAP_GRAY(d5, 2 * s);                                       \
+    } while (0)
 
     for (j = j0; j <= j1; j++) {
         __m256 d0, d1, d2, d3, d4, d5;
@@ -586,9 +688,13 @@ static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
             continue;
         if (q + 7 > x1) q = x1 - 7;
         d0 = d1 = d2 = d3 = d4 = d5 = _mm256_setzero_ps();
-        JXL_EPF_FWD_CHANNEL(0, cs0, JXL_EPF_FWD_FIRST);
-        JXL_EPF_FWD_CHANNEL(1, cs1, JXL_EPF_FWD_NEXT);
-        JXL_EPF_FWD_CHANNEL(2, cs2, JXL_EPF_FWD_NEXT);
+        if (gray) {
+            JXL_EPF_FWD_CHANNEL_GRAY();
+        } else {
+            JXL_EPF_FWD_CHANNEL(0, cs0, JXL_EPF_FWD_FIRST);
+            JXL_EPF_FWD_CHANNEL(1, cs1, JXL_EPF_FWD_NEXT);
+            JXL_EPF_FWD_CHANNEL(2, cs2, JXL_EPF_FWD_NEXT);
+        }
         _mm256_storeu_ps(dst[EPF_F_H1] + q, d0);
         _mm256_storeu_ps(dst[EPF_F_H2] + q, d1);
         _mm256_storeu_ps(dst[EPF_F_VA] + q, d2);
@@ -596,6 +702,8 @@ static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
         _mm256_storeu_ps(dst[EPF_F_VC] + q, d4);
         _mm256_storeu_ps(dst[EPF_F_V2] + q, d5);
     }
+#undef JXL_EPF_FWD_CHANNEL_GRAY
+#undef JXL_EPF_FWD_TAP_GRAY
 #undef JXL_EPF_FWD_CHANNEL
 #undef JXL_EPF_FWD_NEXT
 #undef JXL_EPF_FWD_FIRST
@@ -604,17 +712,29 @@ static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
     _mm256_zeroupper();
 }
 
+JXL_TARGET_AVX2
+static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
+                              uint32_t j1, uint32_t x1, size_t stride,
+                              const float *sig_a, const float *sig_b,
+                              const float cscale[3],
+                              float *dst[EPF_F_COUNT], int gray) {
+    if (gray)
+        epf_pass0_fwd_row_impl(in, row, j0, j1, x1, stride, sig_a, sig_b,
+                               cscale, dst, 1);
+    else
+        epf_pass0_fwd_row_impl(in, row, j0, j1, x1, stride, sig_a, sig_b,
+                               cscale, dst, 0);
+}
+
 /* The weighting half of epf_row8 for a run of interior octets, with the
    distances taken from the rows epf_pass0_fwd_row filled. dist[k] + dx[k] is
    the row and shift that holds kernel tap k. */
 JXL_TARGET_AVX2
-static void epf_row_pass0_avx2(float *in[3], float *out[3], size_t row,
-                               uint32_t x, uint32_t x1,
-                               const float *sigma_row,
-                               const ptrdiff_t koff[12],
-                               const float *const dist[12],
-                               float step_mul, float border_mul,
-                               int is_y_border, const uint8_t *copy_row) {
+static JXL_INLINE_HINT void epf_row_pass0_avx2_impl(
+    float *in[3], float *out[3], size_t row, uint32_t x, uint32_t x1,
+    const float *sigma_row, const ptrdiff_t koff[12],
+    const float *const dist[12], float step_mul, float border_mul,
+    int is_y_border, const uint8_t *copy_row, const int gray) {
     static const int8_t dx[12] = {0, -1, 0, 1, -2, -1, 0, 0, 0, 0, 0, 0};
     const __m256 one = _mm256_set1_ps(1.0f);
     const __m256 zero = _mm256_setzero_ps();
@@ -624,14 +744,16 @@ static void epf_row_pass0_avx2(float *in[3], float *out[3], size_t row,
                          step_mul, step_mul, step_mul, border_mul);
     for (; x < x1; x += 8) {
         const float *p0 = in[0] + row + x;
-        const float *p1 = in[1] + row + x;
-        const float *p2 = in[2] + row + x;
+        const float *p1 = gray ? p0 : in[1] + row + x;
+        const float *p2 = gray ? p0 : in[2] + row + x;
         float sigma_val = sigma_row[x / 8];
-        __m256 sum0, sum1, sum2;
+        __m256 sum0, sum1 = zero, sum2 = zero;
         if (sigma_val == 0.0f && !copy_row[x / 8]) continue;
         sum0 = _mm256_loadu_ps(p0);
-        sum1 = _mm256_loadu_ps(p1);
-        sum2 = _mm256_loadu_ps(p2);
+        if (!gray) {
+            sum1 = _mm256_loadu_ps(p1);
+            sum2 = _mm256_loadu_ps(p2);
+        }
         if (sigma_val != 0.0f) {
             __m256 nis = _mm256_mul_ps(_mm256_set1_ps(sigma_val), smv);
             __m256 sw = one;
@@ -643,21 +765,44 @@ static void epf_row_pass0_avx2(float *in[3], float *out[3], size_t row,
                 sw = _mm256_add_ps(sw, wgt);
                 sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(wgt,
                     _mm256_loadu_ps(p0 + koff[k])));
-                sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(wgt,
-                    _mm256_loadu_ps(p1 + koff[k])));
-                sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(wgt,
-                    _mm256_loadu_ps(p2 + koff[k])));
+                if (!gray) {
+                    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(wgt,
+                        _mm256_loadu_ps(p1 + koff[k])));
+                    sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(wgt,
+                        _mm256_loadu_ps(p2 + koff[k])));
+                }
             }
             sw = _mm256_rcp_ps(sw);
             sum0 = _mm256_mul_ps(sum0, sw);
-            sum1 = _mm256_mul_ps(sum1, sw);
-            sum2 = _mm256_mul_ps(sum2, sw);
+            if (!gray) {
+                sum1 = _mm256_mul_ps(sum1, sw);
+                sum2 = _mm256_mul_ps(sum2, sw);
+            }
         }
         _mm256_storeu_ps(out[0] + row + x, sum0);
-        _mm256_storeu_ps(out[1] + row + x, sum1);
-        _mm256_storeu_ps(out[2] + row + x, sum2);
+        if (!gray) {
+            _mm256_storeu_ps(out[1] + row + x, sum1);
+            _mm256_storeu_ps(out[2] + row + x, sum2);
+        }
     }
     _mm256_zeroupper();
+}
+
+JXL_TARGET_AVX2
+static void epf_row_pass0_avx2(float *in[3], float *out[3], size_t row,
+                               uint32_t x, uint32_t x1,
+                               const float *sigma_row,
+                               const ptrdiff_t koff[12],
+                               const float *const dist[12],
+                               float step_mul, float border_mul,
+                               int is_y_border, const uint8_t *copy_row,
+                               int gray) {
+    if (gray)
+        epf_row_pass0_avx2_impl(in, out, row, x, x1, sigma_row, koff, dist,
+                                step_mul, border_mul, is_y_border, copy_row, 1);
+    else
+        epf_row_pass0_avx2_impl(in, out, row, x, x1, sigma_row, koff, dist,
+                                step_mul, border_mul, is_y_border, copy_row, 0);
 }
 /* Pass 2 for a run of interior octets: four taps, each compared with the
    centre sample alone. epf_row8 does the same arithmetic in the same order;
@@ -665,12 +810,11 @@ static void epf_row_pass0_avx2(float *in[3], float *out[3], size_t row,
    counts as loop bounds, for the cheapest pass of the three. Adding the
    first term to a zero accumulator is left out, which changes no value. */
 JXL_TARGET_AVX2
-static uint32_t epf_row_pass2_avx2(float *in[3], float *out[3], size_t row,
-                                   uint32_t x, uint32_t w, size_t stride,
-                                   const float *sigma_row,
-                                   const float cscale[3], float step_mul,
-                                   float border_mul, int is_y_border,
-                                   const uint8_t *copy_row) {
+static JXL_INLINE_HINT uint32_t epf_row_pass2_avx2_impl(
+    float *in[3], float *out[3], size_t row, uint32_t x, uint32_t w,
+    size_t stride, const float *sigma_row, const float cscale[3],
+    float step_mul, float border_mul, int is_y_border,
+    const uint8_t *copy_row, const int gray) {
     const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
     const __m256 one = _mm256_set1_ps(1.0f);
     const __m256 zero = _mm256_setzero_ps();
@@ -685,59 +829,92 @@ static uint32_t epf_row_pass2_avx2(float *in[3], float *out[3], size_t row,
     const ptrdiff_t koff[4] = {-(ptrdiff_t)stride, (ptrdiff_t)stride, -1, 1};
     for (; x + 8 < w; x += 8) {
         const float *p0 = in[0] + row + x;
-        const float *p1 = in[1] + row + x;
-        const float *p2 = in[2] + row + x;
+        const float *p1 = gray ? p0 : in[1] + row + x;
+        const float *p2 = gray ? p0 : in[2] + row + x;
         float sigma_val = sigma_row[x / 8];
-        __m256 c0, c1, c2, sum0, sum1, sum2, sw, nis;
+        __m256 c0, c1 = zero, c2 = zero, sum0, sum1, sum2, sw, nis;
         int k;
         if (sigma_val == 0.0f && !copy_row[x / 8]) continue;
         c0 = _mm256_loadu_ps(p0);
-        c1 = _mm256_loadu_ps(p1);
-        c2 = _mm256_loadu_ps(p2);
+        if (!gray) {
+            c1 = _mm256_loadu_ps(p1);
+            c2 = _mm256_loadu_ps(p2);
+        }
         sum0 = c0; sum1 = c1; sum2 = c2;
         if (sigma_val != 0.0f) {
             nis = _mm256_mul_ps(_mm256_set1_ps(sigma_val), smv);
             sw = one;
             for (k = 0; k < 4; k++) {
                 __m256 t0 = _mm256_loadu_ps(p0 + koff[k]);
-                __m256 t1 = _mm256_loadu_ps(p1 + koff[k]);
-                __m256 t2 = _mm256_loadu_ps(p2 + koff[k]);
                 __m256 dist, wgt;
-                dist = _mm256_mul_ps(cs0, _mm256_and_ps(absmask,
-                                                        _mm256_sub_ps(t0, c0)));
-                dist = _mm256_add_ps(dist, _mm256_mul_ps(cs1,
-                    _mm256_and_ps(absmask, _mm256_sub_ps(t1, c1))));
-                dist = _mm256_add_ps(dist, _mm256_mul_ps(cs2,
-                    _mm256_and_ps(absmask, _mm256_sub_ps(t2, c2))));
-                wgt = _mm256_add_ps(one, _mm256_mul_ps(dist, nis));
-                wgt = _mm256_max_ps(wgt, zero);
-                sw = _mm256_add_ps(sw, wgt);
-                sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(wgt, t0));
-                sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(wgt, t1));
-                sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(wgt, t2));
+                if (gray) {
+                    __m256 a = _mm256_and_ps(absmask, _mm256_sub_ps(t0, c0));
+                    dist = _mm256_mul_ps(cs0, a);
+                    dist = _mm256_add_ps(dist, _mm256_mul_ps(cs1, a));
+                    dist = _mm256_add_ps(dist, _mm256_mul_ps(cs2, a));
+                    wgt = _mm256_add_ps(one, _mm256_mul_ps(dist, nis));
+                    wgt = _mm256_max_ps(wgt, zero);
+                    sw = _mm256_add_ps(sw, wgt);
+                    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(wgt, t0));
+                } else {
+                    __m256 t1 = _mm256_loadu_ps(p1 + koff[k]);
+                    __m256 t2 = _mm256_loadu_ps(p2 + koff[k]);
+                    dist = _mm256_mul_ps(cs0, _mm256_and_ps(absmask,
+                                                            _mm256_sub_ps(t0, c0)));
+                    dist = _mm256_add_ps(dist, _mm256_mul_ps(cs1,
+                        _mm256_and_ps(absmask, _mm256_sub_ps(t1, c1))));
+                    dist = _mm256_add_ps(dist, _mm256_mul_ps(cs2,
+                        _mm256_and_ps(absmask, _mm256_sub_ps(t2, c2))));
+                    wgt = _mm256_add_ps(one, _mm256_mul_ps(dist, nis));
+                    wgt = _mm256_max_ps(wgt, zero);
+                    sw = _mm256_add_ps(sw, wgt);
+                    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(wgt, t0));
+                    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(wgt, t1));
+                    sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(wgt, t2));
+                }
             }
             sw = _mm256_rcp_ps(sw);
             sum0 = _mm256_mul_ps(sum0, sw);
-            sum1 = _mm256_mul_ps(sum1, sw);
-            sum2 = _mm256_mul_ps(sum2, sw);
+            if (!gray) {
+                sum1 = _mm256_mul_ps(sum1, sw);
+                sum2 = _mm256_mul_ps(sum2, sw);
+            }
         }
         _mm256_storeu_ps(out[0] + row + x, sum0);
-        _mm256_storeu_ps(out[1] + row + x, sum1);
-        _mm256_storeu_ps(out[2] + row + x, sum2);
+        if (!gray) {
+            _mm256_storeu_ps(out[1] + row + x, sum1);
+            _mm256_storeu_ps(out[2] + row + x, sum2);
+        }
     }
     _mm256_zeroupper();
     return x;
+}
+
+JXL_TARGET_AVX2
+static uint32_t epf_row_pass2_avx2(float *in[3], float *out[3], size_t row,
+                                   uint32_t x, uint32_t w, size_t stride,
+                                   const float *sigma_row,
+                                   const float cscale[3], float step_mul,
+                                   float border_mul, int is_y_border,
+                                   const uint8_t *copy_row, int gray) {
+    if (gray)
+        return epf_row_pass2_avx2_impl(in, out, row, x, w, stride, sigma_row,
+                                       cscale, step_mul, border_mul,
+                                       is_y_border, copy_row, 1);
+    return epf_row_pass2_avx2_impl(in, out, row, x, w, stride, sigma_row,
+                                   cscale, step_mul, border_mul, is_y_border,
+                                   copy_row, 0);
 }
 #endif
 
 /* A sample whose whole footprint is inside the image needs no mirroring, so
    every neighbour it reads is a fixed sample offset from its centre. Those
    offsets depend only on the pass, so they are tabulated once per pass. */
-static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
-                    size_t stride, const float *sigma, uint32_t sigma_stride,
-                    const jxl_epf *epf, int step, float *vsad_cache,
-                    float *fwd_cache, const uint8_t *copy_map,
-                    size_t copy_stride, uint32_t y_begin, uint32_t y_end) {
+static JXL_INLINE_HINT int epf_pass_impl(
+    float *in[3], float *out[3], uint32_t w, uint32_t h, size_t stride,
+    const float *sigma, uint32_t sigma_stride, const jxl_epf *epf, int step,
+    float *vsad_cache, float *fwd_cache, const uint8_t *copy_map,
+    size_t copy_stride, uint32_t y_begin, uint32_t y_end, const int gray) {
     const int8_t (*kernel)[2];
     const int8_t (*dist_off)[2];
     ptrdiff_t koff[12];      /* kernel tap -> sample offset */
@@ -825,7 +1002,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                         in, (size_t)r * stride, 1, p0_x1 / 8, p0_x1, stride,
                         sigma + (size_t)(r / 8) * sigma_stride,
                         sigma + (size_t)((r + 2) / 8) * sigma_stride,
-                        cscale, f);
+                        cscale, f, gray);
                 }
             }
             /* epf_kernel_2 order. */
@@ -855,10 +1032,10 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                         in, row, x == 8 ? 1 : x / 8 + 1, xe / 8, p0_x1,
                         stride, sigma_row,
                         sigma + (size_t)((y + 2) / 8) * sigma_stride,
-                        cscale, p0_f);
+                        cscale, p0_f, gray);
                     epf_row_pass0_avx2(in, out, row, x, xe, sigma_row, koff,
                                        p0_dist, step_mul, border_mul,
-                                       is_y_border, copy_row);
+                                       is_y_border, copy_row, gray);
                     x = xe;
                 }
                 continue;
@@ -866,7 +1043,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
             if (use_avx2 && step == 2 && y_inside && x == 8 && w > 16) {
                 x = epf_row_pass2_avx2(in, out, row, x, w, stride, sigma_row,
                                        cscale, step_mul, border_mul,
-                                       is_y_border, copy_row);
+                                       is_y_border, copy_row, gray);
                 continue;
             }
             if (use_avx2_fma && step == 1 && y_inside && (x & 7u) == 0 &&
@@ -875,7 +1052,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                                        cscale, step_mul, border_mul,
                                        is_y_border, vsad_cache,
                                        prev_sigma_row,
-                                       y > (uint32_t)pad, copy_row);
+                                       y > (uint32_t)pad, copy_row, gray);
                 continue;
             }
             /* Eight samples at a time with AVX2 (epf_row8, approximate
@@ -891,7 +1068,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                 x >= (uint32_t)pad && x + 7 + (uint32_t)pad < w) {
                 if (sigma_val == 0.0f) {
                     if (copy_row[x / 8]) {
-                        for (c = 0; c < 3; c++) {
+                        for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                             memcpy(out[c] + row + x, in[c] + row + x,
                                    8 * sizeof(float));
                         }
@@ -901,7 +1078,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                 }
                 epf_row8(in, out, row, x, koff, doff, nkernel, ndist,
                          cscale, sigma_val, step_mul, border_mul,
-                         is_y_border);
+                         is_y_border, gray);
                 x += 8;
                 continue;
             }
@@ -910,7 +1087,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                 __m128 dist4[12], sum4[3], sw, nis;
                 if (sigma_val == 0.0f) {
                     if (copy_row[x / 8]) {
-                        for (c = 0; c < 3; c++) {
+                        for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                             _mm_storeu_ps(out[c] + row + x,
                                           _mm_loadu_ps(in[c] + row + x));
                         }
@@ -925,7 +1102,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                                  is_y_border ? sm_border
                                              : ((x & 7u) == 0 ? sm_lo : sm_hi));
                 for (k = 0; k < nkernel; k++) dist4[k] = _mm_setzero_ps();
-                for (c = 0; c < 3; c++) {
+                for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                     const float *p = in[c] + row + x;
                     __m128 cs = _mm_set1_ps(cscale[c]);
                     __m128 cen[5];
@@ -938,16 +1115,23 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                                 _mm_sub_ps(_mm_loadu_ps(pk + doff[d]), cen[d])));
                         }
                         dist4[k] = _mm_add_ps(dist4[k], _mm_mul_ps(cs, acc));
+                        if (gray) {
+                            dist4[k] = _mm_add_ps(dist4[k], _mm_mul_ps(
+                                _mm_set1_ps(cscale[1]), acc));
+                            dist4[k] = _mm_add_ps(dist4[k], _mm_mul_ps(
+                                _mm_set1_ps(cscale[2]), acc));
+                        }
                     }
                 }
-                for (c = 0; c < 3; c++) sum4[c] = _mm_loadu_ps(in[c] + row + x);
+                for (c = 0; c < JXL_EPF_NCH(gray); c++)
+                    sum4[c] = _mm_loadu_ps(in[c] + row + x);
                 sw = _mm_set1_ps(1.0f);
                 for (k = 0; k < nkernel; k++) {
                     __m128 wgt = _mm_add_ps(_mm_set1_ps(1.0f),
                                             _mm_mul_ps(dist4[k], nis));
                     wgt = _mm_max_ps(wgt, _mm_setzero_ps());
                     sw = _mm_add_ps(sw, wgt);
-                    for (c = 0; c < 3; c++) {
+                    for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                         sum4[c] = _mm_add_ps(sum4[c], _mm_mul_ps(wgt,
                             _mm_loadu_ps(in[c] + row + x + koff[k])));
                     }
@@ -957,7 +1141,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                    the vector path that is kept exact (the AVX2 kernels above
                    accept that divergence). */
                 sw = _mm_div_ps(_mm_set1_ps(1.0f), sw);
-                for (c = 0; c < 3; c++) {
+                for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                     _mm_storeu_ps(out[c] + row + x, _mm_mul_ps(sum4[c], sw));
                 }
                 x += 4;
@@ -971,7 +1155,8 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
 
             if (sigma_val == 0.0f) {
                 if (copy_row[x / 8]) {
-                    for (c = 0; c < 3; c++) out[c][row + x] = in[c][row + x];
+                    for (c = 0; c < JXL_EPF_NCH(gray); c++)
+                        out[c][row + x] = in[c][row + x];
                 }
                 x++;
                 continue;
@@ -991,7 +1176,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                 /* Fast path: nothing mirrors, so every neighbour is a fixed
                    offset off the centre sample. */
                 for (k = 0; k < nkernel; k++) soff[k] = row + x + koff[k];
-                for (c = 0; c < 3; c++) {
+                for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                     const float *p = in[c] + row + x;
                     float cs = cscale[c];
                     float cen[5];
@@ -1002,6 +1187,10 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                         for (d = 0; d < ndist; d++)
                             acc += fabsf(pk[doff[d]] - cen[d]);
                         dist[k] += cs * acc;
+                        if (gray) {
+                            dist[k] += cscale[1] * acc;
+                            dist[k] += cscale[2] * acc;
+                        }
                     }
                 }
             } else {
@@ -1025,7 +1214,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                     soff[k] = (size_t)jxl_mirror(ky, h) * stride +
                               jxl_mirror(kx, w);
                 }
-                for (c = 0; c < 3; c++) {
+                for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                     const float *p = in[c];
                     float cs = cscale[c];
                     float cen[5];
@@ -1035,31 +1224,55 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                         for (d = 0; d < ndist; d++)
                             acc += fabsf(p[ao[k][d]] - cen[d]);
                         dist[k] += cs * acc;
+                        if (gray) {
+                            dist[k] += cscale[1] * acc;
+                            dist[k] += cscale[2] * acc;
+                        }
                     }
                 }
             }
 
-            for (c = 0; c < 3; c++) sum[c] = in[c][row + x];
+            for (c = 0; c < JXL_EPF_NCH(gray); c++) sum[c] = in[c][row + x];
             sum_weights = 1.0f;
             for (k = 0; k < nkernel; k++) {
                 float weight = 1.0f + dist[k] * neg_inv_sigma;
                 if (weight < 0.0f) weight = 0.0f;
                 sum_weights += weight;
-                for (c = 0; c < 3; c++) sum[c] += weight * in[c][soff[k]];
+                for (c = 0; c < JXL_EPF_NCH(gray); c++)
+                    sum[c] += weight * in[c][soff[k]];
             }
             /* One reciprocal and three multiplies, as libjxl does, rather
                than three divisions. */
             inv_w = 1.0f / sum_weights;
-            for (c = 0; c < 3; c++) out[c][row + x] = sum[c] * inv_w;
+            for (c = 0; c < JXL_EPF_NCH(gray); c++)
+                out[c][row + x] = sum[c] * inv_w;
             x++;
         }
     }
     return 0;
 }
 
+/* The two forms of a pass (see the note above epf_row8 for `gray`): the
+   three-channel one compiles exactly as before, the gray one reads and
+   writes channel 0 only. */
+static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
+                    size_t stride, const float *sigma, uint32_t sigma_stride,
+                    const jxl_epf *epf, int step, float *vsad_cache,
+                    float *fwd_cache, const uint8_t *copy_map,
+                    size_t copy_stride, uint32_t y_begin, uint32_t y_end,
+                    int gray) {
+    if (gray)
+        return epf_pass_impl(in, out, w, h, stride, sigma, sigma_stride, epf,
+                             step, vsad_cache, fwd_cache, copy_map,
+                             copy_stride, y_begin, y_end, 1);
+    return epf_pass_impl(in, out, w, h, stride, sigma, sigma_stride, epf, step,
+                         vsad_cache, fwd_cache, copy_map, copy_stride, y_begin,
+                         y_end, 0);
+}
+
 /* Copies the filtered blocks of row y of `src` over `dst`. */
-static void epf_copy_active_row(float *dst[3], float *src[3], uint32_t w,
-                                uint32_t y, size_t stride,
+static void epf_copy_active_row(float *dst[3], float *src[3], int nch,
+                                uint32_t w, uint32_t y, size_t stride,
                                 const float *sigma, uint32_t sigma_stride) {
     const float *sigma_row = sigma + (size_t)(y / 8) * sigma_stride;
     uint32_t bw = (w + 7) / 8, x;
@@ -1069,7 +1282,7 @@ static void epf_copy_active_row(float *dst[3], float *src[3], uint32_t w,
         uint32_t n;
         if (sigma_row[x] == 0.0f) continue;
         n = JXL_MIN(8u, w - x * 8);
-        for (c = 0; c < 3; c++) {
+        for (c = 0; c < nch; c++) {
             memcpy(dst[c] + row + x * 8, src[c] + row + x * 8,
                    n * sizeof(float));
         }
@@ -1087,25 +1300,27 @@ typedef struct {
     float *buf[3];
     float *p[3];
     uint32_t base, keep;
+    int nch;          /* channels held: 3, or 1 for gray */
 } epf_ring;
 
 static void epf_ring_bias(epf_ring *r, size_t stride) {
     int c;
-    for (c = 0; c < 3; c++) {
+    for (c = 0; c < r->nch; c++) {
         r->p[c] = (float *)((uintptr_t)r->buf[c] -
                             (uintptr_t)r->base * stride * sizeof(float));
     }
 }
 
 static int epf_ring_init(jxl_ctx *ctx, epf_ring *r, size_t stride,
-                         uint32_t keep) {
+                         uint32_t keep, int nch) {
     size_t n;
     int c;
     /* One spare row: the kernels load a vector that may start in the last
        columns of a row and run on into the next. */
     if (!jxl_size_mul(stride, (JXL_EPF_RING_ROWS + 1) * sizeof(float), &n))
         return -1;
-    for (c = 0; c < 3; c++) {
+    r->nch = nch;
+    for (c = 0; c < nch; c++) {
         r->buf[c] = (float *)jxl_malloc(ctx, n);
         if (!r->buf[c]) return -1;
     }
@@ -1119,7 +1334,7 @@ static int epf_ring_init(jxl_ctx *ctx, epf_ring *r, size_t stride,
 static void epf_ring_advance(epf_ring *r, uint32_t y, size_t stride) {
     int c;
     if (y - r->base < JXL_EPF_RING_ROWS) return;
-    for (c = 0; c < 3; c++) {
+    for (c = 0; c < r->nch; c++) {
         memmove(r->buf[c],
                 r->buf[c] + (size_t)(JXL_EPF_RING_ROWS - r->keep) * stride,
                 (size_t)r->keep * stride * sizeof(float));
@@ -1147,9 +1362,9 @@ static void epf_ring_advance(epf_ring *r, uint32_t y, size_t stride) {
  *
  * Each lag is the larger of what the pass ahead still reads from the buffer
  * being overwritten (its pad) and how far ahead the pass behind reads. */
-int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
-                  size_t stride, const float *sigma, uint32_t sigma_stride,
-                  const jxl_epf *epf) {
+int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], int gray, uint32_t w,
+                  uint32_t h, size_t stride, const float *sigma,
+                  uint32_t sigma_stride, const jxl_epf *epf) {
     static const uint32_t step_pad[3] = {3, 2, 1};
     epf_ring ring_a, ring_b;
     float *vsad_cache = NULL;
@@ -1171,8 +1386,12 @@ int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
     /* Pass i reads the plane when i is even and ring a when it is odd; an
        odd pass count leaves the last output in ring b. `keep` is how far
        behind the newest row the reader of a ring still looks. */
-    if (nsteps > 1 && epf_ring_init(ctx, &ring_a, stride, 6) != 0) goto done;
-    if ((nsteps & 1) && epf_ring_init(ctx, &ring_b, stride, 3) != 0) goto done;
+    if (nsteps > 1 &&
+        epf_ring_init(ctx, &ring_a, stride, 6, JXL_EPF_NCH(gray)) != 0)
+        goto done;
+    if ((nsteps & 1) &&
+        epf_ring_init(ctx, &ring_b, stride, 3, JXL_EPF_NCH(gray)) != 0)
+        goto done;
 
     /* Row 0 of the map is all zeros, for a pass whose unfiltered blocks are
        already where they belong; the rest marks, per block, an unfiltered
@@ -1234,12 +1453,12 @@ int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
                          to_plane ? plane : dst->p, w, h, stride, sigma,
                          sigma_stride, epf, steps[i], vsad_cache, fwd_cache,
                          (!to_plane && !last) ? copy_map + bw : copy_map,
-                         (!to_plane && !last) ? bw : 0, y, y + 1) != 0)
+                         (!to_plane && !last) ? bw : 0, y, y + 1, gray) != 0)
                 goto done;
         }
         if ((nsteps & 1) && t >= lag[nsteps] && t - lag[nsteps] < h) {
-            epf_copy_active_row(plane, ring_b.p, w, t - lag[nsteps], stride,
-                                sigma, sigma_stride);
+            epf_copy_active_row(plane, ring_b.p, JXL_EPF_NCH(gray), w,
+                                t - lag[nsteps], stride, sigma, sigma_stride);
         }
     }
     rc = 0;

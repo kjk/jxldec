@@ -213,9 +213,9 @@ static float tf_srgb(float s) {
  * is four orders of magnitude spare, and since it is what libjxl does, using
  * it moves this decoder's output *towards* the reference rather than away.
  *
- * Only the 709 curve is switched over. The gamma, DCI and PQ paths below
- * still call powf: no corpus file exercises them, so the change could not be
- * measured or verified there.
+ * The 709 curve, the HLG curve and the HLG OOTF use these. PQ has libjxl's
+ * own rational polynomial (tf_pq). The gamma and DCI paths still call powf:
+ * no corpus file exercises them, so a change there could not be verified.
  *
  * Undefined for x <= 0, as libjxl's is; both callers below test the
  * threshold first, and the vector one selects the lane afterwards. */
@@ -285,13 +285,31 @@ static float tf_pq(float v, float scale) {
     return v < 0.0f ? -r : r;
 }
 
+/* The HLG OETF as libjxl evaluates it (TF_HLG::EncodedFromDisplay): sqrt(3x)
+   up to 1/12, then a ln(12x - b) + c with the natural log taken as
+   ln 2 * fast_log2f -- the same rational polynomial, not logf. Besides
+   matching the reference that is several times cheaper, and it vectorises
+   (tf_hlg_x4 / _x8 below, operation for operation). Not-positive and NaN
+   input give 0. */
+#define JXL_HLG_A_LN2 0.123957433f   /* 0.17883277 * ln 2 */
+#define JXL_HLG_B 0.28466892f
+#define JXL_HLG_C 0.55991073f
 static float tf_hlg(float v) {
-    const float a = 0.17883277f;
-    const float b = 0.28466892f;
-    const float c = 0.55991073f;
-    if (v <= 0.0f) return 0.0f;
+    if (!(v > 0.0f)) return 0.0f;
     if (v <= 1.0f / 12.0f) return sqrtf(3.0f * v);
-    return a * logf(12.0f * v - b) + c;
+    return JXL_HLG_A_LN2 * fast_log2f(12.0f * v - JXL_HLG_B) + JXL_HLG_C;
+}
+
+/* pow(y, e) for the HLG OOTF ratio: libjxl's FastPowf. The argument is held
+   at -126 or above so fast_pow2f's exponent stays a normal float even for a
+   large positive e (a very dim intensity_target) and a denormal y. */
+static float hlg_ootf_ratio(float y, float e) {
+    float a, ratio;
+    if (!(y > 0.0f)) return 0.0f;
+    a = fast_log2f(y) * e;
+    if (a < -126.0f) a = -126.0f;
+    ratio = fast_pow2f(a);
+    return ratio < 1e9f ? ratio : 1e9f;
 }
 
 #ifdef JXL_COLOR_SSE2
@@ -541,6 +559,102 @@ static void tf_bt709_x4(float *v, size_t n, size_t *pos) {
     }
     *pos = i;
 }
+
+/* tf_hlg four / eight at a time. Both legs are computed for every lane and
+   one is selected, so a lane whose log argument is not positive (those are
+   all on the sqrt leg) cannot leak into the result. max(v, 0) maps
+   not-positive and NaN input to 0, as the scalar test does. */
+static void tf_hlg_x4(float *v, size_t n, size_t *pos) {
+    const __m128 zero = _mm_setzero_ps();
+    const __m128 three = _mm_set1_ps(3.0f), twelve = _mm_set1_ps(12.0f);
+    const __m128 thresh = _mm_set1_ps(1.0f / 12.0f);
+    const __m128 ka = _mm_set1_ps(JXL_HLG_A_LN2), kb = _mm_set1_ps(JXL_HLG_B);
+    const __m128 kc = _mm_set1_ps(JXL_HLG_C);
+    size_t i = *pos;
+    for (; i + 4 <= n; i += 4) {
+        __m128 x = _mm_max_ps(_mm_loadu_ps(v + i), zero);
+        __m128 low = _mm_sqrt_ps(_mm_mul_ps(three, x));
+        __m128 hi = _mm_add_ps(_mm_mul_ps(ka, fast_log2f_x4(
+            _mm_sub_ps(_mm_mul_ps(twelve, x), kb))), kc);
+        __m128 m = _mm_cmple_ps(x, thresh);
+        _mm_storeu_ps(v + i, _mm_or_ps(_mm_and_ps(m, low),
+                                       _mm_andnot_ps(m, hi)));
+    }
+    *pos = i;
+}
+
+JXL_TARGET_AVX2
+static void tf_hlg_x8(float *v, size_t n, size_t *pos) {
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 three = _mm256_set1_ps(3.0f), twelve = _mm256_set1_ps(12.0f);
+    const __m256 thresh = _mm256_set1_ps(1.0f / 12.0f);
+    const __m256 ka = _mm256_set1_ps(JXL_HLG_A_LN2);
+    const __m256 kb = _mm256_set1_ps(JXL_HLG_B);
+    const __m256 kc = _mm256_set1_ps(JXL_HLG_C);
+    size_t i = *pos;
+    for (; i + 8 <= n; i += 8) {
+        __m256 x = _mm256_max_ps(_mm256_loadu_ps(v + i), zero);
+        __m256 low = _mm256_sqrt_ps(_mm256_mul_ps(three, x));
+        __m256 hi = _mm256_add_ps(_mm256_mul_ps(ka, fast_log2f_x8(
+            _mm256_sub_ps(_mm256_mul_ps(twelve, x), kb))), kc);
+        __m256 m = _mm256_cmp_ps(x, thresh, _CMP_LE_OQ);
+        _mm256_storeu_ps(v + i, _mm256_or_ps(_mm256_and_ps(m, low),
+                                             _mm256_andnot_ps(m, hi)));
+    }
+    _mm256_zeroupper();
+    *pos = i;
+}
+
+/* The OOTF ratio applied to four / eight pixels, as hlg_ootf_ratio. The
+   luminance sum associates left to right like the scalar expression. A lane
+   with y <= 0 (or NaN) computes garbage that the final mask discards; the
+   cap is applied first, which for those lanes changes nothing. */
+static void hlg_ootf_x4(float *r, float *g, float *b, size_t n,
+                        const float lum[3], float e, size_t *pos) {
+    const __m128 l0 = _mm_set1_ps(lum[0]), l1 = _mm_set1_ps(lum[1]);
+    const __m128 l2 = _mm_set1_ps(lum[2]), ve = _mm_set1_ps(e);
+    const __m128 lo = _mm_set1_ps(-126.0f), cap = _mm_set1_ps(1e9f);
+    const __m128 zero = _mm_setzero_ps();
+    size_t i = *pos;
+    for (; i + 4 <= n; i += 4) {
+        __m128 vr = _mm_loadu_ps(r + i), vg = _mm_loadu_ps(g + i);
+        __m128 vb = _mm_loadu_ps(b + i);
+        __m128 y = _mm_add_ps(_mm_add_ps(_mm_mul_ps(l0, vr), _mm_mul_ps(l1, vg)),
+                              _mm_mul_ps(l2, vb));
+        __m128 a = _mm_max_ps(_mm_mul_ps(fast_log2f_x4(y), ve), lo);
+        __m128 ratio = _mm_min_ps(fast_pow2f_x4(a), cap);
+        ratio = _mm_and_ps(_mm_cmpgt_ps(y, zero), ratio);
+        _mm_storeu_ps(r + i, _mm_mul_ps(vr, ratio));
+        _mm_storeu_ps(g + i, _mm_mul_ps(vg, ratio));
+        _mm_storeu_ps(b + i, _mm_mul_ps(vb, ratio));
+    }
+    *pos = i;
+}
+
+JXL_TARGET_AVX2
+static void hlg_ootf_x8(float *r, float *g, float *b, size_t n,
+                        const float lum[3], float e, size_t *pos) {
+    const __m256 l0 = _mm256_set1_ps(lum[0]), l1 = _mm256_set1_ps(lum[1]);
+    const __m256 l2 = _mm256_set1_ps(lum[2]), ve = _mm256_set1_ps(e);
+    const __m256 lo = _mm256_set1_ps(-126.0f), cap = _mm256_set1_ps(1e9f);
+    const __m256 zero = _mm256_setzero_ps();
+    size_t i = *pos;
+    for (; i + 8 <= n; i += 8) {
+        __m256 vr = _mm256_loadu_ps(r + i), vg = _mm256_loadu_ps(g + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        __m256 y = _mm256_add_ps(
+            _mm256_add_ps(_mm256_mul_ps(l0, vr), _mm256_mul_ps(l1, vg)),
+            _mm256_mul_ps(l2, vb));
+        __m256 a = _mm256_max_ps(_mm256_mul_ps(fast_log2f_x8(y), ve), lo);
+        __m256 ratio = _mm256_min_ps(fast_pow2f_x8(a), cap);
+        ratio = _mm256_and_ps(_mm256_cmp_ps(y, zero, _CMP_GT_OQ), ratio);
+        _mm256_storeu_ps(r + i, _mm256_mul_ps(vr, ratio));
+        _mm256_storeu_ps(g + i, _mm256_mul_ps(vg, ratio));
+        _mm256_storeu_ps(b + i, _mm256_mul_ps(vb, ratio));
+    }
+    _mm256_zeroupper();
+    *pos = i;
+}
 #endif
 
 /* The inverse HLG OOTF: display light back to scene light, which is what the
@@ -553,17 +667,20 @@ void jxl_hlg_inverse_ootf(float *r, float *g, float *b, size_t n,
     float gamma = (1.0f / 1.2f) *
                   powf(1.111f, -log2f(intensity_target / 1000.0f));
     float exponent = gamma - 1.0f;
-    size_t i;
+    size_t i = 0;
     if (!(exponent < -0.01f || exponent > 0.01f)) return;
-    for (i = 0; i < n; i++) {
+#ifdef JXL_COLOR_SSE2
+    if (jxl_has_avx2()) hlg_ootf_x8(r, g, b, n, luminances, exponent, &i);
+    hlg_ootf_x4(r, g, b, n, luminances, exponent, &i);
+#endif
+    for (; i < n; i++) {
         float y = luminances[0] * r[i] + luminances[1] * g[i] +
                   luminances[2] * b[i];
         /* Zero or negative luminance is black plus float noise (a fully
            transparent pixel, typically). A negative exponent would scale
            that noise by the 1e9 cap into a saturated channel, so it is
            forced to black instead; libjxl's fast pow is undefined there. */
-        float ratio = y > 0.0f ? powf(y, exponent) : 0.0f;
-        if (!(ratio < 1e9f)) ratio = 1e9f;
+        float ratio = hlg_ootf_ratio(y, exponent);
         r[i] *= ratio;
         g[i] *= ratio;
         b[i] *= ratio;
@@ -605,7 +722,12 @@ void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
             }
             break;
         case JXL_TF_HLG:
-            for (i = 0; i < n; i++) v[i] = tf_hlg(v[i]);
+            i = 0;
+#ifdef JXL_COLOR_SSE2
+            if (jxl_has_avx2()) tf_hlg_x8(v, n, &i);
+            tf_hlg_x4(v, n, &i);
+#endif
+            for (; i < n; i++) v[i] = tf_hlg(v[i]);
             break;
         case JXL_TF_SRGB:
         default:

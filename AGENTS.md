@@ -362,6 +362,10 @@ current; it lists the exact pass rate and every known gap.
   operation order matches what the obvious per-channel loop would produce.
   Reordering an accumulation there changes pixels; the interior fast path and
   the mirroring border path in `epf_pass` must stay in step.
+- Every EPF kernel has a `gray` form (one channel, distance folded in with all
+  three channel scales) that must stay bit-identical to the three-channel form
+  on equal channels. Change both together; the check is that
+  `grayscale_public_university` renders the same before and after.
 
 **Do not commit automatically.** Make and verify changes, but leave them in the
 working tree; only run `git commit` when the user asks. Never commit
