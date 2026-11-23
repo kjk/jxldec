@@ -127,21 +127,36 @@ int jxl_has_spot_colour(const jxl_image_metadata *meta) {
 /* Spot colours: libjxl's stage_spot.cc. Each spot channel is a coverage map
    for one ink (r, g, b, solidity), mixed into the colour channels of the
    image that is displayed -- after blending, and not into what a frame saves
-   as a reference, which is where libjxl's pipeline puts the stage. */
-void jxl_apply_spot_colours(jxl_fimage *img, const jxl_image_metadata *meta) {
+   as a reference, which is where libjxl's pipeline puts the stage.
+
+   One more thing follows from that placement. An XYB frame comes out of the
+   colour transform in linear light, and libjxl only applies the transfer
+   curve early when blending or a reference needs encoded samples. So for a
+   plain XYB frame the ink is mixed in *linear* light, before the curve
+   (jxl_frame_state.spot_linear, done inside the colour transform below);
+   for a blended or referenced one, and for anything not XYB, it is mixed
+   into the encoded samples by jxl_apply_spot_colours.
+
+   A grayscale image has one colour plane here where libjxl's pipeline carries
+   three identical ones and outputs the first, so gray is mixed with the
+   ink's red component: that is what libjxl produces (test/data/gray_spot_*),
+   odd as it is for an ink that is not gray. */
+static void spot_mix_rows(jxl_fimage *img, const jxl_image_metadata *meta,
+                          uint32_t y0, uint32_t y1) {
     uint32_t i, x, y, c;
-    if (img->ncolor != 3) return;
+    uint32_t nc = img->ncolor;
+    if (nc != 1 && nc != 3) return;
     for (i = 0; i < meta->num_extra; i++) {
         const jxl_ec_info *ec = &meta->ec_info[i];
         const jxl_fplane *sp;
-        if (ec->type != JXL_EC_SPOT || 3 + i >= img->nplane) continue;
-        sp = &img->plane[3 + i];
+        if (ec->type != JXL_EC_SPOT || nc + i >= img->nplane) continue;
+        sp = &img->plane[nc + i];
         if (!sp->data) continue;
-        for (c = 0; c < 3; c++) {
+        for (c = 0; c < nc; c++) {
             jxl_fplane *p = &img->plane[c];
             uint32_t w = JXL_MIN(p->w, sp->w), h = JXL_MIN(p->h, sp->h);
             if (!p->data) continue;
-            for (y = 0; y < h; y++) {
+            for (y = y0; y < y1 && y < h; y++) {
                 const float *s = sp->data + (size_t)y * sp->stride;
                 float *d = p->data + (size_t)y * p->stride;
                 for (x = 0; x < w; x++) {
@@ -151,6 +166,10 @@ void jxl_apply_spot_colours(jxl_fimage *img, const jxl_image_metadata *meta) {
             }
         }
     }
+}
+
+void jxl_apply_spot_colours(jxl_fimage *img, const jxl_image_metadata *meta) {
+    spot_mix_rows(img, meta, 0, 0xffffffffu);
 }
 
 /* A Modular sample holding a float's bit pattern -> float. libjxl's
@@ -776,6 +795,12 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     int have_patches = 0, have_splines = 0, have_noise = 0;
     int is_vardct, discard_cb;
     int lazy_int = 0;
+    /* libjxl's name for it: when the colour channels are upsampled and every
+       extra channel shares their factor, all of them are upsampled together,
+       late (after patches and splines). Otherwise each extra channel is
+       brought to full size by its own factor first, before patches. */
+    int late_ec_upsample = fh->upsampling != 1;
+    int any_ec_upsample = 0;
     uint32_t nspecs = 0, i, split;
     uint32_t color_w, color_h, group_dim, group_dim_shift;
     uint32_t num_lf_groups, num_groups, num_passes;
@@ -811,29 +836,19 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         return -1;
     }
 
-    /* Two things about extra channels we decline rather than get wrong.
-       Every other type -- depth, selection mask, CFA, thermal, black -- is
-       carried through as a plane, which is what libjxl does with it too. */
+    /* Extra channels of every type -- depth, selection mask, CFA, thermal,
+       black -- are carried through as planes, which is what libjxl does with
+       them too. */
     for (i = 0; i < meta->num_extra; i++) {
-        /* A different upsampling factor from the colour channels needs a
-           separate, earlier pass (libjxl's !late_ec_upsample path). Decoding
-           it as if the factors matched would silently misplace the channel. */
-        if (fh->ec_upsampling[i] != fh->upsampling) {
-            JXL_ERR(ctx, "frame: extra channel %u upsamples by %u but the "
-                         "colour channels by %u; not supported",
-                    (unsigned)i, (unsigned)fh->ec_upsampling[i],
-                    (unsigned)fh->upsampling);
+        /* The upsampler has kernels for 2x, 4x and 8x; so has libjxl's, which
+           is the limit on dim_shift x ec_upsampling in practice. */
+        if (fh->ec_upsampling[i] > 8) {
+            JXL_ERR(ctx, "frame: extra channel %u is stored at 1/%u of the "
+                         "image; at most 1/8 is supported",
+                    (unsigned)i, (unsigned)fh->ec_upsampling[i]);
             return -1;
         }
-        /* Spot colour is mixed into the colour channels of the displayed
-           image (jxl_apply_spot_colours), which needs three of them. A gray image with a spot channel is refused rather than left
-           silently unmixed: there is no file to check that case against. */
-        if (meta->ec_info[i].type == JXL_EC_SPOT &&
-            meta->colour.colour_space == JXLDEC_CS_GRAY) {
-            JXL_ERR(ctx, "frame: extra channel %u is a spot colour on a "
-                         "grayscale image; not supported", (unsigned)i);
-            return -1;
-        }
+        if (fh->ec_upsampling[i] != fh->upsampling) late_ec_upsample = 0;
     }
 
     color_w = jxl_frame_color_width(fh);
@@ -919,8 +934,11 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         uint32_t u = fh->ec_upsampling[i];
         int32_t actual;
         while (u > 1) { ec_shift++; u >>= 1; }
-        actual = (int32_t)(ec_shift + meta->ec_info[i].dim_shift) -
-                 (int32_t)color_upsampling_shift;
+        if (ec_shift) any_ec_upsample = 1;
+        /* ec_upsampling already includes dim_shift and is never below the
+           colour factor (jxl_read_frame_header), so this is the channel's
+           size relative to the colour planes. */
+        actual = (int32_t)ec_shift - (int32_t)color_upsampling_shift;
         if (actual < 0) actual = 0;
         specs[base + i].w = color_w;
         specs[base + i].h = color_h;
@@ -1270,7 +1288,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         lazy_int = st->lazy_int_ok && !is_vardct && !meta->xyb_encoded &&
                    !have_patches && !have_splines && !have_noise &&
                    !fh->gab.enabled && !fh->epf.enabled &&
-                   color_upsampling_shift == 0 &&
+                   color_upsampling_shift == 0 && !any_ec_upsample &&
                    !(apply_ct && fh->do_ycbcr && out->ncolor >= 3);
         for (i = 0; i < gmod.nbase; i++) {
             const jxl_mchan *ch = &gmod.base[i];
@@ -1333,6 +1351,25 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         if (modular_loop_filters(ctx, out, fh) != 0) goto done;
     }
 
+    /* Extra channels with a factor of their own go to full size here, each
+       by its own factor, before patches (libjxl's !late_ec_upsample). */
+    if (!late_ec_upsample && any_ec_upsample) {
+        uint32_t full_w = jxl_frame_sample_width(fh, 1);
+        uint32_t full_h = jxl_frame_sample_height(fh, 1);
+        for (i = 0; i < meta->num_extra; i++) {
+            uint32_t pi = out->ncolor + i, shift = 0, tw, th;
+            uint32_t u = fh->ec_upsampling[i];
+            while (u > 1) { shift++; u >>= 1; }
+            if (shift == 0 || pi >= out->nplane || !out->plane[pi].data) continue;
+            tw = out->plane[pi].w << shift;
+            th = out->plane[pi].h << shift;
+            if (tw > full_w) tw = full_w;
+            if (th > full_h) th = full_h;
+            if (jxl_upsample_plane(ctx, &out->plane[pi], shift, meta, tw, th) != 0)
+                goto done;
+        }
+    }
+
     /* Patches blend pre-color-transform samples from a reference frame. */
     if (have_patches) {
         if (jxl_apply_patches(ctx, out, &patches, meta, st->refs,
@@ -1349,13 +1386,13 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     /* Upsampling sits between splines and noise, where libjxl's pipeline puts
        it (dec_cache.cc), so noise is synthesised at full resolution. When the
        colour channels are upsampled and every extra channel shares the same
-       factor, libjxl upsamples them all here together ("late_ec_upsample");
-       that is the case handled below, and jxl_frame_decode rejects the mixed
-       one up front. */
+       factor, libjxl upsamples them all here together ("late_ec_upsample").
+       Otherwise the extra channels were already brought to full size above
+       and only the colour planes are left. */
     if (color_upsampling_shift > 0) {
         uint32_t full_w = jxl_frame_sample_width(fh, 1);
         uint32_t full_h = jxl_frame_sample_height(fh, 1);
-        for (i = 0; i < out->nplane; i++) {
+        for (i = 0; i < (late_ec_upsample ? out->nplane : out->ncolor); i++) {
             /* Scale each plane by the factor rather than stretching it to the
                frame size: a colour plane is ceil(full / N) and lands exactly
                on full once the rounding is cropped off, while a plane that
@@ -1426,6 +1463,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                               out->plane[2].data + (size_t)row * out->plane[2].stride,
                               rw, opsin, meta->opsin_bias,
                               meta->tone_mapping.intensity_target);
+            if (st->spot_linear) spot_mix_rows(out, meta, row, row + 1);
             if (!out_enc.tf_have_gamma && out_enc.tf == JXL_TF_HLG) {
                 jxl_hlg_inverse_ootf(
                     out->plane[0].data + (size_t)row * out->plane[0].stride,
@@ -1440,6 +1478,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                                  meta->tone_mapping.intensity_target);
             }
         }
+        if (st->spot_linear) st->spot_done = 1;
         /* Grayscale XYB decodes into three identical planes; drop two so the
            extra channels (alpha!) keep their expected plane indices. */
         if (meta->colour.colour_space == JXLDEC_CS_GRAY && out->ncolor == 3) {

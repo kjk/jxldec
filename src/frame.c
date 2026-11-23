@@ -265,7 +265,19 @@ int jxl_read_frame_header(jxl_ctx *ctx, jxl_br *br, const jxl_size_header *size,
     if (!all_default && !(fh->flags & JXL_FF_USE_LF_FRAME)) {
         fh->upsampling = jxl_br_u32(br, 1, 0, 2, 0, 4, 0, 8, 0);
         for (i = 0; i < nec; i++) {
-            fh->ec_upsampling[i] = jxl_br_u32(br, 1, 0, 2, 0, 4, 0, 8, 0);
+            /* The coded factor is on top of the channel's own dim_shift, and
+               what everything downstream wants is the product: the channel
+               is stored at 1/ec_upsampling of the full image. libjxl folds
+               the two the same way and requires the result to be at least
+               the colour factor (an extra channel is never coded finer than
+               the colour it accompanies). */
+            uint32_t up = jxl_br_u32(br, 1, 0, 2, 0, 4, 0, 8, 0);
+            uint32_t dim_shift = meta->ec_info[i].dim_shift;
+            if (dim_shift > 8 || (up << dim_shift) < fh->upsampling) {
+                br->err = 1;
+                break;
+            }
+            fh->ec_upsampling[i] = up << dim_shift;
         }
     }
     if (fh->encoding == JXL_ENC_MODULAR) {

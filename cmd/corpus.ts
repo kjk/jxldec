@@ -8,8 +8,9 @@
 //
 // JXL_SPECS=<dir> overrides the corpus with any directory of .jxl files
 // (scanned recursively), the way DJVU_SPECS does in djvudec.
-import { existsSync, lstatSync, mkdirSync, readdirSync, statSync, writeFileSync } from "fs";
-import { basename, dirname, join, relative } from "path";
+import { existsSync, lstatSync, mkdirSync, openSync, readSync, closeSync,
+         readdirSync, statSync, writeFileSync } from "fs";
+import { basename, dirname, join, relative, resolve } from "path";
 import { CONFORMANCE_DIR, DEPS_DIR, LIBJXL_DIR, refTool } from "./get-deps";
 import { pngToPam } from "./png";
 
@@ -65,10 +66,11 @@ const iccProfile = (name: string) => join(
 const ICC_PROFILE = iccProfile("ProPhoto-v4");
 
 /** cjxl settings, one per generated variant. `peakTol` / `rmsTol` replace
- *  the test driver's default limits for that preset's files. */
+ *  the test driver's default limits for that preset's files; `alphaOnly`
+ *  restricts a preset to the sources that have an alpha channel. */
 export const PRESETS:
     { name: string; args: string[] | ((src: string) => string[]);
-      peakTol?: number; rmsTol?: number }[] = [
+      peakTol?: number; rmsTol?: number; alphaOnly?: boolean }[] = [
   { name: "m_e1", args: ["-d", "0", "-e", "1"] },
   { name: "m_e3", args: ["-d", "0", "-e", "3"] },
   { name: "m_e7", args: ["-d", "0", "-e", "7"] },
@@ -132,6 +134,15 @@ export const PRESETS:
     args: ["-d", "1", "-e", "7", "-x", "color_space=RGB_D65_202_Rel_PeQ"] },
   { name: "v_hlg", peakTol: 16,
     args: ["-d", "1", "-e", "7", "-x", "color_space=RGB_D65_202_Rel_HLG"] },
+  // An extra channel stored at a different resolution from the colour
+  // channels, which libjxl upsamples on its own, before patches, rather than
+  // together with them. One with full-size colour, one where both are
+  // downsampled by different factors. Only meaningful with an alpha channel,
+  // and on a source without one these would just repeat other presets.
+  { name: "m_ec2", alphaOnly: true,
+    args: ["-d", "0", "-e", "4", "--ec_resampling=2"] },
+  { name: "v_rs2_ec8", alphaOnly: true,
+    args: ["-d", "1", "-e", "4", "--resampling=2", "--ec_resampling=8"] },
   // EXIF orientation, which the writer undoes. The eight values are spread
   // across the sources by orientationFor, so this one preset reaches every
   // arm of unapply_orientation's switch, including the four that transpose.
@@ -180,13 +191,32 @@ function conformanceFiles(): string[] {
 
 // Files whose first frame `djxl x.jxl x.pam` writes in a shape we cannot
 // compare: it appends every extra channel as a further PAM plane, so
-// cmyk_layers comes out as five (RGB, K, alpha) and spot as six, where we
-// render RGB + alpha. `tests.ts -all-frames` checks them against libjxl
-// directly instead.
-const DJXL_UNCOMPARABLE = ["cmyk_layers", "spot"];
+// cmyk_layers comes out as five (RGB, K, alpha), spot as six and the gray
+// spot fixtures as two, where we render colour (+ alpha) with the ink mixed
+// in. `tests.ts -all-frames` checks them against libjxl directly instead.
+const DJXL_UNCOMPARABLE = [
+  "/testcases/cmyk_layers/", "/testcases/spot/", "/test/data/gray_spot_",
+];
 export function skipWithDjxl(file: string): boolean {
-  const f = file.replaceAll("\\", "/");
-  return DJXL_UNCOMPARABLE.some((t) => f.includes(`/testcases/${t}/`));
+  // Absolute, so a relative path given on the command line matches too.
+  const f = resolve(file).replaceAll("\\", "/");
+  return DJXL_UNCOMPARABLE.some((t) => f.includes(t));
+}
+
+// Fixtures checked into the repo: files no tool here can produce, made once
+// with libjxl's encoder API (see test/gen_gray_spot.c).
+const FIXTURE_DIR = join(import.meta.dir, "..", "test", "data");
+
+/** Whether a PAM source has an alpha channel, from its TUPLTYPE line. */
+function pamHasAlpha(pam: string): boolean {
+  const fd = openSync(pam, "r");
+  try {
+    const buf = Buffer.alloc(128);
+    const n = readSync(fd, buf, 0, 128, 0);
+    return buf.subarray(0, n).toString("latin1").includes("_ALPHA");
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** Source images shipped in libjxl's testdata, converted to PAM once. */
@@ -269,6 +299,7 @@ export function corpusFiles(presets = PRESETS.map((p) => p.name)): string[] {
     const base = basename(src).replace(/\.pam$/, "");
     for (const preset of PRESETS) {
       if (!presets.includes(preset.name)) continue;
+      if (preset.alphaOnly && !pamHasAlpha(src)) continue;
       const dst = join(GEN_DIR, `${base}.${preset.name}.jxl`);
       if (!existsSync(dst)) {
         const args = typeof preset.args === "function"
@@ -313,6 +344,7 @@ export function corpusFiles(presets = PRESETS.map((p) => p.name)): string[] {
     n.toLowerCase().endsWith(".jxl"),
   ));
   out.push(...conformanceFiles());
+  out.push(...walk(FIXTURE_DIR, (n) => n.toLowerCase().endsWith(".jxl")));
   if (generated) console.log(`corpus: generated ${generated} file(s)`);
   if (skipped.length) {
     console.warn(`corpus: ${skipped.length} source(s) cjxl could not encode:`);
@@ -377,7 +409,7 @@ export function corpusSummary(): string {
     ? walk(process.env.JXL_SPECS, isJxl).length
     : walk(GEN_DIR, isJxl).length +
       walk(join(LIBJXL_DIR, "testdata", "jxl"), isJxl).length +
-      conformanceFiles().length;
+      conformanceFiles().length + walk(FIXTURE_DIR, isJxl).length;
   return `${n} .jxl file(s) available from ${src}`;
 }
 

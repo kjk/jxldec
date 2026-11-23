@@ -8,8 +8,8 @@ A decode-only [JPEG XL](https://fileformats.dev/jxl) library, in the spirit of
 * simple to integrate: copy `dist/jxl.h` and `dist/jxl.c` into your project.
   That is `src/*` amalgamated into a single translation unit, like sqlite
 * single-threaded by design
-* verified against libjxl on a corpus of 1547 `.jxl` files: libjxl's test
-  images encoded 21 ways, plus the JPEG XL conformance testcases
+* verified against libjxl on a corpus of 1579 `.jxl` files: libjxl's test
+  images encoded 23 ways, plus the JPEG XL conformance testcases
 
 ## API
 Sketch (full documentation in [`src/jxl.h`](src/jxl.h)):
@@ -56,22 +56,24 @@ turns on `jxl_ctx_set_srgb_output`. With no option it prints `-info`.
 
 ## Status
 See [PROGRESS.md](PROGRESS.md) for the full feature matrix. In short,
-`bun cmd/tests.ts -all` decodes 1547 corpus files and compares each against
-`djxl`: **all 1547 match — 538 byte-exact, the rest inside the tolerance.**
+`bun cmd/tests.ts -all` decodes 1579 corpus files and compares each against
+`djxl`: **all 1579 match — 548 byte-exact, the rest inside the tolerance.**
 `bun cmd/tests.ts -all -all-frames` then checks *every frame* of every file
 against libjxl itself (`djxl` writes only the first frame of an animation):
-also 1547 of 1547.
+also 1579 of 1579.
 
 * **Byte-exact** against libjxl: Modular lossless (every effort level,
   palette, squeeze, RCT, every predictor), plus patches and reference frames.
 * **Within one 8-bit step**: VarDCT including progressive/LF frames, and
-  lossy Modular (XYB). Two conformance files reach two steps.
+  lossy Modular (XYB). A dozen files reach two or three steps on a few
+  near-black samples.
 * Also working: gaborish and EPF (on Modular frames too), splines, synthetic
   photon noise, 2x/4x/8x upsampling, all eight EXIF orientations, embedded
   ICC profiles, non-sRGB primaries (P3 and Rec.2100, Bradford-adapted),
   YCbCr/JPEG-transcoded frames in every chroma subsampling mode, layers and
-  animation with every blend mode and cropped frames, spot colours, extra
-  channels with their own bit depth, and lossless float samples.
+  animation with every blend mode and cropped frames, spot colours (on
+  grayscale images too), extra channels with their own bit depth or their own
+  resolution, and lossless float samples.
 * Transfer functions: sRGB, 709, HLG (with its OOTF) and PQ. PQ is verified
   only loosely: its slope at black turns the ~1e-5 of float noise between two
   correct XYB decoders into tens of 8-bit steps, so that preset alone is held
@@ -85,9 +87,8 @@ tolerance too, and like it we gate on RMS and peak together rather than peak
 alone (`-rms`, default 0.6; `-tol`, default 3).
 
 Not implemented: encoding, JPEG reconstruction (`jbrd` boxes are skipped), and
-multithreading. Two things are rejected with an error rather than decoded
-wrongly: an extra channel whose upsampling factor differs from the colour
-channels', and a spot colour on a grayscale image. A preview frame is skipped,
+multithreading. An extra channel stored below 1/8 of the image size is
+rejected (libjxl has no upsampler for it either). A preview frame is skipped,
 not decoded — untested, since no available file has one.
 
 ## Performance

@@ -1169,6 +1169,11 @@ typedef struct {
        writer will read: integer channels may then be handed over as they
        are instead of being converted to float planes. */
     int lazy_int_ok;
+    /* Set by the frame walk for a wanted frame whose spot colours belong in
+       linear light; jxl_frame_decode mixes them during the XYB transform
+       and sets spot_done so the walk does not mix them again. */
+    int spot_linear;
+    int spot_done;
 } jxl_frame_state;
 
 void jxl_frame_state_free(jxl_ctx *ctx, jxl_frame_state *st);

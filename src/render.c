@@ -936,6 +936,9 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
         /* A wanted frame that replaces the whole canvas goes to the output
            writer untouched. */
         st.lazy_int_ok = want && !needs_blend && !has_spot;
+        st.spot_linear = want && has_spot && !needs_blend &&
+                         !(can_ref && !fh.save_before_ct);
+        st.spot_done = 0;
         if (jxl_frame_decode(ctx, doc, &fh, &toc, &st, apply_ct, &tmp) != 0) {
             jxl_toc_free(ctx, &toc);
             jxl_frame_header_free(ctx, &fh);
@@ -987,7 +990,8 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
                the walk ends at the wanted frame -- so it is moved, not
                copied, either way. */
             if (want) {
-                if (has_spot) jxl_apply_spot_colours(&tmp, &doc->meta);
+                if (has_spot && !st.spot_done)
+                    jxl_apply_spot_colours(&tmp, &doc->meta);
                 *img = tmp;
                 memset(&tmp, 0, sizeof(tmp));
                 if (info_out) {

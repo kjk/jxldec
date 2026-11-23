@@ -4,24 +4,26 @@ Milestone log for the C JPEG XL decoder. Newest first.
 
 ## Status summary
 
-`bun cmd/tests.ts -all` — 1547 corpus files (libjxl's testdata images × 21 cjxl
-presets, its JPEGs transcoded, the `.jxl` files that ship with libjxl, and the
-24 JPEG XL conformance testcases):
+`bun cmd/tests.ts -all` — 1579 corpus files (libjxl's testdata images × 23 cjxl
+presets, two of them only for sources with alpha; its JPEGs transcoded; the
+`.jxl` files that ship with libjxl; the 24 JPEG XL conformance testcases; and
+the two fixtures in `test/data/`):
 
 ```
-1547/1547 ok, 0 failed
-538 byte-exact, 1006 within tolerance (worst peak 23.00; 2.00 outside the presets with their own limit), 3 skipped
+1579/1579 ok, 0 failed
+548 byte-exact, 1026 within tolerance (worst peak 23.00; 3.00 outside the presets with their own limit), 5 skipped
 ```
 
 "ok" means byte-identical to `djxl file.jxl out.pam`, or inside the float
 tolerance for the lossy paths. Outside the two HDR presets, which carry their
 own limits (see `cmd/corpus.ts` for why), no sample differs from libjxl by
-more than two 8-bit steps, and by more than one only in two conformance
-files. The three skips are files `djxl` cannot write comparably (CMYK and
-spot colour get extra PAM planes, float samples are refused).
+more than three 8-bit steps, and by more than one only in a dozen files, on
+a few near-black samples each. The five skips are files `djxl` cannot write
+comparably (CMYK and spot colour get extra PAM planes, float samples are
+refused).
 
 `bun cmd/tests.ts -all -all-frames` checks every frame of every file against
-libjxl directly (`test/jxl_ref.c`), skips nothing, and is also 1547/1547.
+libjxl directly (`test/jxl_ref.c`), skips nothing, and is also 1579/1579.
 
 | area | state |
 |---|---|
@@ -42,7 +44,8 @@ libjxl directly (`test/jxl_ref.c`), skips nothing, and is also 1547/1547.
 | EXIF orientation, all 8 values | within 1 |
 | animation (frames after the first) | done, every frame checked against libjxl |
 | layers, all blend modes, cropped frames | done (conformance: blendmodes, sunset_logo, cmyk_layers) |
-| spot colour | done for RGB (conformance: spot); gray + spot is rejected |
+| spot colour | done (conformance: spot; gray: test/data/gray_spot_*) |
+| extra channels at their own resolution (`--ec_resampling`) | within 1 |
 | extra channels with their own bit depth | done |
 | lossless float samples | done (conformance: lossless_pfm) |
 | Gaborish / EPF on Modular frames | within 1 |
@@ -1763,6 +1766,41 @@ latency than three adds.
 Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
+
+### The last two rejections: mixed extra-channel resolution, gray spot colour
+Both used to be refused with an error on the grounds that nothing could
+produce a file to check them against. Both grounds were wrong.
+
+**Extra channels at their own resolution.** `cjxl --ec_resampling` produces
+them. The frame header's `ec_upsampling` is on top of the channel's
+`dim_shift`, so the two are folded at read time (and, as in libjxl, the
+product may not be below the colour factor). Decoding then follows libjxl's
+`late_ec_upsample` rule: if the colour channels are upsampled and every
+extra channel shares their factor, everything is upsampled together after
+patches and splines; otherwise each extra channel goes to full size by its
+own factor *before* patches and only the colour planes are upsampled later.
+Checked on sixteen combinations of `--resampling` 1/2/4 with
+`--ec_resampling` 2/4/8, lossless and lossy: all within one step of libjxl.
+Two alpha-only presets, `m_ec2` and `v_rs2_ec8`, keep it covered. A factor
+above 8 is still rejected; libjxl has no kernel for it either.
+
+This also retires a quiet inaccuracy: a channel with `dim_shift > 0` used to
+be accepted and nearest-neighbour scaled at output. It is upsampled properly
+now.
+
+**Spot colour on a grayscale image.** No tool emits one, so
+`test/gen_gray_spot.c` makes two with libjxl's encoder API (lossless Modular
+and lossy XYB) and they are checked in under `test/data/`. What libjxl does:
+its pipeline carries three identical channels for gray and outputs the
+first, so the gray is mixed with the ink's *red* component.
+
+Making the lossy fixture turned up something the RGB conformance file could
+not: where the mix happens depends on the frame. libjxl applies the transfer
+curve early only when blending or a saved reference needs encoded samples,
+and the spot stage sits after that point -- so for a plain XYB frame the ink
+is mixed in **linear light**, before the curve (peak 35 if done after). The
+conformance `spot` file is two blended layers, which is why mixing into
+encoded samples matched there.
 
 ### Conformance files, an all-frames oracle, and everything they exposed
 The previous entry ended with a list of suspected bugs that had no test file.

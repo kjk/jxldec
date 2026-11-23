@@ -177,6 +177,10 @@ two HDR ones do, and the comment there says exactly why (PQ's slope at black
 turns float noise into tens of 8-bit steps). Do not reach for that to make a
 failing preset pass: every other preset is held to the default limits.
 
+`test/data/` holds fixtures no tool here can produce, made once with
+libjxl's encoder API (`test/gen_gray_spot.c` says how to rebuild them). They
+are part of the corpus.
+
 When a decoder bug turns up in a path the corpus does not reach, add the
 `cjxl` flag that reaches it as a preset (`m_rct7` and `m_p13` exist for
 exactly that reason) rather than only fixing the bug.
@@ -249,7 +253,11 @@ Compositing follows libjxl's pipeline (`dec_cache.cc`), and the order matters:
 3. Reference-only frames and `save_before_ct` frames are saved as decoded:
    frame-sized, unblended, pre-colour-transform. That is what patches read.
 4. Spot colours are mixed into the displayed frame last, after blending, and
-   never into a saved reference.
+   never into a saved reference. For a plain XYB frame (no blending, not
+   saved after the colour transform) that means in **linear light**, before
+   the transfer curve, because libjxl only applies the curve early when
+   blending or a reference needs it (`jxl_frame_state.spot_linear`). A gray
+   image is mixed with the ink's red component.
 
 Without an animation header there is exactly one displayed frame, however
 many layers the file has, so `jxl_doc_frame_count` answers 1 without walking.
@@ -317,6 +325,10 @@ current; it lists the exact pass rate and every known gap.
 - A permutation-only RCT (rct_type 7, 14, ...) has to move samples. Swapping
   `jxl_mchan` views is invisible to everything that reads
   `jxl_modular.base[]`, and breaks squeeze's adjacency assumption.
+- `fh->ec_upsampling[i]` is the coded factor `<< dim_shift`, i.e. the
+  channel's real size relative to the image. Extra channels are upsampled
+  together with colour only when every one shares the colour factor
+  (`late_ec_upsample`); otherwise each goes first, alone, before patches.
 - Each extra channel is scaled by its **own** bit depth, and a float channel
   holds IEEE bit patterns (`modular_sample_to_float`), not counts.
 - Gaborish and EPF apply to Modular frames too, with the constant
