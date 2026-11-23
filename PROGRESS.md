@@ -73,8 +73,9 @@ different IDCT factorizations and different `powf` approximations, so exact
 equality is not achievable and libjxl's own conformance testing uses a
 tolerance. Following it, a VarDCT file passes on RMS **and** peak together
 (`-rms` 0.6, `-tol` 3 in 8-bit steps), not peak alone: a single sample should
-not decide a megapixel file. Max abs difference ≤ 1 currently holds on every
-corpus file anyway.
+not decide a megapixel file. Max abs difference ≤ 1 holds on every file of
+the generated corpus outside the HDR presets; see the status summary above
+for the exceptions.
 
 ## Remaining differences
 
@@ -93,7 +94,9 @@ corpus file anyway.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1245-file corpus we are **about 1.10x libjxl** (the latest best-of-five sweep
+1580-file corpus we are **about 0.99x libjxl** (0.993x; see "Re-measured
+after the conformance work" in the log for how, and per preset). Before
+that, over the 1245-file corpus, **about 1.10x libjxl** (the best-of-five sweep
 measured 18089.84ms against 16470.12ms, **1.0983x**; an immediately preceding
 best-of-three sweep measured 18195.22ms against 16560.84ms, **1.0987x**;
 1.124x before the recent work below, with both columns thermally slower than
@@ -108,8 +111,9 @@ specialization; 2.74x before the SIMD work below;
 average up). libjxl is AVX2 throughout; our hot loops use runtime-selected
 SSE2/AVX2 kernels (noise, upsampling, EPF, gaborish, both DCT passes, YCbCr
 and XYB conversion, the sRGB transfer function and the output quantiser), so
-a constant factor is expected. Each keeps a scalar twin and is checked
-bit-identical against it -- see the log.
+a constant factor is expected. Each keeps a scalar twin; the SSE2 ones are
+checked bit-identical against it, the AVX2+FMA ones (DCT, dequantiser, EPF)
+are not bit-identical -- see the log.
 
 `bun cmd/prof.ts <file.jxl>` profiles our decoder alone through the sibling
 `../winperf` and prints its `-print-agent` report (top self-time functions,
@@ -1766,6 +1770,40 @@ latency than three adds.
 Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
+
+### Re-measured after the conformance work
+The last numbers (1.10x) were from before the audit and the conformance
+fixes, on the 1245-file corpus. Measured again: `5fe3b66` (the last commit
+before that work) against `bb1769f`, both from the amalgamation, MSVC,
+single-threaded, pinned to CPU 4 (a P-core), two alternating rounds of
+best-of-three, native output format. libjxl runs interleaved with ours on
+every file, so the ratio against it cancels most background noise -- there
+was a lot (other agents running; libjxl's own total drifted ~8% between
+rounds), so changes under ~2% per preset are noise.
+
+| | files | jxldec / libjxl |
+|---|---|---|
+| old decoder, files it decodes | 1515 | 1.056x |
+| new decoder, the same files | 1515 | 0.997x |
+| new decoder, whole corpus | 1580 | 0.993x |
+| new decoder, files of the old 1245-file corpus | 1248 | 0.981x |
+
+(The old decoder refuses or fails 65 of today's files: mixed-resolution
+extra channels, `-P 13`, spot colour.) The old one measures 1.056x here
+rather than 1.10x because the comparison differs: the native format, and
+the larger corpus.
+
+What moved, new against old, libjxl-normalised:
+- **PQ 57% faster**: libjxl's rational polynomial instead of two `powf`
+  per sample, which was also the accuracy fix.
+- **HLG 27% slower**: the inverse OOTF added one `powf` per pixel.
+- **`grayscale_public_university` 2.5x slower** (54 -> 121 ms): the
+  Modular frame that now gets Gaborish and 3-pass EPF. The old decoder
+  skipped them, and was wrong.
+- **`-P 13` 4% slower**: AvgAll leaves are off the flat-run fast path.
+- **Lossless Modular 2-5% faster** (`m_e9`, `m_rct7`, `m_e7`): the
+  allocation cleanups -- fewer scratch rows, `ans_parse` on the stack.
+- Everything else within +-2%.
 
 ### A real file with custom dequant tables
 The x64 scale on custom IDENTITY (Hornuss) and DCT2 dequant weights went in
