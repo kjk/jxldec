@@ -145,8 +145,12 @@ export const PRESETS:
   // and on a source without one these would just repeat other presets.
   { name: "m_ec2", alphaOnly: true,
     args: ["-d", "0", "-e", "4", "--ec_resampling=2"] },
-  { name: "v_rs2_ec8", alphaOnly: true,
-    args: ["-d", "1", "-e", "4", "--resampling=2", "--ec_resampling=8"] },
+  // Effort 7 like the other lossy presets, deliberately: at -e 4 the same
+  // settings leave a few near-black samples 2-4 steps off depending on the
+  // CPU (the AVX2 EPF's approximate reciprocal is vendor-specific), which is
+  // right on the peak limit and has nothing to do with the extra channel.
+  { name: "v_ec8", alphaOnly: true,
+    args: ["-d", "1", "-e", "7", "--resampling=2", "--ec_resampling=8"] },
   // EXIF orientation, which the writer undoes. The eight values are spread
   // across the sources by orientationFor, so this one preset reaches every
   // arm of unapply_orientation's switch, including the four that transpose.

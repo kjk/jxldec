@@ -1792,7 +1792,7 @@ patches and splines; otherwise each extra channel goes to full size by its
 own factor *before* patches and only the colour planes are upsampled later.
 Checked on sixteen combinations of `--resampling` 1/2/4 with
 `--ec_resampling` 2/4/8, lossless and lossy: all within one step of libjxl.
-Two alpha-only presets, `m_ec2` and `v_rs2_ec8`, keep it covered. A factor
+Two alpha-only presets, `m_ec2` and `v_ec8`, keep it covered. A factor
 above 8 is still rejected; libjxl has no kernel for it either.
 
 This also retires a quiet inaccuracy: a channel with `dim_shift > 0` used to
