@@ -289,6 +289,71 @@ static void up_block8(const float *const *srow, uint32_t x, uint32_t N,
         vhi = mx;
     }
 
+    /* 8x: the same trick as 4x below, with all eight horizontal phases of
+       an output row accumulated off one walk of the 25 input vectors (25
+       loads per row instead of 200), and the eight accumulators -- one
+       output column each, for eight input samples -- turned into eight
+       output runs with an 8x8 transpose instead of 64 lane stores. Every
+       accumulator still adds taps 0..24 in scalar order. */
+    if (N == 8 && ny == 8) {
+        __m256 m;
+        for (oy = 0; oy < 8; oy++) {
+            const float *kr = kernel + (size_t)oy * 8 * 25;
+            __m256 a[8];
+            float *drow = dst_rows[oy];
+            int t = 0, j;
+            for (j = 0; j < 8; j++) a[j] = _mm256_setzero_ps();
+            for (py = 0; py < 5; py++) {
+                const float *r = srow[py] + x - 2;
+                for (px = 0; px < 5; px++, t++) {
+                    __m256 v = _mm256_loadu_ps(r + px);
+                    for (j = 0; j < 8; j++) {
+                        a[j] = _mm256_add_ps(a[j], _mm256_mul_ps(
+                            v, _mm256_set1_ps(kr[j * 25 + t])));
+                    }
+                }
+            }
+            for (j = 0; j < 8; j++) {
+                m = _mm256_cmp_ps(a[j], vlo, _CMP_LT_OQ);
+                a[j] = _mm256_or_ps(_mm256_and_ps(m, vlo),
+                                    _mm256_andnot_ps(m, a[j]));
+                m = _mm256_cmp_ps(a[j], vhi, _CMP_GT_OQ);
+                a[j] = _mm256_or_ps(_mm256_and_ps(m, vhi),
+                                    _mm256_andnot_ps(m, a[j]));
+            }
+            {   /* a[j] lane i is output column j of input sample x + i;
+                   row i of the transpose is that sample's eight outputs. */
+                __m256 t0 = _mm256_unpacklo_ps(a[0], a[1]);
+                __m256 t1 = _mm256_unpackhi_ps(a[0], a[1]);
+                __m256 t2 = _mm256_unpacklo_ps(a[2], a[3]);
+                __m256 t3 = _mm256_unpackhi_ps(a[2], a[3]);
+                __m256 t4 = _mm256_unpacklo_ps(a[4], a[5]);
+                __m256 t5 = _mm256_unpackhi_ps(a[4], a[5]);
+                __m256 t6 = _mm256_unpacklo_ps(a[6], a[7]);
+                __m256 t7 = _mm256_unpackhi_ps(a[6], a[7]);
+                __m256 s0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1, 0, 1, 0));
+                __m256 s1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3, 2, 3, 2));
+                __m256 s2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1, 0, 1, 0));
+                __m256 s3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3, 2, 3, 2));
+                __m256 s4 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(1, 0, 1, 0));
+                __m256 s5 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(3, 2, 3, 2));
+                __m256 s6 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(1, 0, 1, 0));
+                __m256 s7 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(3, 2, 3, 2));
+                float *d = drow + (size_t)x * 8;
+                _mm256_storeu_ps(d + 0 * 8, _mm256_permute2f128_ps(s0, s4, 0x20));
+                _mm256_storeu_ps(d + 1 * 8, _mm256_permute2f128_ps(s1, s5, 0x20));
+                _mm256_storeu_ps(d + 2 * 8, _mm256_permute2f128_ps(s2, s6, 0x20));
+                _mm256_storeu_ps(d + 3 * 8, _mm256_permute2f128_ps(s3, s7, 0x20));
+                _mm256_storeu_ps(d + 4 * 8, _mm256_permute2f128_ps(s0, s4, 0x31));
+                _mm256_storeu_ps(d + 5 * 8, _mm256_permute2f128_ps(s1, s5, 0x31));
+                _mm256_storeu_ps(d + 6 * 8, _mm256_permute2f128_ps(s2, s6, 0x31));
+                _mm256_storeu_ps(d + 7 * 8, _mm256_permute2f128_ps(s3, s7, 0x31));
+            }
+        }
+        _mm256_zeroupper();
+        return;
+    }
+
     /* Four horizontal phases on one 4x output row share the same 25 input
        vectors. Accumulate those phases together, reducing the filter loads
        from 4 * 25 to 25 per output row without carrying all sixteen output

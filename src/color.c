@@ -262,15 +262,20 @@ static float tf_bt709(float v) {
    two powf of the definition: the curve is so steep at black that the two
    differ by several 8-bit steps there, and libjxl is what we are compared
    against. Note the 1e-4 switch is on the unscaled sample, as in libjxl. */
+static const float jxl_pq_p[5] = {1.351392e-02f, -1.095778e+00f,
+                                  5.522776e+01f, 1.492516e+02f, 4.838434e+01f};
+static const float jxl_pq_q[5] = {1.012416e+00f, 2.016708e+01f,
+                                  9.263710e+01f, 1.120607e+02f, 2.590418e+01f};
+static const float jxl_pq_plo[5] = {9.863406e-06f, 3.881234e-01f,
+                                    1.352821e+02f, 6.889862e+04f,
+                                    -2.864824e+05f};
+static const float jxl_pq_qlo[5] = {3.371868e+01f, 1.477719e+03f,
+                                    1.608477e+04f, -4.389884e+04f,
+                                    -2.072546e+05f};
+
 static float tf_pq(float v, float scale) {
-    static const float p[5] = {1.351392e-02f, -1.095778e+00f, 5.522776e+01f,
-                               1.492516e+02f, 4.838434e+01f};
-    static const float q[5] = {1.012416e+00f, 2.016708e+01f, 9.263710e+01f,
-                               1.120607e+02f, 2.590418e+01f};
-    static const float plo[5] = {9.863406e-06f, 3.881234e-01f, 1.352821e+02f,
-                                 6.889862e+04f, -2.864824e+05f};
-    static const float qlo[5] = {3.371868e+01f, 1.477719e+03f, 1.608477e+04f,
-                                 -4.389884e+04f, -2.072546e+05f};
+    const float *p = jxl_pq_p, *q = jxl_pq_q;
+    const float *plo = jxl_pq_plo, *qlo = jxl_pq_qlo;
     float a = fabsf(v);
     float x = sqrtf(sqrtf(a * scale));
     const float *pp = a < 1e-4f ? plo : p;
@@ -631,6 +636,72 @@ static void hlg_ootf_x4(float *r, float *g, float *b, size_t n,
     *pos = i;
 }
 
+/* tf_pq four / eight at a time, operation for operation: both polynomials
+   are evaluated and the 1e-4 test (on the unscaled magnitude, as in the
+   scalar code) selects one, then the sign is put back. */
+static void tf_pq_x4(float *v, size_t n, float scale, size_t *pos) {
+    const __m128 absmask = _mm_castsi128_ps(_mm_set1_epi32(0x7fffffff));
+    const __m128 vscale = _mm_set1_ps(scale), lo = _mm_set1_ps(1e-4f);
+    size_t i = *pos;
+    int k;
+    for (; i + 4 <= n; i += 4) {
+        __m128 v4 = _mm_loadu_ps(v + i);
+        __m128 a = _mm_and_ps(v4, absmask);
+        __m128 x = _mm_sqrt_ps(_mm_sqrt_ps(_mm_mul_ps(a, vscale)));
+        __m128 yp = _mm_set1_ps(jxl_pq_p[4]), yq = _mm_set1_ps(jxl_pq_q[4]);
+        __m128 ypl = _mm_set1_ps(jxl_pq_plo[4]), yql = _mm_set1_ps(jxl_pq_qlo[4]);
+        __m128 m, r;
+        for (k = 3; k >= 0; k--) {
+            yp = _mm_add_ps(_mm_mul_ps(yp, x), _mm_set1_ps(jxl_pq_p[k]));
+            yq = _mm_add_ps(_mm_mul_ps(yq, x), _mm_set1_ps(jxl_pq_q[k]));
+            ypl = _mm_add_ps(_mm_mul_ps(ypl, x), _mm_set1_ps(jxl_pq_plo[k]));
+            yql = _mm_add_ps(_mm_mul_ps(yql, x), _mm_set1_ps(jxl_pq_qlo[k]));
+        }
+        m = _mm_cmplt_ps(a, lo);
+        r = _mm_or_ps(_mm_and_ps(m, _mm_div_ps(ypl, yql)),
+                      _mm_andnot_ps(m, _mm_div_ps(yp, yq)));
+        /* v < 0 -> -r: copy v's sign bit (a negative zero stays positive,
+           as the scalar v < 0.0f test leaves it). */
+        r = _mm_or_ps(r, _mm_and_ps(_mm_cmplt_ps(v4, _mm_setzero_ps()),
+                                    _mm_set1_ps(-0.0f)));
+        _mm_storeu_ps(v + i, r);
+    }
+    *pos = i;
+}
+
+JXL_TARGET_AVX2
+static void tf_pq_x8(float *v, size_t n, float scale, size_t *pos) {
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256 vscale = _mm256_set1_ps(scale), lo = _mm256_set1_ps(1e-4f);
+    size_t i = *pos;
+    int k;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v8 = _mm256_loadu_ps(v + i);
+        __m256 a = _mm256_and_ps(v8, absmask);
+        __m256 x = _mm256_sqrt_ps(_mm256_sqrt_ps(_mm256_mul_ps(a, vscale)));
+        __m256 yp = _mm256_set1_ps(jxl_pq_p[4]), yq = _mm256_set1_ps(jxl_pq_q[4]);
+        __m256 ypl = _mm256_set1_ps(jxl_pq_plo[4]);
+        __m256 yql = _mm256_set1_ps(jxl_pq_qlo[4]);
+        __m256 m, r;
+        for (k = 3; k >= 0; k--) {
+            yp = _mm256_add_ps(_mm256_mul_ps(yp, x), _mm256_set1_ps(jxl_pq_p[k]));
+            yq = _mm256_add_ps(_mm256_mul_ps(yq, x), _mm256_set1_ps(jxl_pq_q[k]));
+            ypl = _mm256_add_ps(_mm256_mul_ps(ypl, x),
+                                _mm256_set1_ps(jxl_pq_plo[k]));
+            yql = _mm256_add_ps(_mm256_mul_ps(yql, x),
+                                _mm256_set1_ps(jxl_pq_qlo[k]));
+        }
+        m = _mm256_cmp_ps(a, lo, _CMP_LT_OQ);
+        r = _mm256_blendv_ps(_mm256_div_ps(yp, yq), _mm256_div_ps(ypl, yql), m);
+        r = _mm256_or_ps(r, _mm256_and_ps(
+            _mm256_cmp_ps(v8, _mm256_setzero_ps(), _CMP_LT_OQ),
+            _mm256_set1_ps(-0.0f)));
+        _mm256_storeu_ps(v + i, r);
+    }
+    _mm256_zeroupper();
+    *pos = i;
+}
+
 JXL_TARGET_AVX2
 static void hlg_ootf_x8(float *r, float *g, float *b, size_t n,
                         const float lum[3], float e, size_t *pos) {
@@ -713,7 +784,12 @@ void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
         case JXL_TF_PQ:
             {
                 float scale = intensity_target / 10000.0f;
-                for (i = 0; i < n; i++) v[i] = tf_pq(v[i], scale);
+                i = 0;
+#ifdef JXL_COLOR_SSE2
+                if (jxl_has_avx2()) tf_pq_x8(v, n, scale, &i);
+                tf_pq_x4(v, n, scale, &i);
+#endif
+                for (; i < n; i++) v[i] = tf_pq(v[i], scale);
             }
             break;
         case JXL_TF_DCI:

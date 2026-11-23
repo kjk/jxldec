@@ -1096,7 +1096,59 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
 
                 coeff_ctx_base = block_ctx * 458 + 37 * bc->num_block_clusters;
                 if (coeff_offsets && p->coeff_shift == 0 &&
-                    !dist->lz77_enabled) {
+                    !dist->lz77_enabled && !dist->use_prefix) {
+                    /* The ANS form of the loop below, which is most of a
+                       VarDCT decode (about half of a JPEG transcode's). Going
+                       through jxl_dec_read_clustered_no_lz77 costs two calls
+                       per coefficient, a prefix-or-ANS test, and a trip
+                       through memory for the coder state and the bit reader,
+                       which no compiler can keep in registers across those
+                       calls. Here both are locals for the whole block -- the
+                       bit reader only escapes to the rare hybrid-uint tail --
+                       and are written back at the end, as
+                       modular_decode_grad_wp_nec does for Modular. The
+                       symbols and values are the same; only where the state
+                       lives changes. */
+                    jxl_br lbr = *br;
+                    uint32_t state = dist->state;
+                    const uint8_t *clusters =
+                        dist->clusters + cluster_base + coeff_ctx_base;
+                    int bad = 0;
+                    for (k = 1; k < 64; k++) {
+                        uint32_t nzi = non_zeros - 1;
+                        uint32_t fi = k - 1;
+                        uint32_t coeff_ctx =
+                            (coeff_num_nonzero_context[nzi] +
+                             coeff_freq_context[fi]) * 2 + is_prev_nonzero;
+                        uint32_t ucoeff, cl;
+                        int32_t coeff;
+
+                        if (coeff_ctx >= 458) {
+                            bad = 1;
+                            break;
+                        }
+                        cl = clusters[coeff_ctx];
+                        ucoeff = jxl_ans_read_symbol(&dist->ans[cl], &lbr,
+                                                     &state);
+                        if (ucoeff >= dist->configs[cl].split) {
+                            ucoeff = jxl_dec_hybrid_uint(
+                                &lbr, &dist->configs[cl], ucoeff);
+                        }
+                        coeff = (int32_t)((ucoeff >> 1) ^
+                                          (((~ucoeff) & 1u) - 1u));
+                        JXL_COEFF_ADD(coeff_out[coeff_offsets[k]], coeff);
+                        is_prev_nonzero = ucoeff != 0;
+                        non_zeros -= is_prev_nonzero;
+                        if (non_zeros == 0) break;
+                    }
+                    *br = lbr;
+                    dist->state = state;
+                    if (bad) {
+                        JXL_ERR(ctx, "vardct: too many zeros in varblock");
+                        goto done;
+                    }
+                } else if (coeff_offsets && p->coeff_shift == 0 &&
+                           !dist->lz77_enabled) {
                     for (k = 1; k < 64; k++) {
                         uint32_t nzi = non_zeros - 1;
                         uint32_t fi = k - 1;

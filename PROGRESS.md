@@ -1773,6 +1773,40 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### The four slowest file kinds: PQ, JPEG transcodes, resampled, 1/8 alpha
+Profiled first, two ways that need no Administrator prompt: stage timers in
+a scratch copy of the sources, and a 50 us sampler (a second thread suspends
+the decoder, reads RIP, resumes; DbgHelp symbolises from the PDB) against the
+amalgamation, so inlining is what ships. Then, per change, an A/B that
+differs only in that change, pinned, interleaved, best of five.
+
+| change | effect | output |
+|---|---|---|
+| PQ curve on SSE2/AVX2 (`tf_pq_x4` / `_x8`) | `v_pq` 1.35x -> 1.03x libjxl; `flower.v_pq` colour transform 36 -> 9 ms | bit-identical to scalar, all 67 PQ files |
+| HF coefficients: ANS state and bit reader in locals for the DCT8 loop | 3-4.5% on every sizeable VarDCT and JPEG file | same symbols, same pixels |
+| 8x upsampling: one walk of the 25 inputs per output row, 8x8 transpose store | `v_ec8` 4-7% | bit-identical to scalar |
+
+Every corpus file renders bit-identically to before.
+
+What did not work, and why the rest is where it is:
+- **JPEG transcodes** are half ANS symbol decoding -- the alias-table lookup
+  itself, which libjxl pays too -- then coefficient placement, then zeroing
+  three full-size coefficient planes. Only the call overhead around the
+  lookup was ours to remove (the change above).
+- **Resampled frames**: the 2x filter is not arithmetic-bound. FMA made it
+  5% *slower*; FMA with split accumulators, 9% slower. What it is bound by
+  is memory: each upsampled plane is a new full-resolution float buffer
+  (41 MB for three channels at 2268x1512), and first-touch page faults on it
+  cost about as much as the filter (6.4 ms against 8.8 on `flower.v_rs2`),
+  before the colour transform and the output writer each stream all of it
+  again. libjxl upsamples into small row buffers and goes straight to the
+  output. Matching it means streaming upsampling -> colour transform ->
+  output a band of rows at a time for a frame that needs nothing else at
+  full resolution -- a structural change, not a kernel one.
+- **`flower_alpha.v_pq`** stays slow for an unrelated reason: half of it is
+  the lossless Modular alpha channel (weighted predictor), the same cost
+  every `flower_alpha` file pays.
+
 ### HLG and gray Modular EPF, the two costs the re-measure found
 **HLG** (66 `v_hlg` files: 880 -> 627 ms, 1.47x -> 1.05x libjxl). The
 inverse OOTF did a `powf` per pixel and the HLG curve a `logf` per sample.
