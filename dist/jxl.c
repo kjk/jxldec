@@ -504,8 +504,6 @@ int jxl_dec_init(jxl_ctx *ctx, jxl_dec *dec, jxl_br *br, uint32_t num_dist);
 void jxl_dec_begin(jxl_dec *dec, jxl_br *br);
 void jxl_dec_free(jxl_dec *dec);
 uint32_t jxl_dec_read(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx);
-uint32_t jxl_dec_read_mult(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx,
-                           uint32_t dist_multiplier);
 
 uint32_t jxl_dec_read_clustered(jxl_dec *dec, jxl_br *br, uint32_t cluster,
                                 uint32_t dist_multiplier);
@@ -533,6 +531,7 @@ static JXL_INLINE_HINT uint32_t jxl_ans_read_symbol(const jxl_ans_hist *h,
 
 uint32_t jxl_dec_hybrid_uint(jxl_br *br, const jxl_int_config *cfg,
                              uint32_t token);
+
 uint32_t jxl_dec_read_clustered_no_lz77(jxl_dec *dec, jxl_br *br,
                                         uint32_t cluster);
 
@@ -839,12 +838,6 @@ typedef enum {
     JXL_TR_DCT128X256, JXL_TR_COUNT
 } jxl_transform_type;
 
-void jxl_tr_select_size(int tr, uint32_t *bw, uint32_t *bh);
-void jxl_tr_matrix_size(int tr, uint32_t *w, uint32_t *h);
-int jxl_tr_matrix_index(int tr);
-int jxl_tr_order_id(int tr);
-int jxl_tr_need_transpose(int tr);
-
 typedef struct {
     uint32_t global_scale;
     uint32_t quant_lf;
@@ -901,8 +894,6 @@ typedef struct {
     uint16_t *order[13];
 } jxl_natural_orders;
 
-const uint16_t *jxl_natural_order(jxl_ctx *ctx, jxl_natural_orders *no,
-                                  int order_id);
 void jxl_natural_orders_free(jxl_ctx *ctx, jxl_natural_orders *no);
 
 void jxl_quantizer_read(jxl_br *br, jxl_quantizer *q);
@@ -998,11 +989,12 @@ void jxl_fill_varblock_lf(float *coeff, size_t stride, int tr,
                           const float *lf, size_t lf_stride, uint32_t lf_x,
                           uint32_t lf_y);
 
-int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
-                    size_t stride, const float weights[3][2]);
-int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
-                  size_t stride, const float *sigma, uint32_t sigma_stride,
-                  const jxl_epf *epf);
+int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], int nchan, uint32_t w,
+                    uint32_t h, size_t stride, const float weights[3][2]);
+
+int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], int gray, uint32_t w,
+                  uint32_t h, size_t stride, const float *sigma,
+                  uint32_t sigma_stride, const jxl_epf *epf);
 
 void jxl_xyb_to_linear(float *x, float *y, float *b, size_t n,
                        const float opsin_inv[9], const float opsin_bias[3],
@@ -1042,6 +1034,7 @@ typedef struct {
     uint32_t x0, y0, width, height;
     jxl_patch_target *targets;
     uint32_t ntargets;
+    jxl_patch_blend *blends;
 } jxl_patch_ref;
 
 typedef struct {
@@ -1126,7 +1119,6 @@ void jxl_blend_frame(jxl_fimage *canvas, const jxl_fimage *frame,
                      const jxl_image_metadata *meta);
 int jxl_fimage_blank_like(jxl_ctx *ctx, jxl_fimage *out, const jxl_fimage *like,
                           uint32_t w, uint32_t h);
-int jxl_fimage_copy(jxl_ctx *ctx, jxl_fimage *dst, const jxl_fimage *src);
 
 int jxl_fimage_materialize(jxl_ctx *ctx, jxl_fimage *img);
 int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,
@@ -2221,8 +2213,8 @@ uint32_t jxl_bitlen(uint32_t x) {
     return n;
 }
 
-#define PFX_MAX_BITS 15
-#define PFX_ROOT_BITS 8
+#define JXL_PFX_MAX_BITS 15
+#define JXL_PFX_ROOT_BITS 8
 
 static uint32_t pfx_entry(uint32_t sym, uint32_t len, uint32_t nested) {
     return sym | (len << 16) | (nested << 24);
@@ -2261,10 +2253,10 @@ static int pfx_single(jxl_ctx *ctx, jxl_pfx_hist *h, uint16_t sym) {
 
 static int pfx_build(jxl_ctx *ctx, jxl_pfx_hist *h, const uint8_t *lens,
                      uint32_t n) {
-    uint32_t count[PFX_MAX_BITS + 1];
-    uint32_t next_code[PFX_MAX_BITS + 2];
-    uint32_t sub_off[1 << PFX_ROOT_BITS];
-    uint8_t sub_maxlen[1 << PFX_ROOT_BITS];
+    uint32_t count[JXL_PFX_MAX_BITS + 1];
+    uint32_t next_code[JXL_PFX_MAX_BITS + 2];
+    uint32_t sub_off[1 << JXL_PFX_ROOT_BITS];
+    uint8_t sub_maxlen[1 << JXL_PFX_ROOT_BITS];
     uint32_t total = 0, sub_total = 0;
     uint32_t code, i, sym;
     int len, max_len = 0, root_bits;
@@ -2272,7 +2264,7 @@ static int pfx_build(jxl_ctx *ctx, jxl_pfx_hist *h, const uint8_t *lens,
 
     memset(count, 0, sizeof(count));
     for (sym = 0; sym < n; sym++) {
-        if (lens[sym] > PFX_MAX_BITS) return -1;
+        if (lens[sym] > JXL_PFX_MAX_BITS) return -1;
         if (lens[sym]) {
             count[lens[sym]]++;
             if (lens[sym] > max_len) max_len = lens[sym];
@@ -2280,8 +2272,8 @@ static int pfx_build(jxl_ctx *ctx, jxl_pfx_hist *h, const uint8_t *lens,
     }
     if (max_len == 0) return -1;
 
-    for (len = 1; len <= max_len; len++) total += count[len] << (PFX_MAX_BITS - len);
-    if (total != (1u << PFX_MAX_BITS)) return -1;
+    for (len = 1; len <= max_len; len++) total += count[len] << (JXL_PFX_MAX_BITS - len);
+    if (total != (1u << JXL_PFX_MAX_BITS)) return -1;
 
     code = 0;
     for (len = 1; len <= max_len; len++) {
@@ -2289,13 +2281,13 @@ static int pfx_build(jxl_ctx *ctx, jxl_pfx_hist *h, const uint8_t *lens,
         code = (code + count[len]) << 1;
     }
 
-    root_bits = max_len < PFX_ROOT_BITS ? max_len : PFX_ROOT_BITS;
+    root_bits = max_len < JXL_PFX_ROOT_BITS ? max_len : JXL_PFX_ROOT_BITS;
     root_size = 1u << root_bits;
     root_mask = root_size - 1;
 
     memset(sub_maxlen, 0, sizeof(sub_maxlen));
     {
-        uint32_t nc[PFX_MAX_BITS + 2];
+        uint32_t nc[JXL_PFX_MAX_BITS + 2];
         memcpy(nc, next_code, sizeof(nc));
         for (len = 1; len <= max_len; len++) {
             for (sym = 0; sym < n; sym++) {
@@ -2355,7 +2347,7 @@ static int pfx_build(jxl_ctx *ctx, jxl_pfx_hist *h, const uint8_t *lens,
 }
 
 static uint32_t pfx_read(const jxl_pfx_hist *h, jxl_br *br) {
-    uint32_t peeked = jxl_br_peek(br, PFX_MAX_BITS);
+    uint32_t peeked = jxl_br_peek(br, JXL_PFX_MAX_BITS);
     uint32_t e = h->root[peeked & h->root_mask].bits;
     if (e >> 24) {
         uint32_t sym = e & 0xffff;
@@ -2415,7 +2407,7 @@ static const uint8_t pfx_code_length_order[18] = {
 static int pfx_parse_complex(jxl_ctx *ctx, jxl_br *br, jxl_pfx_hist *h,
                              uint32_t alphabet_size, uint32_t hskip) {
     uint8_t clcl[18];
-    jxl_pfx_entry cl_root[1 << PFX_ROOT_BITS];
+    jxl_pfx_entry cl_root[1 << JXL_PFX_ROOT_BITS];
     jxl_pfx_hist clh;
     uint8_t *lens = NULL;
     uint32_t bitacc = 0;
@@ -2459,9 +2451,9 @@ static int pfx_parse_complex(jxl_ctx *ctx, jxl_br *br, jxl_pfx_hist *h,
         return -1;
     } else {
 
-        uint32_t count[PFX_MAX_BITS + 1];
+        uint32_t count[JXL_PFX_MAX_BITS + 1];
         int len, max_len = 0;
-        uint32_t next_code[PFX_MAX_BITS + 2], code = 0, sym, k, step;
+        uint32_t next_code[JXL_PFX_MAX_BITS + 2], code = 0, sym, k, step;
         memset(count, 0, sizeof(count));
         for (sym = 0; sym < 18; sym++) {
             if (clcl[sym]) {
@@ -2533,13 +2525,13 @@ static int pfx_parse_complex(jxl_ctx *ctx, jxl_br *br, jxl_pfx_hist *h,
             prev_sym = (uint8_t)sym;
         }
         if (lens[i] != 0) {
-            uint32_t shift = lens[i] >= PFX_MAX_BITS ? 0 : (PFX_MAX_BITS - lens[i]);
+            uint32_t shift = lens[i] >= JXL_PFX_MAX_BITS ? 0 : (JXL_PFX_MAX_BITS - lens[i]);
             bitacc += 1u << shift;
-            if (bitacc > (1u << PFX_MAX_BITS)) goto done;
-            if (bitacc == (1u << PFX_MAX_BITS) && repeat_count == 0) break;
+            if (bitacc > (1u << JXL_PFX_MAX_BITS)) goto done;
+            if (bitacc == (1u << JXL_PFX_MAX_BITS) && repeat_count == 0) break;
         }
     }
-    if (bitacc != (1u << PFX_MAX_BITS) || repeat_count > 0) goto done;
+    if (bitacc != (1u << JXL_PFX_MAX_BITS) || repeat_count > 0) goto done;
     rc = pfx_build(ctx, h, lens, alphabet_size);
 
 done:
@@ -2556,17 +2548,17 @@ static int pfx_parse(jxl_ctx *ctx, jxl_br *br, jxl_pfx_hist *h,
     h->single_symbol = -1;
 
     if (alphabet_size == 1) return pfx_single(ctx, h, 0);
-    if (alphabet_size > (1u << PFX_MAX_BITS)) return -1;
+    if (alphabet_size > (1u << JXL_PFX_MAX_BITS)) return -1;
 
     hskip = jxl_br_read(br, 2);
     if (hskip == 1) return pfx_parse_simple(ctx, br, h, alphabet_size);
     return pfx_parse_complex(ctx, br, h, alphabet_size, hskip);
 }
 
-#define ANS_LOG_TAB_SIZE 12
-#define ANS_TAB_SIZE (1 << ANS_LOG_TAB_SIZE)
+#define JXL_ANS_LOG_TAB_SIZE 12
+#define JXL_ANS_TAB_SIZE (1 << JXL_ANS_LOG_TAB_SIZE)
 
-#define ANS_SIGNATURE 0x130000
+#define JXL_ANS_SIGNATURE 0x130000
 
 static uint32_t ans_read_u8(jxl_br *br) {
     if (jxl_br_bool(br)) {
@@ -2601,24 +2593,27 @@ static void ans_free(jxl_ctx *ctx, jxl_ans_hist *h) {
     h->buckets = NULL;
 }
 
+#define JXL_ANS_MAX_TABLE 256
+#define JXL_ANS_MAX_REPEATS (JXL_ANS_MAX_TABLE / 4)
+
 static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
                      uint32_t log_alphabet_size) {
     uint32_t table_size = 1u << log_alphabet_size;
-    uint32_t log_bucket_size = 12 - log_alphabet_size;
+    uint32_t log_bucket_size = JXL_ANS_LOG_TAB_SIZE - log_alphabet_size;
     uint32_t bucket_size = 1u << log_bucket_size;
-    uint16_t *dist = NULL;
+    uint16_t dist[JXL_ANS_MAX_TABLE];
     uint32_t alphabet_size = 0;
     uint32_t i;
-    int rc = -1;
     int32_t single_sym = -1;
 
-    uint16_t *cutoff = NULL, *alias_sym = NULL, *alias_off = NULL;
-    uint32_t *underfull = NULL, *overfull = NULL;
+    uint16_t cutoff[JXL_ANS_MAX_TABLE], alias_sym[JXL_ANS_MAX_TABLE];
+    uint16_t alias_off[JXL_ANS_MAX_TABLE];
+    uint32_t underfull[JXL_ANS_MAX_TABLE], overfull[JXL_ANS_MAX_TABLE];
     uint32_t nunder = 0, nover = 0;
 
     h->buckets = NULL;
-    dist = (uint16_t *)jxl_calloc(ctx, table_size, sizeof(uint16_t));
-    if (!dist) return -1;
+    if (log_alphabet_size > 8) return -1;
+    memset(dist, 0, table_size * sizeof(dist[0]));
 
     if (jxl_br_bool(br)) {
         if (jxl_br_bool(br)) {
@@ -2626,26 +2621,26 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
             uint32_t v0 = ans_read_u8(br);
             uint32_t v1 = ans_read_u8(br);
             uint32_t prob;
-            if (v0 == v1) goto done;
+            if (v0 == v1) return -1;
             alphabet_size = (v0 > v1 ? v0 : v1) + 1;
-            if (alphabet_size > table_size) goto done;
+            if (alphabet_size > table_size) return -1;
             prob = jxl_br_read(br, 12);
             dist[v0] = (uint16_t)prob;
-            dist[v1] = (uint16_t)(ANS_TAB_SIZE - prob);
+            dist[v1] = (uint16_t)(JXL_ANS_TAB_SIZE - prob);
         } else {
 
             uint32_t val = ans_read_u8(br);
             alphabet_size = val + 1;
-            if (alphabet_size > table_size) goto done;
-            dist[val] = ANS_TAB_SIZE;
+            if (alphabet_size > table_size) return -1;
+            dist[val] = JXL_ANS_TAB_SIZE;
         }
     } else if (jxl_br_bool(br)) {
 
         uint32_t base, leftover;
         alphabet_size = ans_read_u8(br) + 1;
-        if (alphabet_size > table_size) goto done;
-        base = ANS_TAB_SIZE / alphabet_size;
-        leftover = ANS_TAB_SIZE % alphabet_size;
+        if (alphabet_size > table_size) return -1;
+        base = JXL_ANS_TAB_SIZE / alphabet_size;
+        leftover = JXL_ANS_TAB_SIZE % alphabet_size;
         for (i = 0; i < leftover; i++) dist[i] = (uint16_t)(base + 1);
         for (; i < alphabet_size; i++) dist[i] = (uint16_t)base;
     } else {
@@ -2655,34 +2650,23 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
         uint32_t idx = 0, acc = 0;
         uint16_t prev_dist = 0;
         int32_t omit_log = -1, omit_pos = -1;
-        uint32_t *rep_start = NULL, *rep_end = NULL;
-        uint32_t nrep = 0, rep_cap = 0, rep_idx = 0;
+        uint32_t rep_start[JXL_ANS_MAX_REPEATS], rep_end[JXL_ANS_MAX_REPEATS];
+        uint32_t nrep = 0, rep_idx = 0;
 
         while (len < 3 && jxl_br_bool(br)) len++;
         shift = (int16_t)(jxl_br_read(br, len) + (1u << len) - 1);
-        if (shift > 13) goto done;
+        if (shift > 13) return -1;
         alphabet_size = ans_read_u8(br) + 3;
-        if (alphabet_size > table_size) goto done;
+        if (alphabet_size > table_size) return -1;
 
         while (idx < alphabet_size) {
             dist[idx] = ans_read_prefix(br);
-            if (br->err) { jxl_free(ctx, rep_start); jxl_free(ctx, rep_end); goto done; }
+            if (br->err) return -1;
             if (dist[idx] == 13) {
                 uint32_t repeat_count = ans_read_u8(br) + 4;
-                if (idx + repeat_count > alphabet_size) {
-                    jxl_free(ctx, rep_start);
-                    jxl_free(ctx, rep_end);
-                    goto done;
-                }
-                if (nrep == rep_cap) {
-                    uint32_t ncap = rep_cap ? rep_cap * 2 : 8;
-                    uint32_t *a = (uint32_t *)jxl_realloc_array(ctx, rep_start, rep_cap, ncap, sizeof(uint32_t));
-                    uint32_t *b = (uint32_t *)jxl_realloc_array(ctx, rep_end, rep_cap, ncap, sizeof(uint32_t));
-                    if (!a || !b) { jxl_free(ctx, a); jxl_free(ctx, b); goto done; }
-                    rep_start = a;
-                    rep_end = b;
-                    rep_cap = ncap;
-                }
+                if (idx + repeat_count > alphabet_size) return -1;
+
+                if (nrep == JXL_ANS_MAX_REPEATS) return -1;
                 rep_start[nrep] = idx;
                 rep_end[nrep] = idx + repeat_count;
                 nrep++;
@@ -2696,11 +2680,8 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
             idx++;
         }
         if (omit_pos < 0 ||
-            ((uint32_t)omit_pos + 1 < table_size && dist[omit_pos + 1] == 13)) {
-            jxl_free(ctx, rep_start);
-            jxl_free(ctx, rep_end);
-            goto done;
-        }
+            ((uint32_t)omit_pos + 1 < table_size && dist[omit_pos + 1] == 13))
+            return -1;
 
         for (i = 0; i < table_size; i++) {
             uint16_t code = dist[i];
@@ -2710,7 +2691,7 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
                 } else {
                     dist[i] = prev_dist;
                     acc += dist[i];
-                    if (acc > ANS_TAB_SIZE) break;
+                    if (acc > JXL_ANS_TAB_SIZE) break;
                     continue;
                 }
                 code = dist[i];
@@ -2728,23 +2709,21 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
             }
             prev_dist = code;
             acc += code;
-            if (acc > ANS_TAB_SIZE) break;
+            if (acc > JXL_ANS_TAB_SIZE) break;
         }
-        jxl_free(ctx, rep_start);
-        jxl_free(ctx, rep_end);
-        if (acc > ANS_TAB_SIZE) goto done;
-        dist[omit_pos] = (uint16_t)(ANS_TAB_SIZE - acc);
+        if (acc > JXL_ANS_TAB_SIZE) return -1;
+        dist[omit_pos] = (uint16_t)(JXL_ANS_TAB_SIZE - acc);
     }
-    if (br->err) goto done;
+    if (br->err) return -1;
 
     h->log_bucket_size = log_bucket_size;
     h->bucket_mask = bucket_size - 1;
     h->buckets = (jxl_ans_bucket *)jxl_calloc(ctx, table_size,
                                               sizeof(jxl_ans_bucket));
-    if (!h->buckets) goto done;
+    if (!h->buckets) return -1;
 
     for (i = 0; i < table_size; i++) {
-        if (dist[i] == ANS_TAB_SIZE) { single_sym = (int32_t)i; break; }
+        if (dist[i] == JXL_ANS_TAB_SIZE) { single_sym = (int32_t)i; break; }
     }
     if (single_sym >= 0) {
 
@@ -2753,18 +2732,10 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
             h->buckets[i].alias_symbol = (uint8_t)single_sym;
             h->buckets[i].alias_offset = (uint16_t)(bucket_size * i);
             h->buckets[i].alias_cutoff = 0;
-            h->buckets[i].alias_dist_xor = (uint16_t)(dist[i] ^ ANS_TAB_SIZE);
+            h->buckets[i].alias_dist_xor = (uint16_t)(dist[i] ^ JXL_ANS_TAB_SIZE);
         }
-        rc = 0;
-        goto done;
+        return 0;
     }
-
-    cutoff = (uint16_t *)jxl_calloc(ctx, table_size, sizeof(uint16_t));
-    alias_sym = (uint16_t *)jxl_calloc(ctx, table_size, sizeof(uint16_t));
-    alias_off = (uint16_t *)jxl_calloc(ctx, table_size, sizeof(uint16_t));
-    underfull = (uint32_t *)jxl_calloc(ctx, table_size, sizeof(uint32_t));
-    overfull = (uint32_t *)jxl_calloc(ctx, table_size, sizeof(uint32_t));
-    if (!cutoff || !alias_sym || !alias_off || !underfull || !overfull) goto done;
 
     for (i = 0; i < table_size; i++) {
         cutoff[i] = dist[i];
@@ -2799,25 +2770,11 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
                 (uint16_t)(dist[i] ^ dist[alias_sym[i]]);
         }
     }
-    rc = 0;
-
-done:
-    jxl_free(ctx, dist);
-    jxl_free(ctx, cutoff);
-    jxl_free(ctx, alias_sym);
-    jxl_free(ctx, alias_off);
-    jxl_free(ctx, underfull);
-    jxl_free(ctx, overfull);
-    return rc;
+    return 0;
 }
 
 static uint32_t read_uint(jxl_br *br, const jxl_int_config *cfg,
                           uint32_t token);
-
-static uint32_t ans_read_symbol(const jxl_ans_hist *h, jxl_br *br,
-                                uint32_t *state) {
-    return jxl_ans_read_symbol(h, br, state);
-}
 
 uint32_t jxl_dec_hybrid_uint(jxl_br *br, const jxl_int_config *cfg,
                              uint32_t token) {
@@ -2886,8 +2843,8 @@ static const int8_t lz77_special_distances[120][2] = {
     {8,4},{6,7},{-6,7},{7,6},{-7,6},{8,5},{7,7},{-7,7},{8,6},{8,7}
 };
 
-#define LZ77_WINDOW_SIZE (1u << 20)
-#define LZ77_WINDOW_MASK (LZ77_WINDOW_SIZE - 1)
+#define JXL_LZ77_WINDOW_SIZE (1u << 20)
+#define JXL_LZ77_WINDOW_MASK (JXL_LZ77_WINDOW_SIZE - 1)
 
 void jxl_dec_free(jxl_dec *dec) {
     uint32_t i;
@@ -3082,11 +3039,11 @@ int jxl_dec_init(jxl_ctx *ctx, jxl_dec *dec, jxl_br *br, uint32_t num_dist) {
 static int lz77_ensure_window(jxl_dec *dec) {
     if (dec->window) return 0;
     dec->window = (uint32_t *)jxl_malloc(
-        dec->ctx, (size_t)LZ77_WINDOW_SIZE * sizeof(uint32_t));
+        dec->ctx, (size_t)JXL_LZ77_WINDOW_SIZE * sizeof(uint32_t));
 #ifdef JXL_POISON_UNINIT
     if (dec->window) {
         memset(dec->window, 0xCD,
-               (size_t)LZ77_WINDOW_SIZE * sizeof(uint32_t));
+               (size_t)JXL_LZ77_WINDOW_SIZE * sizeof(uint32_t));
     }
 #endif
     return dec->window ? 0 : -1;
@@ -3094,7 +3051,7 @@ static int lz77_ensure_window(jxl_dec *dec) {
 
 static uint32_t dec_read_symbol(jxl_dec *dec, jxl_br *br, uint32_t cluster) {
     if (dec->use_prefix) return pfx_read(&dec->pfx[cluster], br);
-    return ans_read_symbol(&dec->ans[cluster], br, &dec->state);
+    return jxl_ans_read_symbol(&dec->ans[cluster], br, &dec->state);
 }
 
 uint32_t jxl_dec_read_clustered(jxl_dec *dec, jxl_br *br, uint32_t cluster,
@@ -3111,7 +3068,7 @@ uint32_t jxl_dec_read_clustered(jxl_dec *dec, jxl_br *br, uint32_t cluster,
     if (lz77_ensure_window(dec) != 0) { dec->err = 1; return 0; }
 
     if (dec->num_to_copy > 0) {
-        r = dec->window[dec->copy_pos & LZ77_WINDOW_MASK];
+        r = dec->window[dec->copy_pos & JXL_LZ77_WINDOW_MASK];
         dec->copy_pos++;
         dec->num_to_copy--;
     } else {
@@ -3143,19 +3100,19 @@ uint32_t jxl_dec_read_clustered(jxl_dec *dec, jxl_br *br, uint32_t cluster,
             } else {
                 distance -= 120;
             }
-            if (distance > LZ77_WINDOW_MASK) distance = LZ77_WINDOW_MASK;
+            if (distance > JXL_LZ77_WINDOW_MASK) distance = JXL_LZ77_WINDOW_MASK;
             distance += 1;
             if (distance > dec->num_decoded) distance = dec->num_decoded;
             dec->copy_pos = dec->num_decoded - distance;
 
-            r = dec->window[dec->copy_pos & LZ77_WINDOW_MASK];
+            r = dec->window[dec->copy_pos & JXL_LZ77_WINDOW_MASK];
             dec->copy_pos++;
             dec->num_to_copy--;
         } else {
             r = read_uint(br, &dec->configs[cluster], token);
         }
     }
-    dec->window[dec->num_decoded & LZ77_WINDOW_MASK] = r;
+    dec->window[dec->num_decoded & JXL_LZ77_WINDOW_MASK] = r;
     dec->num_decoded++;
     return r;
 }
@@ -3168,7 +3125,7 @@ uint32_t jxl_dec_read_clustered_no_lz77(jxl_dec *dec, jxl_br *br,
     return read_uint(br, &dec->configs[cluster], token);
 }
 
-uint32_t jxl_dec_read_mult(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx,
+static uint32_t jxl_dec_read_mult(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx,
                            uint32_t dist_multiplier) {
     if (ctx_idx >= dec->num_dist) { dec->err = 1; return 0; }
     return jxl_dec_read_clustered(dec, br, dec->clusters[ctx_idx],
@@ -3236,7 +3193,7 @@ uint32_t jxl_dec_read_prefix_rle1(jxl_dec *dec, jxl_br *br, uint32_t cluster,
 int jxl_dec_finalize(jxl_dec *dec) {
     if (dec->err) return -1;
     if (dec->use_prefix) return 0;
-    return dec->state == ANS_SIGNATURE ? 0 : -1;
+    return dec->state == JXL_ANS_SIGNATURE ? 0 : -1;
 }
 
 static uint32_t perm_context(uint32_t x) {
@@ -4758,6 +4715,23 @@ static void pred_state_free(jxl_ctx *ctx, jxl_pred_state *ps) {
     memset(ps, 0, sizeof(*ps));
 }
 
+static int fixed_loop_predictor(uint8_t predictor) {
+    switch (predictor) {
+        case JXL_PRED_ZERO:
+        case JXL_PRED_WEST:
+        case JXL_PRED_NORTH:
+        case JXL_PRED_NORTH_WEST:
+        case JXL_PRED_GRADIENT:
+        case JXL_PRED_AVG_W_N:
+        case JXL_PRED_AVG_W_NW:
+        case JXL_PRED_AVG_N_NW:
+        case JXL_PRED_SELECT:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 static int pred_state_reset(jxl_ctx *ctx, jxl_pred_state *ps, uint32_t width,
                             int need_neighbor_rows,
                             const jxl_wp_header *wp,
@@ -5415,7 +5389,7 @@ static int squeeze_default_params(jxl_ctx *ctx, jxl_transform *tr,
         }
     }
 
-#define SQ_PUSH(horiz)                                                        \
+#define JXL_SQ_PUSH(horiz)                                                        \
     do {                                                                      \
         if (n == cap) {                                                       \
             jxl_sq_param *ns = (jxl_sq_param *)jxl_realloc_array(             \
@@ -5431,14 +5405,14 @@ static int squeeze_default_params(jxl_ctx *ctx, jxl_transform *tr,
     } while (0)
 
     if (h >= w && h > 8) {
-        SQ_PUSH(0);
+        JXL_SQ_PUSH(0);
         h = div_ceil_u32(h, 2);
     }
     while (w > 8 || h > 8) {
-        if (w > 8) { SQ_PUSH(1); w = div_ceil_u32(w, 2); }
-        if (h > 8) { SQ_PUSH(0); h = div_ceil_u32(h, 2); }
+        if (w > 8) { JXL_SQ_PUSH(1); w = div_ceil_u32(w, 2); }
+        if (h > 8) { JXL_SQ_PUSH(0); h = div_ceil_u32(h, 2); }
     }
-#undef SQ_PUSH
+#undef JXL_SQ_PUSH
 
     tr->sp = sp;
     tr->nsp = n;
@@ -6276,8 +6250,8 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
 
     int32_t nb_colours = (int32_t)(tr->nb_colours + tr->nb_deltas);
     int32_t nb_deltas = (int32_t)tr->nb_deltas;
+
     uint8_t *need_delta = NULL;
-    int any_delta = 0;
     int rc = -1;
 
     if (cl->n == 0) return -1;
@@ -6298,9 +6272,6 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
     width = targets[0].w;
     height = targets[0].h;
 
-    need_delta = (uint8_t *)jxl_calloc(ctx, (size_t)width * height + 1, 1);
-    if (!need_delta) goto done;
-
     for (y = 0; y < height; y++) {
         int32_t *row0 = targets[0].data + (size_t)y * targets[0].stride;
         for (x = 0; x < width; x++) {
@@ -6312,8 +6283,13 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
                 continue;
             }
             if (index < nb_deltas) {
+                if (!need_delta) {
+                    size_t n;
+                    if (!jxl_size_mul(width, height, &n)) goto done;
+                    need_delta = (uint8_t *)jxl_calloc(ctx, n ? n : 1, 1);
+                    if (!need_delta) goto done;
+                }
                 need_delta[(size_t)y * width + x] = 1;
-                any_delta = 1;
             }
             if (index >= 0 && index < nb_colours) {
                 for (c = 0; c < num_c; c++) {
@@ -6369,7 +6345,7 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
         }
     }
 
-    if (any_delta) {
+    if (need_delta) {
         jxl_pred_state ps;
         memset(&ps, 0, sizeof(ps));
         for (c = 0; c < num_c; c++) {
@@ -7199,7 +7175,10 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
             }
         }
 
-        if (pred_state_reset(ctx, &ps, ch->w, !wp_only_fast,
+        if (pred_state_reset(ctx, &ps, ch->w,
+                             !wp_only_fast &&
+                                 !(fixed && (rle1_fast ||
+                                             fixed_loop_predictor(fixed->predictor))),
                              channel_need_sc ? &m->header.wp : NULL,
                              prev, nprev) != 0)
             goto done;
@@ -7558,12 +7537,10 @@ done:
 }
 
 void jxl_patches_free(jxl_ctx *ctx, jxl_patches *p) {
-    uint32_t i, j;
+    uint32_t i;
     if (!p || !p->refs) return;
     for (i = 0; i < p->n; i++) {
-        for (j = 0; j < p->refs[i].ntargets; j++) {
-            jxl_free(ctx, p->refs[i].targets[j].blending);
-        }
+        jxl_free(ctx, p->refs[i].blends);
         jxl_free(ctx, p->refs[i].targets);
     }
     jxl_free(ctx, p->refs);
@@ -7627,6 +7604,14 @@ int jxl_patches_read(jxl_ctx *ctx, jxl_br *br, const jxl_image_metadata *meta,
         if (!pr->targets) goto done;
         pr->ntargets = count;
 
+        {
+            size_t nb;
+            if (!jxl_size_mul(count, nblend, &nb)) goto done;
+            pr->blends = (jxl_patch_blend *)jxl_calloc(ctx, nb,
+                                                       sizeof(jxl_patch_blend));
+            if (!pr->blends) goto done;
+        }
+
         for (t = 0; t < count; t++) {
             jxl_patch_target *tg = &pr->targets[t];
             uint32_t b;
@@ -7643,9 +7628,7 @@ int jxl_patches_read(jxl_ctx *ctx, jxl_br *br, const jxl_image_metadata *meta,
             px = tg->x;
             py = tg->y;
 
-            tg->blending = (jxl_patch_blend *)jxl_calloc(ctx, nblend,
-                                                         sizeof(jxl_patch_blend));
-            if (!tg->blending) goto done;
+            tg->blending = pr->blends + (size_t)t * nblend;
             for (b = 0; b < nblend; b++) {
                 uint32_t raw = jxl_dec_read(&dec, br, 5);
                 if (raw > JXL_PATCH_MULADD_BELOW) {
@@ -7964,23 +7947,6 @@ int jxl_fimage_blank_like(jxl_ctx *ctx, jxl_fimage *out, const jxl_fimage *like,
     return 0;
 }
 
-int jxl_fimage_copy(jxl_ctx *ctx, jxl_fimage *dst, const jxl_fimage *src) {
-    uint32_t i, y;
-    if (jxl_fimage_alloc(ctx, dst, src->nplane) != 0) return -1;
-    dst->ncolor = src->ncolor;
-    dst->w = src->w;
-    dst->h = src->h;
-    for (i = 0; i < src->nplane; i++) {
-        const jxl_fplane *s = &src->plane[i];
-        if (jxl_fplane_alloc_uninit(ctx, &dst->plane[i], s->w, s->h) != 0) return -1;
-        for (y = 0; y < s->h; y++) {
-            memcpy(dst->plane[i].data + (size_t)y * dst->plane[i].stride,
-                   s->data + (size_t)y * s->stride, (size_t)s->w * sizeof(float));
-        }
-    }
-    return 0;
-}
-
 #include <math.h>
 
 #if !defined(JXL_SPLINE_FORCE_SCALAR) && \
@@ -7991,7 +7957,7 @@ int jxl_fimage_copy(jxl_ctx *ctx, jxl_fimage *dst, const jxl_fimage *src) {
 #include <immintrin.h>
 #endif
 
-#define SPLINE_MAX_POINTS (1u << 20)
+#define JXL_SPLINE_MAX_POINTS (1u << 20)
 
 void jxl_splines_free(jxl_ctx *ctx, jxl_splines *sp) {
     uint32_t i;
@@ -8004,8 +7970,8 @@ void jxl_splines_free(jxl_ctx *ctx, jxl_splines *sp) {
     memset(sp, 0, sizeof(*sp));
 }
 
-#define SPLINE_POS_LIMIT ((int64_t)1 << 23)
-#define SPLINE_POS_OK(v) ((v) > -SPLINE_POS_LIMIT && (v) < SPLINE_POS_LIMIT)
+#define JXL_SPLINE_POS_LIMIT ((int64_t)1 << 23)
+#define JXL_SPLINE_POS_OK(v) ((v) > -JXL_SPLINE_POS_LIMIT && (v) < JXL_SPLINE_POS_LIMIT)
 
 int jxl_splines_read(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
                      jxl_splines *out) {
@@ -8046,7 +8012,7 @@ int jxl_splines_read(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
         sy[i] = prev_y;
     }
     for (i = 0; i < num_splines; i++) {
-        if (!SPLINE_POS_OK(sx[i]) || !SPLINE_POS_OK(sy[i])) {
+        if (!JXL_SPLINE_POS_OK(sx[i]) || !JXL_SPLINE_POS_OK(sy[i])) {
             JXL_ERR(ctx, "splines: coordinates out of bounds");
             goto done;
         }
@@ -8067,7 +8033,7 @@ int jxl_splines_read(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
         int c, j;
 
         acc_points += num_points;
-        if (acc_points > JXL_MIN((uint64_t)SPLINE_MAX_POINTS, num_pixels / 2)) {
+        if (acc_points > JXL_MIN((uint64_t)JXL_SPLINE_MAX_POINTS, num_pixels / 2)) {
             JXL_ERR(ctx, "splines: too many control points");
             goto done;
         }
@@ -8084,8 +8050,8 @@ int jxl_splines_read(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
             dy_acc += jxl_unpack_signed(jxl_dec_read(&dec, br, 4));
             cx += dx_acc;
             cy += dy_acc;
-            if (!SPLINE_POS_OK(dx_acc) || !SPLINE_POS_OK(dy_acc) ||
-                !SPLINE_POS_OK(cx) || !SPLINE_POS_OK(cy)) {
+            if (!JXL_SPLINE_POS_OK(dx_acc) || !JXL_SPLINE_POS_OK(dy_acc) ||
+                !JXL_SPLINE_POS_OK(cx) || !JXL_SPLINE_POS_OK(cy)) {
                 JXL_ERR(ctx, "splines: coordinates out of bounds");
                 goto done;
             }
@@ -8564,11 +8530,11 @@ done:
     return rc;
 }
 
-#define NOISE_LANES 8
+#define JXL_NOISE_LANES 8
 
 typedef struct {
-    uint64_t s0[NOISE_LANES];
-    uint64_t s1[NOISE_LANES];
+    uint64_t s0[JXL_NOISE_LANES];
+    uint64_t s1[JXL_NOISE_LANES];
 } jxl_xorshift;
 
 static uint64_t split_mix_64(uint64_t z) {
@@ -8581,15 +8547,15 @@ static void xorshift_init(jxl_xorshift *r, uint64_t seed0, uint64_t seed1) {
     int i;
     r->s0[0] = split_mix_64(seed0 + 0x9E3779B97F4A7C15ull);
     r->s1[0] = split_mix_64(seed1 + 0x9E3779B97F4A7C15ull);
-    for (i = 1; i < NOISE_LANES; i++) {
+    for (i = 1; i < JXL_NOISE_LANES; i++) {
         r->s0[i] = split_mix_64(r->s0[i - 1]);
         r->s1[i] = split_mix_64(r->s1[i - 1]);
     }
 }
 
-static void xorshift_batch(jxl_xorshift *r, uint32_t out[NOISE_LANES * 2]) {
+static void xorshift_batch(jxl_xorshift *r, uint32_t out[JXL_NOISE_LANES * 2]) {
     int i;
-    for (i = 0; i < NOISE_LANES; i++) {
+    for (i = 0; i < JXL_NOISE_LANES; i++) {
         uint64_t s1 = r->s0[i];
         uint64_t s0 = r->s1[i];
         uint64_t ret = s1 + s0;
@@ -8633,10 +8599,10 @@ static uint32_t noise_mirror(int64_t v, uint32_t len) {
 #ifdef JXL_NOISE_SSE2
 
 JXL_TARGET_AVX2
-static void xorshift_batch_x8(jxl_xorshift *r, float out[NOISE_LANES * 2]) {
+static void xorshift_batch_x8(jxl_xorshift *r, float out[JXL_NOISE_LANES * 2]) {
     const __m256i exp = _mm256_set1_epi32(0x3f800000u);
     int i;
-    for (i = 0; i < NOISE_LANES; i += 4) {
+    for (i = 0; i < JXL_NOISE_LANES; i += 4) {
         __m256i s1 = _mm256_loadu_si256((const __m256i *)(r->s0 + i));
         __m256i s0 = _mm256_loadu_si256((const __m256i *)(r->s1 + i));
         __m256i ret = _mm256_add_epi64(s1, s0);
@@ -8663,21 +8629,21 @@ static void noise_random_row(float *dst, uint32_t width, uint32_t y,
     for (gx = 0; gx < groups_per_row; gx++) {
         uint32_t x0 = gx * group_dim;
         uint32_t gw = JXL_MIN(group_dim, width - x0);
-        uint32_t blocks = (gw + NOISE_LANES * 2 - 1) /
-                          (NOISE_LANES * 2);
+        uint32_t blocks = (gw + JXL_NOISE_LANES * 2 - 1) /
+                          (JXL_NOISE_LANES * 2);
         jxl_xorshift *rng = rngs + (size_t)gy * groups_per_row + gx;
         uint32_t b;
         for (b = 0; b < blocks; b++) {
-            uint32_t bx = b * NOISE_LANES * 2;
-            uint32_t valid = JXL_MIN(NOISE_LANES * 2, gw - bx);
+            uint32_t bx = b * JXL_NOISE_LANES * 2;
+            uint32_t valid = JXL_MIN(JXL_NOISE_LANES * 2, gw - bx);
             float *out = dst + x0 + bx;
             uint32_t k;
 #ifdef JXL_NOISE_SSE2
             if (use_avx2) {
-                if (valid == NOISE_LANES * 2) {
+                if (valid == JXL_NOISE_LANES * 2) {
                     xorshift_batch_x8(rng, out);
                 } else {
-                    float values[NOISE_LANES * 2];
+                    float values[JXL_NOISE_LANES * 2];
                     xorshift_batch_x8(rng, values);
                     memcpy(out, values, valid * sizeof(float));
                 }
@@ -8687,7 +8653,7 @@ static void noise_random_row(float *dst, uint32_t width, uint32_t y,
             (void)use_avx2;
 #endif
             {
-                uint32_t bits[NOISE_LANES * 2];
+                uint32_t bits[JXL_NOISE_LANES * 2];
                 xorshift_batch(rng, bits);
                 for (k = 0; k < valid; k++) out[k] = bits_to_unit(bits[k]);
             }
@@ -8925,7 +8891,7 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
             uint32_t x0 = gx * group_dim, y0 = gy * group_dim;
             uint32_t gw = JXL_MIN(group_dim, width - x0);
             uint32_t gh = JXL_MIN(group_dim, height - y0);
-            uint32_t blocks = (gw + NOISE_LANES * 2 - 1) / (NOISE_LANES * 2);
+            uint32_t blocks = (gw + JXL_NOISE_LANES * 2 - 1) / (JXL_NOISE_LANES * 2);
             jxl_xorshift rng;
             xorshift_init(&rng, seed0, ((uint64_t)x0 << 32) + y0);
 
@@ -8933,17 +8899,17 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
                 uint32_t row, b;
                 for (row = 0; row < gh; row++) {
                     for (b = 0; b < blocks; b++) {
-                        uint32_t bx = b * NOISE_LANES * 2;
-                        uint32_t valid = JXL_MIN(NOISE_LANES * 2, gw - bx);
+                        uint32_t bx = b * JXL_NOISE_LANES * 2;
+                        uint32_t valid = JXL_MIN(JXL_NOISE_LANES * 2, gw - bx);
                         float *dst = raw[c] +
                             (size_t)(y0 + row) * width + x0 + bx;
                         uint32_t k;
 #ifdef JXL_NOISE_SSE2
                         if (use_avx2) {
-                            if (valid == NOISE_LANES * 2) {
+                            if (valid == JXL_NOISE_LANES * 2) {
                                 xorshift_batch_x8(&rng, dst);
                             } else {
-                                float values[NOISE_LANES * 2];
+                                float values[JXL_NOISE_LANES * 2];
                                 xorshift_batch_x8(&rng, values);
                                 memcpy(dst, values, valid * sizeof(float));
                             }
@@ -8951,7 +8917,7 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
                         }
 #endif
                         {
-                            uint32_t bits[NOISE_LANES * 2];
+                            uint32_t bits[JXL_NOISE_LANES * 2];
                             xorshift_batch(&rng, bits);
                             for (k = 0; k < valid; k++)
                                 dst[k] = bits_to_unit(bits[k]);
@@ -9307,6 +9273,64 @@ static void up_block8(const float *const *srow, uint32_t x, uint32_t N,
         }
         vlo = mn;
         vhi = mx;
+    }
+
+    if (N == 8 && ny == 8) {
+        __m256 m;
+        for (oy = 0; oy < 8; oy++) {
+            const float *kr = kernel + (size_t)oy * 8 * 25;
+            __m256 a[8];
+            float *drow = dst_rows[oy];
+            int t = 0, j;
+            for (j = 0; j < 8; j++) a[j] = _mm256_setzero_ps();
+            for (py = 0; py < 5; py++) {
+                const float *r = srow[py] + x - 2;
+                for (px = 0; px < 5; px++, t++) {
+                    __m256 v = _mm256_loadu_ps(r + px);
+                    for (j = 0; j < 8; j++) {
+                        a[j] = _mm256_add_ps(a[j], _mm256_mul_ps(
+                            v, _mm256_set1_ps(kr[j * 25 + t])));
+                    }
+                }
+            }
+            for (j = 0; j < 8; j++) {
+                m = _mm256_cmp_ps(a[j], vlo, _CMP_LT_OQ);
+                a[j] = _mm256_or_ps(_mm256_and_ps(m, vlo),
+                                    _mm256_andnot_ps(m, a[j]));
+                m = _mm256_cmp_ps(a[j], vhi, _CMP_GT_OQ);
+                a[j] = _mm256_or_ps(_mm256_and_ps(m, vhi),
+                                    _mm256_andnot_ps(m, a[j]));
+            }
+            {
+                __m256 t0 = _mm256_unpacklo_ps(a[0], a[1]);
+                __m256 t1 = _mm256_unpackhi_ps(a[0], a[1]);
+                __m256 t2 = _mm256_unpacklo_ps(a[2], a[3]);
+                __m256 t3 = _mm256_unpackhi_ps(a[2], a[3]);
+                __m256 t4 = _mm256_unpacklo_ps(a[4], a[5]);
+                __m256 t5 = _mm256_unpackhi_ps(a[4], a[5]);
+                __m256 t6 = _mm256_unpacklo_ps(a[6], a[7]);
+                __m256 t7 = _mm256_unpackhi_ps(a[6], a[7]);
+                __m256 s0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1, 0, 1, 0));
+                __m256 s1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3, 2, 3, 2));
+                __m256 s2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1, 0, 1, 0));
+                __m256 s3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3, 2, 3, 2));
+                __m256 s4 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(1, 0, 1, 0));
+                __m256 s5 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(3, 2, 3, 2));
+                __m256 s6 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(1, 0, 1, 0));
+                __m256 s7 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(3, 2, 3, 2));
+                float *d = drow + (size_t)x * 8;
+                _mm256_storeu_ps(d + 0 * 8, _mm256_permute2f128_ps(s0, s4, 0x20));
+                _mm256_storeu_ps(d + 1 * 8, _mm256_permute2f128_ps(s1, s5, 0x20));
+                _mm256_storeu_ps(d + 2 * 8, _mm256_permute2f128_ps(s2, s6, 0x20));
+                _mm256_storeu_ps(d + 3 * 8, _mm256_permute2f128_ps(s3, s7, 0x20));
+                _mm256_storeu_ps(d + 4 * 8, _mm256_permute2f128_ps(s0, s4, 0x31));
+                _mm256_storeu_ps(d + 5 * 8, _mm256_permute2f128_ps(s1, s5, 0x31));
+                _mm256_storeu_ps(d + 6 * 8, _mm256_permute2f128_ps(s2, s6, 0x31));
+                _mm256_storeu_ps(d + 7 * 8, _mm256_permute2f128_ps(s3, s7, 0x31));
+            }
+        }
+        _mm256_zeroupper();
+        return;
     }
 
     if (N == 4 && ny == 4) {
@@ -9731,7 +9755,7 @@ static int modular_loop_filters(jxl_ctx *ctx, jxl_fimage *out,
     uint32_t w, h, bw, bh, ps, ph, x, y;
     uint32_t nc = out->ncolor;
     size_t count;
-    int c, rc = -1;
+    int c, rc = -1, shared;
 
     if (nc != 1 && nc != 3) return 0;
     if (out->nplane < nc) return 0;
@@ -9748,7 +9772,14 @@ static int modular_loop_filters(jxl_ctx *ctx, jxl_fimage *out,
     ph = bh * 8;
     if (ps % 1024 < 32 || ps % 1024 > 1024 - 32) ps += 64;
     if (!jxl_size_mul(ps, ph, &count)) return -1;
-    for (c = 0; c < 3; c++) {
+
+    shared = nc == 1 &&
+             (!fh->gab.enabled ||
+              (fh->gab.weights[1][0] == fh->gab.weights[0][0] &&
+               fh->gab.weights[1][1] == fh->gab.weights[0][1] &&
+               fh->gab.weights[2][0] == fh->gab.weights[0][0] &&
+               fh->gab.weights[2][1] == fh->gab.weights[0][1]));
+    for (c = 0; c < (shared ? 1 : 3); c++) {
         const jxl_fplane *src = &out->plane[nc == 1 ? 0 : c];
         buf[c] = (float *)jxl_calloc(ctx, count, sizeof(float));
         if (!buf[c]) goto done;
@@ -9757,8 +9788,11 @@ static int modular_loop_filters(jxl_ctx *ctx, jxl_fimage *out,
                    (size_t)w * sizeof(float));
         }
     }
+    if (shared) buf[1] = buf[2] = buf[0];
     if (fh->gab.enabled) {
-        if (jxl_apply_gabor(ctx, buf, w, h, ps, fh->gab.weights) != 0) goto done;
+        if (jxl_apply_gabor(ctx, buf, shared ? 1 : 3, w, h, ps,
+                            fh->gab.weights) != 0)
+            goto done;
     }
     if (fh->epf.enabled) {
         float s = fh->epf.sigma_for_modular;
@@ -9766,7 +9800,9 @@ static int modular_loop_filters(jxl_ctx *ctx, jxl_fimage *out,
         sigma = (float *)jxl_malloc(ctx, (size_t)bw * bh * sizeof(float));
         if (!sigma) goto done;
         for (x = 0; x < bw * bh; x++) sigma[x] = v;
-        if (jxl_apply_epf(ctx, buf, w, h, ps, sigma, bw, &fh->epf) != 0) goto done;
+        if (jxl_apply_epf(ctx, buf, shared, w, h, ps, sigma, bw,
+                          &fh->epf) != 0)
+            goto done;
     }
     for (c = 0; c < (int)nc; c++) {
         jxl_free(ctx, out->plane[c].data);
@@ -9777,6 +9813,7 @@ static int modular_loop_filters(jxl_ctx *ctx, jxl_fimage *out,
     rc = 0;
 
 done:
+    if (shared) buf[1] = buf[2] = NULL;
     for (c = 0; c < 3; c++) jxl_free(ctx, buf[c]);
     jxl_free(ctx, sigma);
     return rc;
@@ -10650,13 +10687,13 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
 
         for (c = 0; c < 3; c++) planes[c] = vd.coeff[c];
         if (fh->gab.enabled) {
-            if (jxl_apply_gabor(ctx, planes, color_w, color_h, vd.ps,
+            if (jxl_apply_gabor(ctx, planes, 3, color_w, color_h, vd.ps,
                                 fh->gab.weights) != 0)
                 goto done;
         }
         if (fh->epf.enabled) {
-            if (jxl_apply_epf(ctx, planes, color_w, color_h, vd.ps, vd.epf_sigma,
-                              vd.bw, &fh->epf) != 0)
+            if (jxl_apply_epf(ctx, planes, 0, color_w, color_h, vd.ps,
+                              vd.epf_sigma, vd.bw, &fh->epf) != 0)
                 goto done;
             for (c = 0; c < 3; c++) vd.coeff[c] = planes[c];
         }
@@ -10923,21 +10960,21 @@ static const uint16_t tr_matrix_dims[17][2] = {
     {8,8},{64,64},{64,32},{128,128},{128,64},{256,256},{256,128}
 };
 
-void jxl_tr_select_size(int tr, uint32_t *bw, uint32_t *bh) {
+static void jxl_tr_select_size(int tr, uint32_t *bw, uint32_t *bh) {
     *bw = tr_size[tr][0];
     *bh = tr_size[tr][1];
 }
 
-int jxl_tr_matrix_index(int tr) { return tr_matrix_idx[tr]; }
-int jxl_tr_order_id(int tr) { return tr_order[tr]; }
+static int jxl_tr_matrix_index(int tr) { return tr_matrix_idx[tr]; }
+static int jxl_tr_order_id(int tr) { return tr_order[tr]; }
 
-void jxl_tr_matrix_size(int tr, uint32_t *w, uint32_t *h) {
+static void jxl_tr_matrix_size(int tr, uint32_t *w, uint32_t *h) {
     int idx = tr_matrix_idx[tr];
     *w = tr_matrix_dims[idx][0];
     *h = tr_matrix_dims[idx][1];
 }
 
-int jxl_tr_need_transpose(int tr) {
+static int jxl_tr_need_transpose(int tr) {
     switch (tr) {
         case JXL_TR_HORNUSS: case JXL_TR_DCT2: case JXL_TR_DCT4:
         case JXL_TR_DCT4X8: case JXL_TR_DCT8X4:
@@ -10980,7 +11017,7 @@ static void fill_natural_order(uint32_t bw, uint32_t bh, uint16_t *out) {
     }
 }
 
-const uint16_t *jxl_natural_order(jxl_ctx *ctx, jxl_natural_orders *no,
+static const uint16_t *jxl_natural_order(jxl_ctx *ctx, jxl_natural_orders *no,
                                   int order_id) {
     uint32_t bw, bh;
     if (order_id < 0 || order_id >= 13) return NULL;
@@ -11930,7 +11967,48 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
 
                 coeff_ctx_base = block_ctx * 458 + 37 * bc->num_block_clusters;
                 if (coeff_offsets && p->coeff_shift == 0 &&
-                    !dist->lz77_enabled) {
+                    !dist->lz77_enabled && !dist->use_prefix) {
+
+                    jxl_br lbr = *br;
+                    uint32_t state = dist->state;
+                    const uint8_t *clusters =
+                        dist->clusters + cluster_base + coeff_ctx_base;
+                    int bad = 0;
+                    for (k = 1; k < 64; k++) {
+                        uint32_t nzi = non_zeros - 1;
+                        uint32_t fi = k - 1;
+                        uint32_t coeff_ctx =
+                            (coeff_num_nonzero_context[nzi] +
+                             coeff_freq_context[fi]) * 2 + is_prev_nonzero;
+                        uint32_t ucoeff, cl;
+                        int32_t coeff;
+
+                        if (coeff_ctx >= 458) {
+                            bad = 1;
+                            break;
+                        }
+                        cl = clusters[coeff_ctx];
+                        ucoeff = jxl_ans_read_symbol(&dist->ans[cl], &lbr,
+                                                     &state);
+                        if (ucoeff >= dist->configs[cl].split) {
+                            ucoeff = jxl_dec_hybrid_uint(
+                                &lbr, &dist->configs[cl], ucoeff);
+                        }
+                        coeff = (int32_t)((ucoeff >> 1) ^
+                                          (((~ucoeff) & 1u) - 1u));
+                        JXL_COEFF_ADD(coeff_out[coeff_offsets[k]], coeff);
+                        is_prev_nonzero = ucoeff != 0;
+                        non_zeros -= is_prev_nonzero;
+                        if (non_zeros == 0) break;
+                    }
+                    *br = lbr;
+                    dist->state = state;
+                    if (bad) {
+                        JXL_ERR(ctx, "vardct: too many zeros in varblock");
+                        goto done;
+                    }
+                } else if (coeff_offsets && p->coeff_shift == 0 &&
+                           !dist->lz77_enabled) {
                     for (k = 1; k < 64; k++) {
                         uint32_t nzi = non_zeros - 1;
                         uint32_t fi = k - 1;
@@ -12285,33 +12363,38 @@ int jxl_adaptive_lf_smoothing(jxl_ctx *ctx, float *plane[3], uint32_t width,
     const float scale_diag = 0.03348292f;
     double scale_inv = (double)q->global_scale * (double)q->quant_lf;
     float lf[3];
-    float *udsum[3];
+    float *buf, *up[3], *next_up[3], *ud[3];
+    size_t n;
     uint32_t x, y;
-    int c, rc = -1;
+    int c;
 
-    udsum[0] = udsum[1] = udsum[2] = NULL;
     if (width <= 2 || height <= 2) return 0;
     for (c = 0; c < 3; c++) lf[c] = (float)(512.0 * (double)m_lf[c] / scale_inv);
 
+    if (!jxl_size_mul(width, 9, &n)) return -1;
+    buf = (float *)jxl_malloc(ctx, n * sizeof(float));
+    if (!buf) return -1;
     for (c = 0; c < 3; c++) {
-        udsum[c] = (float *)jxl_calloc(ctx, (size_t)width * (height - 2),
-                                       sizeof(float));
-        if (!udsum[c]) goto done;
-        for (y = 0; y + 2 < height; y++) {
-            const float *up = plane[c] + (size_t)y * stride;
-            const float *down = plane[c] + (size_t)(y + 2) * stride;
-            float *out = udsum[c] + (size_t)y * width;
-            for (x = 0; x < width; x++) out[x] = up[x] + down[x];
-        }
+        up[c] = buf + (size_t)width * (3 * c);
+        next_up[c] = buf + (size_t)width * (3 * c + 1);
+        ud[c] = buf + (size_t)width * (3 * c + 2);
+
+        memcpy(up[c], plane[c], (size_t)width * sizeof(float));
     }
 
     for (y = 0; y + 2 < height; y++) {
         float *row[3];
-        const float *ud[3];
         float prev[3];
         for (c = 0; c < 3; c++) {
+            const float *down = plane[c] + (size_t)(y + 2) * stride;
+            float *t;
             row[c] = plane[c] + (size_t)(y + 1) * stride;
-            ud[c] = udsum[c] + (size_t)y * width;
+            for (x = 0; x < width; x++) ud[c][x] = up[c][x] + down[x];
+
+            memcpy(next_up[c], row[c], (size_t)width * sizeof(float));
+            t = up[c];
+            up[c] = next_up[c];
+            next_up[c] = t;
             prev[c] = row[c][0];
         }
         for (x = 1; x + 1 < width; x++) {
@@ -12333,11 +12416,8 @@ int jxl_adaptive_lf_smoothing(jxl_ctx *ctx, float *plane[3], uint32_t width,
             }
         }
     }
-    rc = 0;
-
-done:
-    for (c = 0; c < 3; c++) jxl_free(ctx, udsum[c]);
-    return rc;
+    jxl_free(ctx, buf);
+    return 0;
 }
 
 void jxl_cfl_lf(float *x, float *y, float *b, uint32_t w, uint32_t h,
@@ -14042,8 +14122,8 @@ static void gabor_plane_avx2(float *plane, uint32_t w, uint32_t h,
 }
 #endif
 
-int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
-                    size_t stride, const float weights[3][2]) {
+int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], int nchan, uint32_t w,
+                    uint32_t h, size_t stride, const float weights[3][2]) {
     float *ring;
     int c;
 #ifdef JXL_EPF_SSE2
@@ -14054,7 +14134,7 @@ int jxl_apply_gabor(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
     ring = (float *)jxl_malloc(ctx, (size_t)w * 2 * sizeof(float));
     if (!ring) return -1;
 
-    for (c = 0; c < 3; c++) {
+    for (c = 0; c < nchan; c++) {
         float w0 = weights[c][0], w1 = weights[c][1];
         float gw = 1.0f / (1.0f + w0 * 4.0f + w1 * 4.0f);
         uint32_t x, y;
@@ -14128,14 +14208,15 @@ static const int8_t epf_dist_0[5][2] = {{0,-1},{1,0},{0,0},{-1,0},{0,1}};
 static const int8_t epf_dist_1[5][2] = {{0,-1},{0,0},{0,1},{-1,0},{1,0}};
 static const int8_t epf_dist_2[1][2] = {{0,0}};
 
+#define JXL_EPF_NCH(gray) ((gray) ? 1 : 3)
 #ifdef JXL_EPF_SSE2
 
 JXL_TARGET_AVX2
-static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
-                     const ptrdiff_t koff[12], const ptrdiff_t doff[5],
-                     int nkernel, int ndist, const float cscale[3],
-                     float sigma_val, float step_mul, float border_mul,
-                     int is_y_border) {
+static JXL_INLINE_HINT void epf_row8_impl(
+    float *in[3], float *out[3], size_t row, uint32_t x,
+    const ptrdiff_t koff[12], const ptrdiff_t doff[5], int nkernel, int ndist,
+    const float cscale[3], float sigma_val, float step_mul, float border_mul,
+    int is_y_border, const int gray) {
     const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
     const __m256 one = _mm256_set1_ps(1.0f);
     __m256 dist8[12], sum8[3], sw, nis, smv;
@@ -14150,7 +14231,7 @@ static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
     nis = _mm256_mul_ps(_mm256_set1_ps(sigma_val), smv);
 
     for (k = 0; k < nkernel; k++) dist8[k] = _mm256_setzero_ps();
-    for (c = 0; c < 3; c++) {
+    for (c = 0; c < JXL_EPF_NCH(gray); c++) {
         const float *p = in[c] + row + x;
         __m256 cs = _mm256_set1_ps(cscale[c]);
         __m256 cen[5];
@@ -14163,24 +14244,45 @@ static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
                     _mm256_sub_ps(_mm256_loadu_ps(pk + doff[d]), cen[d])));
             }
             dist8[k] = _mm256_add_ps(dist8[k], _mm256_mul_ps(cs, acc));
+            if (gray) {
+                dist8[k] = _mm256_add_ps(dist8[k], _mm256_mul_ps(
+                    _mm256_set1_ps(cscale[1]), acc));
+                dist8[k] = _mm256_add_ps(dist8[k], _mm256_mul_ps(
+                    _mm256_set1_ps(cscale[2]), acc));
+            }
         }
     }
-    for (c = 0; c < 3; c++) sum8[c] = _mm256_loadu_ps(in[c] + row + x);
+    for (c = 0; c < JXL_EPF_NCH(gray); c++)
+        sum8[c] = _mm256_loadu_ps(in[c] + row + x);
     sw = one;
     for (k = 0; k < nkernel; k++) {
         __m256 wgt = _mm256_add_ps(one, _mm256_mul_ps(dist8[k], nis));
         wgt = _mm256_max_ps(wgt, _mm256_setzero_ps());
         sw = _mm256_add_ps(sw, wgt);
-        for (c = 0; c < 3; c++) {
+        for (c = 0; c < JXL_EPF_NCH(gray); c++) {
             sum8[c] = _mm256_add_ps(sum8[c], _mm256_mul_ps(wgt,
                 _mm256_loadu_ps(in[c] + row + x + koff[k])));
         }
     }
 
     sw = _mm256_rcp_ps(sw);
-    for (c = 0; c < 3; c++)
+    for (c = 0; c < JXL_EPF_NCH(gray); c++)
         _mm256_storeu_ps(out[c] + row + x, _mm256_mul_ps(sum8[c], sw));
     _mm256_zeroupper();
+}
+
+JXL_TARGET_AVX2
+static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
+                     const ptrdiff_t koff[12], const ptrdiff_t doff[5],
+                     int nkernel, int ndist, const float cscale[3],
+                     float sigma_val, float step_mul, float border_mul,
+                     int is_y_border, int gray) {
+    if (gray)
+        epf_row8_impl(in, out, row, x, koff, doff, nkernel, ndist, cscale,
+                      sigma_val, step_mul, border_mul, is_y_border, 1);
+    else
+        epf_row8_impl(in, out, row, x, koff, doff, nkernel, ndist, cscale,
+                      sigma_val, step_mul, border_mul, is_y_border, 0);
 }
 
 #if defined(_MSC_VER)
@@ -14191,18 +14293,20 @@ static void epf_row8(float *in[3], float *out[3], size_t row, uint32_t x,
 
 static JXL_EPF_NOINLINE float epf_hsad_one(
     float *in[3], size_t row, uint32_t x, size_t stride,
-    const float cscale[3]) {
-    float dist = 0.0f;
+    const float cscale[3], int gray) {
+    float dist = 0.0f, acc = 0.0f;
     int c;
     for (c = 0; c < 3; c++) {
-        const float *p = in[c] + row + x;
-        float acc = fabsf(p[-(ptrdiff_t)stride + 1] -
-                          p[-(ptrdiff_t)stride]);
-        acc += fabsf(p[1] - p[0]);
-        acc += fabsf(p[(ptrdiff_t)stride + 1] -
-                     p[(ptrdiff_t)stride]);
-        acc += fabsf(p[0] - p[-1]);
-        acc += fabsf(p[2] - p[1]);
+        if (c == 0 || !gray) {
+            const float *p = in[c] + row + x;
+            acc = fabsf(p[-(ptrdiff_t)stride + 1] -
+                        p[-(ptrdiff_t)stride]);
+            acc += fabsf(p[1] - p[0]);
+            acc += fabsf(p[(ptrdiff_t)stride + 1] -
+                         p[(ptrdiff_t)stride]);
+            acc += fabsf(p[0] - p[-1]);
+            acc += fabsf(p[2] - p[1]);
+        }
         dist += cscale[c] * acc;
     }
     return dist;
@@ -14214,7 +14318,7 @@ static JXL_INLINE_HINT float epf_row8_pass1(
     float *in[3], float *out[3], size_t row, uint32_t x, size_t stride,
     const float cscale[3], float sigma_val, __m256 smv, __m256 absmask,
     __m256 zero, __m256 one, float prev_hsad, float *prev_vsad,
-    int reuse_vtop) {
+    int reuse_vtop, const int gray) {
     __m256 dist0 = reuse_vtop ? _mm256_loadu_ps(prev_vsad + x) : zero;
     __m256 dist1 = zero, dist2, dist3 = zero;
     __m256 sum0, sum1, sum2, sw, nis, wgt;
@@ -14223,7 +14327,7 @@ static JXL_INLINE_HINT float epf_row8_pass1(
     nis = _mm256_mul_ps(_mm256_set1_ps(sigma_val), smv);
 
     if (!reuse_vtop) {
-        for (c = 0; c < 3; c++) {
+        for (c = 0; c < JXL_EPF_NCH(gray); c++) {
             const float *p = in[c] + row + x;
             const __m256 p20 =
                 _mm256_loadu_ps(p - 2 * (ptrdiff_t)stride);
@@ -14252,10 +14356,14 @@ static JXL_INLINE_HINT float epf_row8_pass1(
             acc0 = _mm256_add_ps(acc0,
                 _mm256_and_ps(absmask, _mm256_sub_ps(p31, p32)));
             dist0 = _mm256_fmadd_ps(cs, acc0, dist0);
+            if (gray) {
+                dist0 = _mm256_fmadd_ps(_mm256_set1_ps(cscale[1]), acc0, dist0);
+                dist0 = _mm256_fmadd_ps(_mm256_set1_ps(cscale[2]), acc0, dist0);
+            }
         }
     }
 
-    for (c = 0; c < 3; c++) {
+    for (c = 0; c < JXL_EPF_NCH(gray); c++) {
         const float *p = in[c] + row + x;
         const __m256 p21 = _mm256_loadu_ps(p - (ptrdiff_t)stride);
         const __m256 p22 = _mm256_loadu_ps(p);
@@ -14297,6 +14405,14 @@ static JXL_INLINE_HINT float epf_row8_pass1(
 
         dist1 = _mm256_fmadd_ps(cs, acc1, dist1);
         dist3 = _mm256_fmadd_ps(cs, acc3, dist3);
+        if (gray) {
+            const __m256 cs1 = _mm256_set1_ps(cscale[1]);
+            const __m256 cs2 = _mm256_set1_ps(cscale[2]);
+            dist1 = _mm256_fmadd_ps(cs1, acc1, dist1);
+            dist3 = _mm256_fmadd_ps(cs1, acc3, dist3);
+            dist1 = _mm256_fmadd_ps(cs2, acc1, dist1);
+            dist3 = _mm256_fmadd_ps(cs2, acc3, dist3);
+        }
     }
     if (prev_vsad) _mm256_storeu_ps(prev_vsad + x, dist1);
 
@@ -14310,8 +14426,8 @@ static JXL_INLINE_HINT float epf_row8_pass1(
     dist2 = _mm256_blend_ps(dist2, _mm256_set1_ps(prev_hsad), 0x01);
 
     sum0 = _mm256_loadu_ps(in[0] + row + x);
-    sum1 = _mm256_loadu_ps(in[1] + row + x);
-    sum2 = _mm256_loadu_ps(in[2] + row + x);
+    sum1 = gray ? zero : _mm256_loadu_ps(in[1] + row + x);
+    sum2 = gray ? zero : _mm256_loadu_ps(in[2] + row + x);
     sw = one;
 
     wgt = _mm256_fmadd_ps(dist0, nis, one);
@@ -14319,39 +14435,49 @@ static JXL_INLINE_HINT float epf_row8_pass1(
     sw = _mm256_add_ps(sw, wgt);
     sum0 = _mm256_fmadd_ps(
         wgt, _mm256_loadu_ps(in[0] + row + x - (ptrdiff_t)stride), sum0);
-    sum1 = _mm256_fmadd_ps(
-        wgt, _mm256_loadu_ps(in[1] + row + x - (ptrdiff_t)stride), sum1);
-    sum2 = _mm256_fmadd_ps(
-        wgt, _mm256_loadu_ps(in[2] + row + x - (ptrdiff_t)stride), sum2);
+    if (!gray) {
+        sum1 = _mm256_fmadd_ps(
+            wgt, _mm256_loadu_ps(in[1] + row + x - (ptrdiff_t)stride), sum1);
+        sum2 = _mm256_fmadd_ps(
+            wgt, _mm256_loadu_ps(in[2] + row + x - (ptrdiff_t)stride), sum2);
+    }
 
     wgt = _mm256_fmadd_ps(dist1, nis, one);
     wgt = _mm256_max_ps(wgt, zero);
     sw = _mm256_add_ps(sw, wgt);
     sum0 = _mm256_fmadd_ps(
         wgt, _mm256_loadu_ps(in[0] + row + x + stride), sum0);
-    sum1 = _mm256_fmadd_ps(
-        wgt, _mm256_loadu_ps(in[1] + row + x + stride), sum1);
-    sum2 = _mm256_fmadd_ps(
-        wgt, _mm256_loadu_ps(in[2] + row + x + stride), sum2);
+    if (!gray) {
+        sum1 = _mm256_fmadd_ps(
+            wgt, _mm256_loadu_ps(in[1] + row + x + stride), sum1);
+        sum2 = _mm256_fmadd_ps(
+            wgt, _mm256_loadu_ps(in[2] + row + x + stride), sum2);
+    }
 
     wgt = _mm256_fmadd_ps(dist2, nis, one);
     wgt = _mm256_max_ps(wgt, zero);
     sw = _mm256_add_ps(sw, wgt);
     sum0 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[0] + row + x - 1), sum0);
-    sum1 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[1] + row + x - 1), sum1);
-    sum2 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[2] + row + x - 1), sum2);
+    if (!gray) {
+        sum1 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[1] + row + x - 1), sum1);
+        sum2 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[2] + row + x - 1), sum2);
+    }
 
     wgt = _mm256_fmadd_ps(dist3, nis, one);
     wgt = _mm256_max_ps(wgt, zero);
     sw = _mm256_add_ps(sw, wgt);
     sum0 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[0] + row + x + 1), sum0);
-    sum1 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[1] + row + x + 1), sum1);
-    sum2 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[2] + row + x + 1), sum2);
+    if (!gray) {
+        sum1 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[1] + row + x + 1), sum1);
+        sum2 = _mm256_fmadd_ps(wgt, _mm256_loadu_ps(in[2] + row + x + 1), sum2);
+    }
 
     sw = _mm256_rcp_ps(sw);
     _mm256_storeu_ps(out[0] + row + x, _mm256_mul_ps(sum0, sw));
-    _mm256_storeu_ps(out[1] + row + x, _mm256_mul_ps(sum1, sw));
-    _mm256_storeu_ps(out[2] + row + x, _mm256_mul_ps(sum2, sw));
+    if (!gray) {
+        _mm256_storeu_ps(out[1] + row + x, _mm256_mul_ps(sum1, sw));
+        _mm256_storeu_ps(out[2] + row + x, _mm256_mul_ps(sum2, sw));
+    }
     {
         __m128 hi = _mm256_extractf128_ps(dist3, 1);
         hi = _mm_shuffle_ps(hi, hi, _MM_SHUFFLE(3, 3, 3, 3));
@@ -14360,11 +14486,12 @@ static JXL_INLINE_HINT float epf_row8_pass1(
 }
 
 JXL_TARGET_AVX2_FMA
-static uint32_t epf_row_pass1_avx2(
+static JXL_INLINE_HINT uint32_t epf_row_pass1_avx2_impl(
     float *in[3], float *out[3], size_t row, uint32_t x, uint32_t w,
     size_t stride, const float *sigma_row, const float cscale[3],
     float step_mul, float border_mul, int is_y_border, float *prev_vsad,
-    const float *prev_sigma_row, int can_reuse_vtop, const uint8_t *copy_row) {
+    const float *prev_sigma_row, int can_reuse_vtop, const uint8_t *copy_row,
+    const int gray) {
     const __m256 absmask =
         _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
     const __m256 zero = _mm256_setzero_ps();
@@ -14381,7 +14508,7 @@ static uint32_t epf_row_pass1_avx2(
         if (sigma_val == 0.0f) {
             int c;
             if (copy_row[x / 8]) {
-                for (c = 0; c < 3; c++) {
+                for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                     _mm256_storeu_ps(out[c] + row + x,
                                      _mm256_loadu_ps(in[c] + row + x));
                 }
@@ -14391,26 +14518,43 @@ static uint32_t epf_row_pass1_avx2(
             int reuse_vtop =
                 have_vtop && prev_sigma_row[x / 8] != 0.0f;
             if (!prev_valid)
-                prev_hsad = epf_hsad_one(in, row, x - 1, stride, cscale);
+                prev_hsad = epf_hsad_one(in, row, x - 1, stride, cscale, gray);
             prev_hsad = epf_row8_pass1(
                 in, out, row, x, stride, cscale, sigma_val, smv, absmask,
-                zero, one, prev_hsad, prev_vsad, reuse_vtop);
+                zero, one, prev_hsad, prev_vsad, reuse_vtop, gray);
             prev_valid = 1;
         }
     }
     return x;
 }
 
+JXL_TARGET_AVX2_FMA
+static uint32_t epf_row_pass1_avx2(
+    float *in[3], float *out[3], size_t row, uint32_t x, uint32_t w,
+    size_t stride, const float *sigma_row, const float cscale[3],
+    float step_mul, float border_mul, int is_y_border, float *prev_vsad,
+    const float *prev_sigma_row, int can_reuse_vtop, const uint8_t *copy_row,
+    int gray) {
+    if (gray)
+        return epf_row_pass1_avx2_impl(in, out, row, x, w, stride, sigma_row,
+                                       cscale, step_mul, border_mul,
+                                       is_y_border, prev_vsad, prev_sigma_row,
+                                       can_reuse_vtop, copy_row, 1);
+    return epf_row_pass1_avx2_impl(in, out, row, x, w, stride, sigma_row,
+                                   cscale, step_mul, border_mul, is_y_border,
+                                   prev_vsad, prev_sigma_row, can_reuse_vtop,
+                                   copy_row, 0);
+}
+
 enum { EPF_F_H1, EPF_F_H2, EPF_F_VA, EPF_F_VB, EPF_F_VC, EPF_F_V2,
        EPF_F_COUNT };
-#define EPF_P0_CHUNK 32u
+#define JXL_EPF_P0_CHUNK 32u
 
 JXL_TARGET_AVX2
-static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
-                              uint32_t j1, uint32_t x1, size_t stride,
-                              const float *sig_a, const float *sig_b,
-                              const float cscale[3],
-                              float *dst[EPF_F_COUNT]) {
+static JXL_INLINE_HINT void epf_pass0_fwd_row_impl(
+    float *in[3], size_t row, uint32_t j0, uint32_t j1, uint32_t x1,
+    size_t stride, const float *sig_a, const float *sig_b,
+    const float cscale[3], float *dst[EPF_F_COUNT], const int gray) {
     const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
     const __m256 cs0 = _mm256_set1_ps(cscale[0]);
     const __m256 cs1 = _mm256_set1_ps(cscale[1]);
@@ -14418,21 +14562,21 @@ static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
     const ptrdiff_t s = (ptrdiff_t)stride;
     uint32_t j;
 
-#define EPF_FWD_ABS(off, cen) \
+#define JXL_EPF_FWD_ABS(off, cen) \
     _mm256_and_ps(absmask, _mm256_sub_ps(_mm256_loadu_ps(p + (off)), cen))
-#define EPF_FWD_TAP(dist, off, FOLD) do {                                  \
-        __m256 acc = EPF_FWD_ABS((off) - s, cen0);                         \
-        acc = _mm256_add_ps(acc, EPF_FWD_ABS((off) + 1, cen1));            \
-        acc = _mm256_add_ps(acc, EPF_FWD_ABS((off), cen2));                \
-        acc = _mm256_add_ps(acc, EPF_FWD_ABS((off) - 1, cen3));            \
-        acc = _mm256_add_ps(acc, EPF_FWD_ABS((off) + s, cen4));            \
+#define JXL_EPF_FWD_TAP(dist, off, FOLD) do {                                  \
+        __m256 acc = JXL_EPF_FWD_ABS((off) - s, cen0);                         \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off) + 1, cen1));            \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off), cen2));                \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off) - 1, cen3));            \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off) + s, cen4));            \
         acc = _mm256_mul_ps(cs, acc);                                      \
         dist = FOLD(dist, acc);                                            \
     } while (0)
-#define EPF_FWD_FIRST(dist, acc) (acc)
-#define EPF_FWD_NEXT(dist, acc) _mm256_add_ps(dist, acc)
+#define JXL_EPF_FWD_FIRST(dist, acc) (acc)
+#define JXL_EPF_FWD_NEXT(dist, acc) _mm256_add_ps(dist, acc)
 
-#define EPF_FWD_CHANNEL(c, scale, FOLD) do {                               \
+#define JXL_EPF_FWD_CHANNEL(c, scale, FOLD) do {                               \
         const float *p = in[c] + row + q;                                  \
         const __m256 cs = (scale);                                         \
         const __m256 cen0 = _mm256_loadu_ps(p - s);                        \
@@ -14440,12 +14584,37 @@ static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
         const __m256 cen2 = _mm256_loadu_ps(p);                            \
         const __m256 cen3 = _mm256_loadu_ps(p - 1);                        \
         const __m256 cen4 = _mm256_loadu_ps(p + s);                        \
-        EPF_FWD_TAP(d0, 1, FOLD);                                          \
-        EPF_FWD_TAP(d1, 2, FOLD);                                          \
-        EPF_FWD_TAP(d2, s - 1, FOLD);                                      \
-        EPF_FWD_TAP(d3, s, FOLD);                                          \
-        EPF_FWD_TAP(d4, s + 1, FOLD);                                      \
-        EPF_FWD_TAP(d5, 2 * s, FOLD);                                      \
+        JXL_EPF_FWD_TAP(d0, 1, FOLD);                                          \
+        JXL_EPF_FWD_TAP(d1, 2, FOLD);                                          \
+        JXL_EPF_FWD_TAP(d2, s - 1, FOLD);                                      \
+        JXL_EPF_FWD_TAP(d3, s, FOLD);                                          \
+        JXL_EPF_FWD_TAP(d4, s + 1, FOLD);                                      \
+        JXL_EPF_FWD_TAP(d5, 2 * s, FOLD);                                      \
+    } while (0)
+
+#define JXL_EPF_FWD_TAP_GRAY(dist, off) do {                                   \
+        __m256 acc = JXL_EPF_FWD_ABS((off) - s, cen0);                         \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off) + 1, cen1));            \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off), cen2));                \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off) - 1, cen3));            \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off) + s, cen4));            \
+        dist = _mm256_mul_ps(cs0, acc);                                        \
+        dist = _mm256_add_ps(dist, _mm256_mul_ps(cs1, acc));                   \
+        dist = _mm256_add_ps(dist, _mm256_mul_ps(cs2, acc));                   \
+    } while (0)
+#define JXL_EPF_FWD_CHANNEL_GRAY() do {                                        \
+        const float *p = in[0] + row + q;                                  \
+        const __m256 cen0 = _mm256_loadu_ps(p - s);                        \
+        const __m256 cen1 = _mm256_loadu_ps(p + 1);                        \
+        const __m256 cen2 = _mm256_loadu_ps(p);                            \
+        const __m256 cen3 = _mm256_loadu_ps(p - 1);                        \
+        const __m256 cen4 = _mm256_loadu_ps(p + s);                        \
+        JXL_EPF_FWD_TAP_GRAY(d0, 1);                                           \
+        JXL_EPF_FWD_TAP_GRAY(d1, 2);                                           \
+        JXL_EPF_FWD_TAP_GRAY(d2, s - 1);                                       \
+        JXL_EPF_FWD_TAP_GRAY(d3, s);                                           \
+        JXL_EPF_FWD_TAP_GRAY(d4, s + 1);                                       \
+        JXL_EPF_FWD_TAP_GRAY(d5, 2 * s);                                       \
     } while (0)
 
     for (j = j0; j <= j1; j++) {
@@ -14456,9 +14625,13 @@ static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
             continue;
         if (q + 7 > x1) q = x1 - 7;
         d0 = d1 = d2 = d3 = d4 = d5 = _mm256_setzero_ps();
-        EPF_FWD_CHANNEL(0, cs0, EPF_FWD_FIRST);
-        EPF_FWD_CHANNEL(1, cs1, EPF_FWD_NEXT);
-        EPF_FWD_CHANNEL(2, cs2, EPF_FWD_NEXT);
+        if (gray) {
+            JXL_EPF_FWD_CHANNEL_GRAY();
+        } else {
+            JXL_EPF_FWD_CHANNEL(0, cs0, JXL_EPF_FWD_FIRST);
+            JXL_EPF_FWD_CHANNEL(1, cs1, JXL_EPF_FWD_NEXT);
+            JXL_EPF_FWD_CHANNEL(2, cs2, JXL_EPF_FWD_NEXT);
+        }
         _mm256_storeu_ps(dst[EPF_F_H1] + q, d0);
         _mm256_storeu_ps(dst[EPF_F_H2] + q, d1);
         _mm256_storeu_ps(dst[EPF_F_VA] + q, d2);
@@ -14466,22 +14639,36 @@ static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
         _mm256_storeu_ps(dst[EPF_F_VC] + q, d4);
         _mm256_storeu_ps(dst[EPF_F_V2] + q, d5);
     }
-#undef EPF_FWD_CHANNEL
-#undef EPF_FWD_NEXT
-#undef EPF_FWD_FIRST
-#undef EPF_FWD_TAP
-#undef EPF_FWD_ABS
+#undef JXL_EPF_FWD_CHANNEL_GRAY
+#undef JXL_EPF_FWD_TAP_GRAY
+#undef JXL_EPF_FWD_CHANNEL
+#undef JXL_EPF_FWD_NEXT
+#undef JXL_EPF_FWD_FIRST
+#undef JXL_EPF_FWD_TAP
+#undef JXL_EPF_FWD_ABS
     _mm256_zeroupper();
 }
 
 JXL_TARGET_AVX2
-static void epf_row_pass0_avx2(float *in[3], float *out[3], size_t row,
-                               uint32_t x, uint32_t x1,
-                               const float *sigma_row,
-                               const ptrdiff_t koff[12],
-                               const float *const dist[12],
-                               float step_mul, float border_mul,
-                               int is_y_border, const uint8_t *copy_row) {
+static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
+                              uint32_t j1, uint32_t x1, size_t stride,
+                              const float *sig_a, const float *sig_b,
+                              const float cscale[3],
+                              float *dst[EPF_F_COUNT], int gray) {
+    if (gray)
+        epf_pass0_fwd_row_impl(in, row, j0, j1, x1, stride, sig_a, sig_b,
+                               cscale, dst, 1);
+    else
+        epf_pass0_fwd_row_impl(in, row, j0, j1, x1, stride, sig_a, sig_b,
+                               cscale, dst, 0);
+}
+
+JXL_TARGET_AVX2
+static JXL_INLINE_HINT void epf_row_pass0_avx2_impl(
+    float *in[3], float *out[3], size_t row, uint32_t x, uint32_t x1,
+    const float *sigma_row, const ptrdiff_t koff[12],
+    const float *const dist[12], float step_mul, float border_mul,
+    int is_y_border, const uint8_t *copy_row, const int gray) {
     static const int8_t dx[12] = {0, -1, 0, 1, -2, -1, 0, 0, 0, 0, 0, 0};
     const __m256 one = _mm256_set1_ps(1.0f);
     const __m256 zero = _mm256_setzero_ps();
@@ -14491,14 +14678,16 @@ static void epf_row_pass0_avx2(float *in[3], float *out[3], size_t row,
                          step_mul, step_mul, step_mul, border_mul);
     for (; x < x1; x += 8) {
         const float *p0 = in[0] + row + x;
-        const float *p1 = in[1] + row + x;
-        const float *p2 = in[2] + row + x;
+        const float *p1 = gray ? p0 : in[1] + row + x;
+        const float *p2 = gray ? p0 : in[2] + row + x;
         float sigma_val = sigma_row[x / 8];
-        __m256 sum0, sum1, sum2;
+        __m256 sum0, sum1 = zero, sum2 = zero;
         if (sigma_val == 0.0f && !copy_row[x / 8]) continue;
         sum0 = _mm256_loadu_ps(p0);
-        sum1 = _mm256_loadu_ps(p1);
-        sum2 = _mm256_loadu_ps(p2);
+        if (!gray) {
+            sum1 = _mm256_loadu_ps(p1);
+            sum2 = _mm256_loadu_ps(p2);
+        }
         if (sigma_val != 0.0f) {
             __m256 nis = _mm256_mul_ps(_mm256_set1_ps(sigma_val), smv);
             __m256 sw = one;
@@ -14510,30 +14699,52 @@ static void epf_row_pass0_avx2(float *in[3], float *out[3], size_t row,
                 sw = _mm256_add_ps(sw, wgt);
                 sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(wgt,
                     _mm256_loadu_ps(p0 + koff[k])));
-                sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(wgt,
-                    _mm256_loadu_ps(p1 + koff[k])));
-                sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(wgt,
-                    _mm256_loadu_ps(p2 + koff[k])));
+                if (!gray) {
+                    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(wgt,
+                        _mm256_loadu_ps(p1 + koff[k])));
+                    sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(wgt,
+                        _mm256_loadu_ps(p2 + koff[k])));
+                }
             }
             sw = _mm256_rcp_ps(sw);
             sum0 = _mm256_mul_ps(sum0, sw);
-            sum1 = _mm256_mul_ps(sum1, sw);
-            sum2 = _mm256_mul_ps(sum2, sw);
+            if (!gray) {
+                sum1 = _mm256_mul_ps(sum1, sw);
+                sum2 = _mm256_mul_ps(sum2, sw);
+            }
         }
         _mm256_storeu_ps(out[0] + row + x, sum0);
-        _mm256_storeu_ps(out[1] + row + x, sum1);
-        _mm256_storeu_ps(out[2] + row + x, sum2);
+        if (!gray) {
+            _mm256_storeu_ps(out[1] + row + x, sum1);
+            _mm256_storeu_ps(out[2] + row + x, sum2);
+        }
     }
     _mm256_zeroupper();
 }
 
 JXL_TARGET_AVX2
-static uint32_t epf_row_pass2_avx2(float *in[3], float *out[3], size_t row,
-                                   uint32_t x, uint32_t w, size_t stride,
-                                   const float *sigma_row,
-                                   const float cscale[3], float step_mul,
-                                   float border_mul, int is_y_border,
-                                   const uint8_t *copy_row) {
+static void epf_row_pass0_avx2(float *in[3], float *out[3], size_t row,
+                               uint32_t x, uint32_t x1,
+                               const float *sigma_row,
+                               const ptrdiff_t koff[12],
+                               const float *const dist[12],
+                               float step_mul, float border_mul,
+                               int is_y_border, const uint8_t *copy_row,
+                               int gray) {
+    if (gray)
+        epf_row_pass0_avx2_impl(in, out, row, x, x1, sigma_row, koff, dist,
+                                step_mul, border_mul, is_y_border, copy_row, 1);
+    else
+        epf_row_pass0_avx2_impl(in, out, row, x, x1, sigma_row, koff, dist,
+                                step_mul, border_mul, is_y_border, copy_row, 0);
+}
+
+JXL_TARGET_AVX2
+static JXL_INLINE_HINT uint32_t epf_row_pass2_avx2_impl(
+    float *in[3], float *out[3], size_t row, uint32_t x, uint32_t w,
+    size_t stride, const float *sigma_row, const float cscale[3],
+    float step_mul, float border_mul, int is_y_border,
+    const uint8_t *copy_row, const int gray) {
     const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
     const __m256 one = _mm256_set1_ps(1.0f);
     const __m256 zero = _mm256_setzero_ps();
@@ -14548,56 +14759,89 @@ static uint32_t epf_row_pass2_avx2(float *in[3], float *out[3], size_t row,
     const ptrdiff_t koff[4] = {-(ptrdiff_t)stride, (ptrdiff_t)stride, -1, 1};
     for (; x + 8 < w; x += 8) {
         const float *p0 = in[0] + row + x;
-        const float *p1 = in[1] + row + x;
-        const float *p2 = in[2] + row + x;
+        const float *p1 = gray ? p0 : in[1] + row + x;
+        const float *p2 = gray ? p0 : in[2] + row + x;
         float sigma_val = sigma_row[x / 8];
-        __m256 c0, c1, c2, sum0, sum1, sum2, sw, nis;
+        __m256 c0, c1 = zero, c2 = zero, sum0, sum1, sum2, sw, nis;
         int k;
         if (sigma_val == 0.0f && !copy_row[x / 8]) continue;
         c0 = _mm256_loadu_ps(p0);
-        c1 = _mm256_loadu_ps(p1);
-        c2 = _mm256_loadu_ps(p2);
+        if (!gray) {
+            c1 = _mm256_loadu_ps(p1);
+            c2 = _mm256_loadu_ps(p2);
+        }
         sum0 = c0; sum1 = c1; sum2 = c2;
         if (sigma_val != 0.0f) {
             nis = _mm256_mul_ps(_mm256_set1_ps(sigma_val), smv);
             sw = one;
             for (k = 0; k < 4; k++) {
                 __m256 t0 = _mm256_loadu_ps(p0 + koff[k]);
-                __m256 t1 = _mm256_loadu_ps(p1 + koff[k]);
-                __m256 t2 = _mm256_loadu_ps(p2 + koff[k]);
                 __m256 dist, wgt;
-                dist = _mm256_mul_ps(cs0, _mm256_and_ps(absmask,
-                                                        _mm256_sub_ps(t0, c0)));
-                dist = _mm256_add_ps(dist, _mm256_mul_ps(cs1,
-                    _mm256_and_ps(absmask, _mm256_sub_ps(t1, c1))));
-                dist = _mm256_add_ps(dist, _mm256_mul_ps(cs2,
-                    _mm256_and_ps(absmask, _mm256_sub_ps(t2, c2))));
-                wgt = _mm256_add_ps(one, _mm256_mul_ps(dist, nis));
-                wgt = _mm256_max_ps(wgt, zero);
-                sw = _mm256_add_ps(sw, wgt);
-                sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(wgt, t0));
-                sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(wgt, t1));
-                sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(wgt, t2));
+                if (gray) {
+                    __m256 a = _mm256_and_ps(absmask, _mm256_sub_ps(t0, c0));
+                    dist = _mm256_mul_ps(cs0, a);
+                    dist = _mm256_add_ps(dist, _mm256_mul_ps(cs1, a));
+                    dist = _mm256_add_ps(dist, _mm256_mul_ps(cs2, a));
+                    wgt = _mm256_add_ps(one, _mm256_mul_ps(dist, nis));
+                    wgt = _mm256_max_ps(wgt, zero);
+                    sw = _mm256_add_ps(sw, wgt);
+                    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(wgt, t0));
+                } else {
+                    __m256 t1 = _mm256_loadu_ps(p1 + koff[k]);
+                    __m256 t2 = _mm256_loadu_ps(p2 + koff[k]);
+                    dist = _mm256_mul_ps(cs0, _mm256_and_ps(absmask,
+                                                            _mm256_sub_ps(t0, c0)));
+                    dist = _mm256_add_ps(dist, _mm256_mul_ps(cs1,
+                        _mm256_and_ps(absmask, _mm256_sub_ps(t1, c1))));
+                    dist = _mm256_add_ps(dist, _mm256_mul_ps(cs2,
+                        _mm256_and_ps(absmask, _mm256_sub_ps(t2, c2))));
+                    wgt = _mm256_add_ps(one, _mm256_mul_ps(dist, nis));
+                    wgt = _mm256_max_ps(wgt, zero);
+                    sw = _mm256_add_ps(sw, wgt);
+                    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(wgt, t0));
+                    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(wgt, t1));
+                    sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(wgt, t2));
+                }
             }
             sw = _mm256_rcp_ps(sw);
             sum0 = _mm256_mul_ps(sum0, sw);
-            sum1 = _mm256_mul_ps(sum1, sw);
-            sum2 = _mm256_mul_ps(sum2, sw);
+            if (!gray) {
+                sum1 = _mm256_mul_ps(sum1, sw);
+                sum2 = _mm256_mul_ps(sum2, sw);
+            }
         }
         _mm256_storeu_ps(out[0] + row + x, sum0);
-        _mm256_storeu_ps(out[1] + row + x, sum1);
-        _mm256_storeu_ps(out[2] + row + x, sum2);
+        if (!gray) {
+            _mm256_storeu_ps(out[1] + row + x, sum1);
+            _mm256_storeu_ps(out[2] + row + x, sum2);
+        }
     }
     _mm256_zeroupper();
     return x;
 }
+
+JXL_TARGET_AVX2
+static uint32_t epf_row_pass2_avx2(float *in[3], float *out[3], size_t row,
+                                   uint32_t x, uint32_t w, size_t stride,
+                                   const float *sigma_row,
+                                   const float cscale[3], float step_mul,
+                                   float border_mul, int is_y_border,
+                                   const uint8_t *copy_row, int gray) {
+    if (gray)
+        return epf_row_pass2_avx2_impl(in, out, row, x, w, stride, sigma_row,
+                                       cscale, step_mul, border_mul,
+                                       is_y_border, copy_row, 1);
+    return epf_row_pass2_avx2_impl(in, out, row, x, w, stride, sigma_row,
+                                   cscale, step_mul, border_mul, is_y_border,
+                                   copy_row, 0);
+}
 #endif
 
-static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
-                    size_t stride, const float *sigma, uint32_t sigma_stride,
-                    const jxl_epf *epf, int step, float *vsad_cache,
-                    float *fwd_cache, const uint8_t *copy_map,
-                    size_t copy_stride, uint32_t y_begin, uint32_t y_end) {
+static JXL_INLINE_HINT int epf_pass_impl(
+    float *in[3], float *out[3], uint32_t w, uint32_t h, size_t stride,
+    const float *sigma, uint32_t sigma_stride, const jxl_epf *epf, int step,
+    float *vsad_cache, float *fwd_cache, const uint8_t *copy_map,
+    size_t copy_stride, uint32_t y_begin, uint32_t y_end, const int gray) {
     const int8_t (*kernel)[2];
     const int8_t (*dist_off)[2];
     ptrdiff_t koff[12];
@@ -14681,7 +14925,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                         in, (size_t)r * stride, 1, p0_x1 / 8, p0_x1, stride,
                         sigma + (size_t)(r / 8) * sigma_stride,
                         sigma + (size_t)((r + 2) / 8) * sigma_stride,
-                        cscale, f);
+                        cscale, f, gray);
                 }
             }
 
@@ -14705,16 +14949,16 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
 #ifdef JXL_EPF_SSE2
             if (p0_x1 && y_inside && x == 8) {
                 while (x < p0_x1) {
-                    uint32_t xe = JXL_MIN(x + 8 * EPF_P0_CHUNK, p0_x1);
+                    uint32_t xe = JXL_MIN(x + 8 * JXL_EPF_P0_CHUNK, p0_x1);
 
                     epf_pass0_fwd_row(
                         in, row, x == 8 ? 1 : x / 8 + 1, xe / 8, p0_x1,
                         stride, sigma_row,
                         sigma + (size_t)((y + 2) / 8) * sigma_stride,
-                        cscale, p0_f);
+                        cscale, p0_f, gray);
                     epf_row_pass0_avx2(in, out, row, x, xe, sigma_row, koff,
                                        p0_dist, step_mul, border_mul,
-                                       is_y_border, copy_row);
+                                       is_y_border, copy_row, gray);
                     x = xe;
                 }
                 continue;
@@ -14722,7 +14966,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
             if (use_avx2 && step == 2 && y_inside && x == 8 && w > 16) {
                 x = epf_row_pass2_avx2(in, out, row, x, w, stride, sigma_row,
                                        cscale, step_mul, border_mul,
-                                       is_y_border, copy_row);
+                                       is_y_border, copy_row, gray);
                 continue;
             }
             if (use_avx2_fma && step == 1 && y_inside && (x & 7u) == 0 &&
@@ -14731,7 +14975,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                                        cscale, step_mul, border_mul,
                                        is_y_border, vsad_cache,
                                        prev_sigma_row,
-                                       y > (uint32_t)pad, copy_row);
+                                       y > (uint32_t)pad, copy_row, gray);
                 continue;
             }
 
@@ -14739,7 +14983,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                 x >= (uint32_t)pad && x + 7 + (uint32_t)pad < w) {
                 if (sigma_val == 0.0f) {
                     if (copy_row[x / 8]) {
-                        for (c = 0; c < 3; c++) {
+                        for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                             memcpy(out[c] + row + x, in[c] + row + x,
                                    8 * sizeof(float));
                         }
@@ -14749,7 +14993,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                 }
                 epf_row8(in, out, row, x, koff, doff, nkernel, ndist,
                          cscale, sigma_val, step_mul, border_mul,
-                         is_y_border);
+                         is_y_border, gray);
                 x += 8;
                 continue;
             }
@@ -14758,7 +15002,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                 __m128 dist4[12], sum4[3], sw, nis;
                 if (sigma_val == 0.0f) {
                     if (copy_row[x / 8]) {
-                        for (c = 0; c < 3; c++) {
+                        for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                             _mm_storeu_ps(out[c] + row + x,
                                           _mm_loadu_ps(in[c] + row + x));
                         }
@@ -14771,7 +15015,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                                  is_y_border ? sm_border
                                              : ((x & 7u) == 0 ? sm_lo : sm_hi));
                 for (k = 0; k < nkernel; k++) dist4[k] = _mm_setzero_ps();
-                for (c = 0; c < 3; c++) {
+                for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                     const float *p = in[c] + row + x;
                     __m128 cs = _mm_set1_ps(cscale[c]);
                     __m128 cen[5];
@@ -14784,23 +15028,30 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                                 _mm_sub_ps(_mm_loadu_ps(pk + doff[d]), cen[d])));
                         }
                         dist4[k] = _mm_add_ps(dist4[k], _mm_mul_ps(cs, acc));
+                        if (gray) {
+                            dist4[k] = _mm_add_ps(dist4[k], _mm_mul_ps(
+                                _mm_set1_ps(cscale[1]), acc));
+                            dist4[k] = _mm_add_ps(dist4[k], _mm_mul_ps(
+                                _mm_set1_ps(cscale[2]), acc));
+                        }
                     }
                 }
-                for (c = 0; c < 3; c++) sum4[c] = _mm_loadu_ps(in[c] + row + x);
+                for (c = 0; c < JXL_EPF_NCH(gray); c++)
+                    sum4[c] = _mm_loadu_ps(in[c] + row + x);
                 sw = _mm_set1_ps(1.0f);
                 for (k = 0; k < nkernel; k++) {
                     __m128 wgt = _mm_add_ps(_mm_set1_ps(1.0f),
                                             _mm_mul_ps(dist4[k], nis));
                     wgt = _mm_max_ps(wgt, _mm_setzero_ps());
                     sw = _mm_add_ps(sw, wgt);
-                    for (c = 0; c < 3; c++) {
+                    for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                         sum4[c] = _mm_add_ps(sum4[c], _mm_mul_ps(wgt,
                             _mm_loadu_ps(in[c] + row + x + koff[k])));
                     }
                 }
 
                 sw = _mm_div_ps(_mm_set1_ps(1.0f), sw);
-                for (c = 0; c < 3; c++) {
+                for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                     _mm_storeu_ps(out[c] + row + x, _mm_mul_ps(sum4[c], sw));
                 }
                 x += 4;
@@ -14814,7 +15065,8 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
 
             if (sigma_val == 0.0f) {
                 if (copy_row[x / 8]) {
-                    for (c = 0; c < 3; c++) out[c][row + x] = in[c][row + x];
+                    for (c = 0; c < JXL_EPF_NCH(gray); c++)
+                        out[c][row + x] = in[c][row + x];
                 }
                 x++;
                 continue;
@@ -14828,7 +15080,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
             if (y_inside && x >= (uint32_t)pad && x + (uint32_t)pad < w) {
 
                 for (k = 0; k < nkernel; k++) soff[k] = row + x + koff[k];
-                for (c = 0; c < 3; c++) {
+                for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                     const float *p = in[c] + row + x;
                     float cs = cscale[c];
                     float cen[5];
@@ -14839,6 +15091,10 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                         for (d = 0; d < ndist; d++)
                             acc += fabsf(pk[doff[d]] - cen[d]);
                         dist[k] += cs * acc;
+                        if (gray) {
+                            dist[k] += cscale[1] * acc;
+                            dist[k] += cscale[2] * acc;
+                        }
                     }
                 }
             } else {
@@ -14860,7 +15116,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                     soff[k] = (size_t)jxl_mirror(ky, h) * stride +
                               jxl_mirror(kx, w);
                 }
-                for (c = 0; c < 3; c++) {
+                for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                     const float *p = in[c];
                     float cs = cscale[c];
                     float cen[5];
@@ -14870,29 +15126,50 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                         for (d = 0; d < ndist; d++)
                             acc += fabsf(p[ao[k][d]] - cen[d]);
                         dist[k] += cs * acc;
+                        if (gray) {
+                            dist[k] += cscale[1] * acc;
+                            dist[k] += cscale[2] * acc;
+                        }
                     }
                 }
             }
 
-            for (c = 0; c < 3; c++) sum[c] = in[c][row + x];
+            for (c = 0; c < JXL_EPF_NCH(gray); c++) sum[c] = in[c][row + x];
             sum_weights = 1.0f;
             for (k = 0; k < nkernel; k++) {
                 float weight = 1.0f + dist[k] * neg_inv_sigma;
                 if (weight < 0.0f) weight = 0.0f;
                 sum_weights += weight;
-                for (c = 0; c < 3; c++) sum[c] += weight * in[c][soff[k]];
+                for (c = 0; c < JXL_EPF_NCH(gray); c++)
+                    sum[c] += weight * in[c][soff[k]];
             }
 
             inv_w = 1.0f / sum_weights;
-            for (c = 0; c < 3; c++) out[c][row + x] = sum[c] * inv_w;
+            for (c = 0; c < JXL_EPF_NCH(gray); c++)
+                out[c][row + x] = sum[c] * inv_w;
             x++;
         }
     }
     return 0;
 }
 
-static void epf_copy_active_row(float *dst[3], float *src[3], uint32_t w,
-                                uint32_t y, size_t stride,
+static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
+                    size_t stride, const float *sigma, uint32_t sigma_stride,
+                    const jxl_epf *epf, int step, float *vsad_cache,
+                    float *fwd_cache, const uint8_t *copy_map,
+                    size_t copy_stride, uint32_t y_begin, uint32_t y_end,
+                    int gray) {
+    if (gray)
+        return epf_pass_impl(in, out, w, h, stride, sigma, sigma_stride, epf,
+                             step, vsad_cache, fwd_cache, copy_map,
+                             copy_stride, y_begin, y_end, 1);
+    return epf_pass_impl(in, out, w, h, stride, sigma, sigma_stride, epf, step,
+                         vsad_cache, fwd_cache, copy_map, copy_stride, y_begin,
+                         y_end, 0);
+}
+
+static void epf_copy_active_row(float *dst[3], float *src[3], int nch,
+                                uint32_t w, uint32_t y, size_t stride,
                                 const float *sigma, uint32_t sigma_stride) {
     const float *sigma_row = sigma + (size_t)(y / 8) * sigma_stride;
     uint32_t bw = (w + 7) / 8, x;
@@ -14902,36 +15179,38 @@ static void epf_copy_active_row(float *dst[3], float *src[3], uint32_t w,
         uint32_t n;
         if (sigma_row[x] == 0.0f) continue;
         n = JXL_MIN(8u, w - x * 8);
-        for (c = 0; c < 3; c++) {
+        for (c = 0; c < nch; c++) {
             memcpy(dst[c] + row + x * 8, src[c] + row + x * 8,
                    n * sizeof(float));
         }
     }
 }
 
-#define EPF_RING_ROWS 48u
+#define JXL_EPF_RING_ROWS 48u
 typedef struct {
     float *buf[3];
     float *p[3];
     uint32_t base, keep;
+    int nch;
 } epf_ring;
 
 static void epf_ring_bias(epf_ring *r, size_t stride) {
     int c;
-    for (c = 0; c < 3; c++) {
+    for (c = 0; c < r->nch; c++) {
         r->p[c] = (float *)((uintptr_t)r->buf[c] -
                             (uintptr_t)r->base * stride * sizeof(float));
     }
 }
 
 static int epf_ring_init(jxl_ctx *ctx, epf_ring *r, size_t stride,
-                         uint32_t keep) {
+                         uint32_t keep, int nch) {
     size_t n;
     int c;
 
-    if (!jxl_size_mul(stride, (EPF_RING_ROWS + 1) * sizeof(float), &n))
+    if (!jxl_size_mul(stride, (JXL_EPF_RING_ROWS + 1) * sizeof(float), &n))
         return -1;
-    for (c = 0; c < 3; c++) {
+    r->nch = nch;
+    for (c = 0; c < nch; c++) {
         r->buf[c] = (float *)jxl_malloc(ctx, n);
         if (!r->buf[c]) return -1;
     }
@@ -14943,19 +15222,19 @@ static int epf_ring_init(jxl_ctx *ctx, epf_ring *r, size_t stride,
 
 static void epf_ring_advance(epf_ring *r, uint32_t y, size_t stride) {
     int c;
-    if (y - r->base < EPF_RING_ROWS) return;
-    for (c = 0; c < 3; c++) {
+    if (y - r->base < JXL_EPF_RING_ROWS) return;
+    for (c = 0; c < r->nch; c++) {
         memmove(r->buf[c],
-                r->buf[c] + (size_t)(EPF_RING_ROWS - r->keep) * stride,
+                r->buf[c] + (size_t)(JXL_EPF_RING_ROWS - r->keep) * stride,
                 (size_t)r->keep * stride * sizeof(float));
     }
     r->base = y - r->keep;
     epf_ring_bias(r, stride);
 }
 
-int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
-                  size_t stride, const float *sigma, uint32_t sigma_stride,
-                  const jxl_epf *epf) {
+int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], int gray, uint32_t w,
+                  uint32_t h, size_t stride, const float *sigma,
+                  uint32_t sigma_stride, const jxl_epf *epf) {
     static const uint32_t step_pad[3] = {3, 2, 1};
     epf_ring ring_a, ring_b;
     float *vsad_cache = NULL;
@@ -14974,8 +15253,12 @@ int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
     steps[nsteps++] = 1;
     if (epf->iters >= 2) steps[nsteps++] = 2;
 
-    if (nsteps > 1 && epf_ring_init(ctx, &ring_a, stride, 6) != 0) goto done;
-    if ((nsteps & 1) && epf_ring_init(ctx, &ring_b, stride, 3) != 0) goto done;
+    if (nsteps > 1 &&
+        epf_ring_init(ctx, &ring_a, stride, 6, JXL_EPF_NCH(gray)) != 0)
+        goto done;
+    if ((nsteps & 1) &&
+        epf_ring_init(ctx, &ring_b, stride, 3, JXL_EPF_NCH(gray)) != 0)
+        goto done;
 
     {
         size_t n;
@@ -15032,12 +15315,12 @@ int jxl_apply_epf(jxl_ctx *ctx, float *plane[3], uint32_t w, uint32_t h,
                          to_plane ? plane : dst->p, w, h, stride, sigma,
                          sigma_stride, epf, steps[i], vsad_cache, fwd_cache,
                          (!to_plane && !last) ? copy_map + bw : copy_map,
-                         (!to_plane && !last) ? bw : 0, y, y + 1) != 0)
+                         (!to_plane && !last) ? bw : 0, y, y + 1, gray) != 0)
                 goto done;
         }
         if ((nsteps & 1) && t >= lag[nsteps] && t - lag[nsteps] < h) {
-            epf_copy_active_row(plane, ring_b.p, w, t - lag[nsteps], stride,
-                                sigma, sigma_stride);
+            epf_copy_active_row(plane, ring_b.p, JXL_EPF_NCH(gray), w,
+                                t - lag[nsteps], stride, sigma, sigma_stride);
         }
     }
     rc = 0;
@@ -15269,15 +15552,20 @@ static float tf_bt709(float v) {
            0.09929682680944f;
 }
 
+static const float jxl_pq_p[5] = {1.351392e-02f, -1.095778e+00f,
+                                  5.522776e+01f, 1.492516e+02f, 4.838434e+01f};
+static const float jxl_pq_q[5] = {1.012416e+00f, 2.016708e+01f,
+                                  9.263710e+01f, 1.120607e+02f, 2.590418e+01f};
+static const float jxl_pq_plo[5] = {9.863406e-06f, 3.881234e-01f,
+                                    1.352821e+02f, 6.889862e+04f,
+                                    -2.864824e+05f};
+static const float jxl_pq_qlo[5] = {3.371868e+01f, 1.477719e+03f,
+                                    1.608477e+04f, -4.389884e+04f,
+                                    -2.072546e+05f};
+
 static float tf_pq(float v, float scale) {
-    static const float p[5] = {1.351392e-02f, -1.095778e+00f, 5.522776e+01f,
-                               1.492516e+02f, 4.838434e+01f};
-    static const float q[5] = {1.012416e+00f, 2.016708e+01f, 9.263710e+01f,
-                               1.120607e+02f, 2.590418e+01f};
-    static const float plo[5] = {9.863406e-06f, 3.881234e-01f, 1.352821e+02f,
-                                 6.889862e+04f, -2.864824e+05f};
-    static const float qlo[5] = {3.371868e+01f, 1.477719e+03f, 1.608477e+04f,
-                                 -4.389884e+04f, -2.072546e+05f};
+    const float *p = jxl_pq_p, *q = jxl_pq_q;
+    const float *plo = jxl_pq_plo, *qlo = jxl_pq_qlo;
     float a = fabsf(v);
     float x = sqrtf(sqrtf(a * scale));
     const float *pp = a < 1e-4f ? plo : p;
@@ -15292,13 +15580,22 @@ static float tf_pq(float v, float scale) {
     return v < 0.0f ? -r : r;
 }
 
+#define JXL_HLG_A_LN2 0.123957433f
+#define JXL_HLG_B 0.28466892f
+#define JXL_HLG_C 0.55991073f
 static float tf_hlg(float v) {
-    const float a = 0.17883277f;
-    const float b = 0.28466892f;
-    const float c = 0.55991073f;
-    if (v <= 0.0f) return 0.0f;
+    if (!(v > 0.0f)) return 0.0f;
     if (v <= 1.0f / 12.0f) return sqrtf(3.0f * v);
-    return a * logf(12.0f * v - b) + c;
+    return JXL_HLG_A_LN2 * fast_log2f(12.0f * v - JXL_HLG_B) + JXL_HLG_C;
+}
+
+static float hlg_ootf_ratio(float y, float e) {
+    float a, ratio;
+    if (!(y > 0.0f)) return 0.0f;
+    a = fast_log2f(y) * e;
+    if (a < -126.0f) a = -126.0f;
+    ratio = fast_pow2f(a);
+    return ratio < 1e9f ? ratio : 1e9f;
 }
 
 #ifdef JXL_COLOR_SSE2
@@ -15528,6 +15825,156 @@ static void tf_bt709_x4(float *v, size_t n, size_t *pos) {
     }
     *pos = i;
 }
+
+static void tf_hlg_x4(float *v, size_t n, size_t *pos) {
+    const __m128 zero = _mm_setzero_ps();
+    const __m128 three = _mm_set1_ps(3.0f), twelve = _mm_set1_ps(12.0f);
+    const __m128 thresh = _mm_set1_ps(1.0f / 12.0f);
+    const __m128 ka = _mm_set1_ps(JXL_HLG_A_LN2), kb = _mm_set1_ps(JXL_HLG_B);
+    const __m128 kc = _mm_set1_ps(JXL_HLG_C);
+    size_t i = *pos;
+    for (; i + 4 <= n; i += 4) {
+        __m128 x = _mm_max_ps(_mm_loadu_ps(v + i), zero);
+        __m128 low = _mm_sqrt_ps(_mm_mul_ps(three, x));
+        __m128 hi = _mm_add_ps(_mm_mul_ps(ka, fast_log2f_x4(
+            _mm_sub_ps(_mm_mul_ps(twelve, x), kb))), kc);
+        __m128 m = _mm_cmple_ps(x, thresh);
+        _mm_storeu_ps(v + i, _mm_or_ps(_mm_and_ps(m, low),
+                                       _mm_andnot_ps(m, hi)));
+    }
+    *pos = i;
+}
+
+JXL_TARGET_AVX2
+static void tf_hlg_x8(float *v, size_t n, size_t *pos) {
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 three = _mm256_set1_ps(3.0f), twelve = _mm256_set1_ps(12.0f);
+    const __m256 thresh = _mm256_set1_ps(1.0f / 12.0f);
+    const __m256 ka = _mm256_set1_ps(JXL_HLG_A_LN2);
+    const __m256 kb = _mm256_set1_ps(JXL_HLG_B);
+    const __m256 kc = _mm256_set1_ps(JXL_HLG_C);
+    size_t i = *pos;
+    for (; i + 8 <= n; i += 8) {
+        __m256 x = _mm256_max_ps(_mm256_loadu_ps(v + i), zero);
+        __m256 low = _mm256_sqrt_ps(_mm256_mul_ps(three, x));
+        __m256 hi = _mm256_add_ps(_mm256_mul_ps(ka, fast_log2f_x8(
+            _mm256_sub_ps(_mm256_mul_ps(twelve, x), kb))), kc);
+        __m256 m = _mm256_cmp_ps(x, thresh, _CMP_LE_OQ);
+        _mm256_storeu_ps(v + i, _mm256_or_ps(_mm256_and_ps(m, low),
+                                             _mm256_andnot_ps(m, hi)));
+    }
+    _mm256_zeroupper();
+    *pos = i;
+}
+
+static void hlg_ootf_x4(float *r, float *g, float *b, size_t n,
+                        const float lum[3], float e, size_t *pos) {
+    const __m128 l0 = _mm_set1_ps(lum[0]), l1 = _mm_set1_ps(lum[1]);
+    const __m128 l2 = _mm_set1_ps(lum[2]), ve = _mm_set1_ps(e);
+    const __m128 lo = _mm_set1_ps(-126.0f), cap = _mm_set1_ps(1e9f);
+    const __m128 zero = _mm_setzero_ps();
+    size_t i = *pos;
+    for (; i + 4 <= n; i += 4) {
+        __m128 vr = _mm_loadu_ps(r + i), vg = _mm_loadu_ps(g + i);
+        __m128 vb = _mm_loadu_ps(b + i);
+        __m128 y = _mm_add_ps(_mm_add_ps(_mm_mul_ps(l0, vr), _mm_mul_ps(l1, vg)),
+                              _mm_mul_ps(l2, vb));
+        __m128 a = _mm_max_ps(_mm_mul_ps(fast_log2f_x4(y), ve), lo);
+        __m128 ratio = _mm_min_ps(fast_pow2f_x4(a), cap);
+        ratio = _mm_and_ps(_mm_cmpgt_ps(y, zero), ratio);
+        _mm_storeu_ps(r + i, _mm_mul_ps(vr, ratio));
+        _mm_storeu_ps(g + i, _mm_mul_ps(vg, ratio));
+        _mm_storeu_ps(b + i, _mm_mul_ps(vb, ratio));
+    }
+    *pos = i;
+}
+
+static void tf_pq_x4(float *v, size_t n, float scale, size_t *pos) {
+    const __m128 absmask = _mm_castsi128_ps(_mm_set1_epi32(0x7fffffff));
+    const __m128 vscale = _mm_set1_ps(scale), lo = _mm_set1_ps(1e-4f);
+    size_t i = *pos;
+    int k;
+    for (; i + 4 <= n; i += 4) {
+        __m128 v4 = _mm_loadu_ps(v + i);
+        __m128 a = _mm_and_ps(v4, absmask);
+        __m128 x = _mm_sqrt_ps(_mm_sqrt_ps(_mm_mul_ps(a, vscale)));
+        __m128 yp = _mm_set1_ps(jxl_pq_p[4]), yq = _mm_set1_ps(jxl_pq_q[4]);
+        __m128 ypl = _mm_set1_ps(jxl_pq_plo[4]), yql = _mm_set1_ps(jxl_pq_qlo[4]);
+        __m128 m, r;
+        for (k = 3; k >= 0; k--) {
+            yp = _mm_add_ps(_mm_mul_ps(yp, x), _mm_set1_ps(jxl_pq_p[k]));
+            yq = _mm_add_ps(_mm_mul_ps(yq, x), _mm_set1_ps(jxl_pq_q[k]));
+            ypl = _mm_add_ps(_mm_mul_ps(ypl, x), _mm_set1_ps(jxl_pq_plo[k]));
+            yql = _mm_add_ps(_mm_mul_ps(yql, x), _mm_set1_ps(jxl_pq_qlo[k]));
+        }
+        m = _mm_cmplt_ps(a, lo);
+        r = _mm_or_ps(_mm_and_ps(m, _mm_div_ps(ypl, yql)),
+                      _mm_andnot_ps(m, _mm_div_ps(yp, yq)));
+
+        r = _mm_or_ps(r, _mm_and_ps(_mm_cmplt_ps(v4, _mm_setzero_ps()),
+                                    _mm_set1_ps(-0.0f)));
+        _mm_storeu_ps(v + i, r);
+    }
+    *pos = i;
+}
+
+JXL_TARGET_AVX2
+static void tf_pq_x8(float *v, size_t n, float scale, size_t *pos) {
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256 vscale = _mm256_set1_ps(scale), lo = _mm256_set1_ps(1e-4f);
+    size_t i = *pos;
+    int k;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v8 = _mm256_loadu_ps(v + i);
+        __m256 a = _mm256_and_ps(v8, absmask);
+        __m256 x = _mm256_sqrt_ps(_mm256_sqrt_ps(_mm256_mul_ps(a, vscale)));
+        __m256 yp = _mm256_set1_ps(jxl_pq_p[4]), yq = _mm256_set1_ps(jxl_pq_q[4]);
+        __m256 ypl = _mm256_set1_ps(jxl_pq_plo[4]);
+        __m256 yql = _mm256_set1_ps(jxl_pq_qlo[4]);
+        __m256 m, r;
+        for (k = 3; k >= 0; k--) {
+            yp = _mm256_add_ps(_mm256_mul_ps(yp, x), _mm256_set1_ps(jxl_pq_p[k]));
+            yq = _mm256_add_ps(_mm256_mul_ps(yq, x), _mm256_set1_ps(jxl_pq_q[k]));
+            ypl = _mm256_add_ps(_mm256_mul_ps(ypl, x),
+                                _mm256_set1_ps(jxl_pq_plo[k]));
+            yql = _mm256_add_ps(_mm256_mul_ps(yql, x),
+                                _mm256_set1_ps(jxl_pq_qlo[k]));
+        }
+        m = _mm256_cmp_ps(a, lo, _CMP_LT_OQ);
+        r = _mm256_blendv_ps(_mm256_div_ps(yp, yq), _mm256_div_ps(ypl, yql), m);
+        r = _mm256_or_ps(r, _mm256_and_ps(
+            _mm256_cmp_ps(v8, _mm256_setzero_ps(), _CMP_LT_OQ),
+            _mm256_set1_ps(-0.0f)));
+        _mm256_storeu_ps(v + i, r);
+    }
+    _mm256_zeroupper();
+    *pos = i;
+}
+
+JXL_TARGET_AVX2
+static void hlg_ootf_x8(float *r, float *g, float *b, size_t n,
+                        const float lum[3], float e, size_t *pos) {
+    const __m256 l0 = _mm256_set1_ps(lum[0]), l1 = _mm256_set1_ps(lum[1]);
+    const __m256 l2 = _mm256_set1_ps(lum[2]), ve = _mm256_set1_ps(e);
+    const __m256 lo = _mm256_set1_ps(-126.0f), cap = _mm256_set1_ps(1e9f);
+    const __m256 zero = _mm256_setzero_ps();
+    size_t i = *pos;
+    for (; i + 8 <= n; i += 8) {
+        __m256 vr = _mm256_loadu_ps(r + i), vg = _mm256_loadu_ps(g + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        __m256 y = _mm256_add_ps(
+            _mm256_add_ps(_mm256_mul_ps(l0, vr), _mm256_mul_ps(l1, vg)),
+            _mm256_mul_ps(l2, vb));
+        __m256 a = _mm256_max_ps(_mm256_mul_ps(fast_log2f_x8(y), ve), lo);
+        __m256 ratio = _mm256_min_ps(fast_pow2f_x8(a), cap);
+        ratio = _mm256_and_ps(_mm256_cmp_ps(y, zero, _CMP_GT_OQ), ratio);
+        _mm256_storeu_ps(r + i, _mm256_mul_ps(vr, ratio));
+        _mm256_storeu_ps(g + i, _mm256_mul_ps(vg, ratio));
+        _mm256_storeu_ps(b + i, _mm256_mul_ps(vb, ratio));
+    }
+    _mm256_zeroupper();
+    *pos = i;
+}
 #endif
 
 void jxl_hlg_inverse_ootf(float *r, float *g, float *b, size_t n,
@@ -15535,14 +15982,17 @@ void jxl_hlg_inverse_ootf(float *r, float *g, float *b, size_t n,
     float gamma = (1.0f / 1.2f) *
                   powf(1.111f, -log2f(intensity_target / 1000.0f));
     float exponent = gamma - 1.0f;
-    size_t i;
+    size_t i = 0;
     if (!(exponent < -0.01f || exponent > 0.01f)) return;
-    for (i = 0; i < n; i++) {
+#ifdef JXL_COLOR_SSE2
+    if (jxl_has_avx2()) hlg_ootf_x8(r, g, b, n, luminances, exponent, &i);
+    hlg_ootf_x4(r, g, b, n, luminances, exponent, &i);
+#endif
+    for (; i < n; i++) {
         float y = luminances[0] * r[i] + luminances[1] * g[i] +
                   luminances[2] * b[i];
 
-        float ratio = y > 0.0f ? powf(y, exponent) : 0.0f;
-        if (!(ratio < 1e9f)) ratio = 1e9f;
+        float ratio = hlg_ootf_ratio(y, exponent);
         r[i] *= ratio;
         g[i] *= ratio;
         b[i] *= ratio;
@@ -15575,7 +16025,12 @@ void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
         case JXL_TF_PQ:
             {
                 float scale = intensity_target / 10000.0f;
-                for (i = 0; i < n; i++) v[i] = tf_pq(v[i], scale);
+                i = 0;
+#ifdef JXL_COLOR_SSE2
+                if (jxl_has_avx2()) tf_pq_x8(v, n, scale, &i);
+                tf_pq_x4(v, n, scale, &i);
+#endif
+                for (; i < n; i++) v[i] = tf_pq(v[i], scale);
             }
             break;
         case JXL_TF_DCI:
@@ -15584,7 +16039,12 @@ void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
             }
             break;
         case JXL_TF_HLG:
-            for (i = 0; i < n; i++) v[i] = tf_hlg(v[i]);
+            i = 0;
+#ifdef JXL_COLOR_SSE2
+            if (jxl_has_avx2()) tf_hlg_x8(v, n, &i);
+            tf_hlg_x4(v, n, &i);
+#endif
+            for (; i < n; i++) v[i] = tf_hlg(v[i]);
             break;
         case JXL_TF_SRGB:
         default:
