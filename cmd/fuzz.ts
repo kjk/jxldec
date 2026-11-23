@@ -18,7 +18,11 @@
 // each reproducible with `out/fuzz/jxl_fuzz.exe <file>`.
 //
 // No extra install on Windows: libFuzzer and ASan ship with the VS-bundled
-// clang (or LLVM clang on PATH). On macOS use Homebrew's llvm.
+// clang (or LLVM clang on PATH). On macOS use Homebrew's llvm. On
+// Debian/Ubuntu, clang needs libclang-rt-<N>-dev for libFuzzer; the first run
+// also builds the libjxl tools (cmake + ninja) to generate the seed corpus.
+// On Linux ASan includes LeakSanitizer, so a leak on an error path fails
+// -check there even though the Windows build cannot see it.
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "fs";
 import { join, resolve } from "path";
 import { buildFuzz, FUZZ_EXE } from "./build";

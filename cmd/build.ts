@@ -240,6 +240,11 @@ export async function buildFuzz(clean = false): Promise<string> {
     if (isMac && cc === "clang") {
       console.error("\nfuzz build failed: Apple's clang has no libFuzzer.");
       console.error("  brew install llvm   (then re-run; it is auto-detected)\n");
+    } else if (!isWindows && !isMac) {
+      // Debian/Ubuntu ship libFuzzer and the ASan runtime in a separate
+      // package from clang itself; a missing one fails at link time.
+      console.error("\nfuzz build failed. On Debian/Ubuntu, libFuzzer is in");
+      console.error("  libclang-rt-<N>-dev   (N = clang's major version)\n");
     }
     throw e;
   }
