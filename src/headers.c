@@ -11,18 +11,11 @@
 
 /* ----- small helpers ----- */
 
-/* Name: a length-prefixed UTF-8 string. Returns malloc'd NUL-terminated bytes,
-   or NULL for the (common) empty name. */
-char *jxl_read_name(jxl_ctx *ctx, jxl_br *br) {
+/* Name: a length-prefixed UTF-8 string. Nothing uses frame or channel names,
+   so they are read past rather than stored. */
+void jxl_skip_name(jxl_br *br) {
     uint32_t len = jxl_br_u32(br, 0, 0, 0, 4, 16, 5, 48, 10);
-    char *s;
-    uint32_t i;
-    if (len == 0 || br->err) return NULL;
-    s = (char *)jxl_malloc(ctx, len + 1);
-    if (!s) return NULL;
-    for (i = 0; i < len; i++) s[i] = (char)jxl_br_read(br, 8);
-    s[len] = 0;
-    return s;
+    if (!br->err) jxl_br_skip(br, (size_t)len * 8);
 }
 
 static void read_bit_depth(jxl_br *br, jxl_bit_depth *bd) {
@@ -149,7 +142,6 @@ static void colour_encoding_default(jxl_colour_encoding *c) {
     c->primaries = JXL_PRIMARIES_SRGB;
     c->tf = JXL_TF_SRGB;
     c->tf_have_gamma = 0;
-    c->rendering_intent = 1;   /* relative colorimetric */
 }
 
 static void colour_encoding_read(jxl_ctx *ctx, jxl_br *br,
@@ -186,7 +178,7 @@ static void colour_encoding_read(jxl_ctx *ctx, jxl_br *br,
     } else {
         c->tf = (jxl_transfer_function)jxl_br_enum(br);
     }
-    c->rendering_intent = jxl_br_enum(br);
+    (void)jxl_br_enum(br);   /* rendering intent: for a CMS, not for us */
 }
 
 /* ----- extra channels ----- */
@@ -207,7 +199,7 @@ static void ec_info_read(jxl_ctx *ctx, jxl_br *br, jxl_ec_info *ec) {
     ty = jxl_br_enum(br);
     read_bit_depth(br, &ec->bit_depth);
     ec->dim_shift = jxl_br_u32(br, 0, 0, 3, 0, 4, 0, 1, 3);
-    ec->name = jxl_read_name(ctx, br);
+    jxl_skip_name(br);
     ec->type = (jxl_ec_type)ty;
 
     switch (ty) {
@@ -221,7 +213,7 @@ static void ec_info_read(jxl_ctx *ctx, jxl_br *br, jxl_ec_info *ec) {
             ec->spot[3] = jxl_br_f16(br);
             break;
         case JXL_EC_CFA:
-            ec->cfa_channel = jxl_br_u32(br, 1, 0, 0, 2, 3, 4, 19, 8);
+            (void)jxl_br_u32(br, 1, 0, 0, 2, 3, 4, 19, 8);   /* cfa_channel */
             break;
         case JXL_EC_DEPTH:
         case JXL_EC_SELECTION_MASK:
@@ -282,15 +274,11 @@ static void image_metadata_defaults(jxl_image_metadata *meta) {
     memset(meta, 0, sizeof(*meta));
     meta->orientation = 1;
     bit_depth_default(&meta->bit_depth);
-    meta->modular_16bit_buffers = 1;
     meta->num_extra = 0;
     meta->alpha_index = -1;
     meta->xyb_encoded = 1;
     colour_encoding_default(&meta->colour);
     meta->tone_mapping.intensity_target = 255.0f;
-    meta->tone_mapping.min_nits = 0.0f;
-    meta->tone_mapping.relative_to_max_display = 0;
-    meta->tone_mapping.linear_below = 0.0f;
 }
 
 static int image_metadata_read(jxl_ctx *ctx, jxl_br *br,
@@ -314,13 +302,12 @@ static int image_metadata_read(jxl_ctx *ctx, jxl_br *br,
                     jxl_br_u32(br, 100, 0, 1000, 0, 1, 10, 1, 30);
                 meta->animation.tps_denominator =
                     jxl_br_u32(br, 1, 0, 1001, 0, 1, 8, 1, 10);
-                meta->animation.num_loops =
-                    jxl_br_u32(br, 0, 0, 0, 3, 0, 16, 0, 32);
+                (void)jxl_br_u32(br, 0, 0, 0, 3, 0, 16, 0, 32);   /* num_loops */
                 meta->animation.have_timecodes = jxl_br_bool(br);
             }
         }
         read_bit_depth(br, &meta->bit_depth);
-        meta->modular_16bit_buffers = jxl_br_bool(br);
+        (void)jxl_br_bool(br);   /* modular_16bit_buffers: int32 throughout */
         /* Count the channels into a local and only publish it once the array
            behind it exists. Assigning meta->num_extra straight from the
            bitstream left it non-zero with ec_info still NULL on both of the
@@ -348,9 +335,11 @@ static int image_metadata_read(jxl_ctx *ctx, jxl_br *br,
         if (extra_fields) {
             if (!jxl_br_bool(br)) {   /* ToneMapping all_default */
                 meta->tone_mapping.intensity_target = jxl_br_f16(br);
-                meta->tone_mapping.min_nits = jxl_br_f16(br);
-                meta->tone_mapping.relative_to_max_display = jxl_br_bool(br);
-                meta->tone_mapping.linear_below = jxl_br_f16(br);
+                /* min_nits, relative_to_max_display, linear_below: tone
+                   mapping hints for a display pipeline we do not have. */
+                (void)jxl_br_f16(br);
+                (void)jxl_br_bool(br);
+                (void)jxl_br_f16(br);
             }
         }
         read_extensions(br);
@@ -392,13 +381,7 @@ int jxl_read_image_header(jxl_ctx *ctx, jxl_br *br, jxl_size_header *size,
 }
 
 void jxl_image_metadata_free(jxl_ctx *ctx, jxl_image_metadata *meta) {
-    uint32_t i;
     if (!meta) return;
-    /* Belt as well as braces: the caller is jxl_doc_close, which also runs on
-       the failure path of jxl_doc_open, so it sees metadata abandoned at
-       whatever point parsing gave up. Never trust num_extra alone. */
-    if (!meta->ec_info) meta->num_extra = 0;
-    for (i = 0; i < meta->num_extra; i++) jxl_free(ctx, meta->ec_info[i].name);
     jxl_free(ctx, meta->ec_info);
     meta->ec_info = NULL;
     meta->num_extra = 0;

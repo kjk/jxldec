@@ -35,7 +35,6 @@ int jxl_patches_read(jxl_ctx *ctx, jxl_br *br, const jxl_image_metadata *meta,
 
     memset(out, 0, sizeof(*out));
     memset(&dec, 0, sizeof(dec));
-    out->nblend = nblend;
 
     if (jxl_dec_init(ctx, &dec, br, 10) != 0) return -1;
     jxl_dec_begin(&dec, br);
@@ -346,60 +345,86 @@ static uint8_t frame_mode_to_patch(jxl_blend_mode m) {
     }
 }
 
+/* Whether plane c is the alpha channel some BlendingInfo of this frame blends
+   with (and so must keep its pre-blend value until every reader is done). */
+static int blend_plane_is_alpha(const jxl_frame_header *fh,
+                                const jxl_image_metadata *meta,
+                                uint32_t ncolor, uint32_t c) {
+    uint32_t e;
+    if (c < ncolor) return 0;
+    if ((fh->blending.mode == JXL_BLEND_BLEND ||
+         fh->blending.mode == JXL_BLEND_MULADD) &&
+        ncolor + fh->blending.alpha_channel == c)
+        return 1;
+    for (e = 0; e < meta->num_extra && fh->ec_blending; e++) {
+        const jxl_blending_info *bi = &fh->ec_blending[e];
+        if ((bi->mode == JXL_BLEND_BLEND || bi->mode == JXL_BLEND_MULADD) &&
+            ncolor + bi->alpha_channel == c)
+            return 1;
+    }
+    return 0;
+}
+
 /* Composites a decoded frame onto the canvas it declares as its source.
    `frame` covers the rectangle (fh->x0, fh->y0, fh->width, fh->height) of the
    full image; the canvas is always full-size. */
-int jxl_blend_frame(jxl_ctx *ctx, jxl_fimage *canvas, const jxl_fimage *frame,
-                    const jxl_frame_header *fh,
-                    const jxl_image_metadata *meta) {
+void jxl_blend_frame(jxl_fimage *canvas, const jxl_fimage *frame,
+                     const jxl_frame_header *fh,
+                     const jxl_image_metadata *meta) {
     uint32_t c;
     uint32_t ncolor = canvas->ncolor;
+    int pass;
 
-    for (c = 0; c < canvas->nplane && c < frame->nplane; c++) {
-        const jxl_blending_info *fbi =
-            (c < ncolor) ? &fh->blending
-                         : (fh->ec_blending ? &fh->ec_blending[c - ncolor]
-                                            : &fh->blending);
-        jxl_patch_blend bi;
-        jxl_fplane *base = &canvas->plane[c];
-        const jxl_fplane *nf = &frame->plane[c];
-        const jxl_fplane *base_alpha = NULL, *new_alpha = NULL;
-        int is_alpha_channel = 0, premultiplied = 0;
-        int64_t bx0, by0, rx0 = 0, ry0 = 0, w, h;
+    /* The blend is in place, and every channel has to see the canvas alpha
+       as it was *before* this frame. So the planes some BlendingInfo names
+       as its alpha channel go last (pass 1); everything else, which only
+       reads them, goes first. */
+    for (pass = 0; pass < 2; pass++) {
+        for (c = 0; c < canvas->nplane && c < frame->nplane; c++) {
+            const jxl_blending_info *fbi =
+                (c < ncolor) ? &fh->blending
+                             : (fh->ec_blending ? &fh->ec_blending[c - ncolor]
+                                                : &fh->blending);
+            jxl_patch_blend bi;
+            jxl_fplane *base = &canvas->plane[c];
+            const jxl_fplane *nf = &frame->plane[c];
+            const jxl_fplane *base_alpha = NULL, *new_alpha = NULL;
+            int is_alpha_channel = 0, premultiplied = 0;
+            int64_t bx0, by0, rx0 = 0, ry0 = 0, w, h;
 
-        if (!base->data || !nf->data) continue;
-        bi.mode = frame_mode_to_patch(fbi->mode);
-        bi.alpha_channel = fbi->alpha_channel;
-        bi.clamp = fbi->clamp;
+            if (blend_plane_is_alpha(fh, meta, ncolor, c) != pass) continue;
+            if (!base->data || !nf->data) continue;
+            bi.mode = frame_mode_to_patch(fbi->mode);
+            bi.alpha_channel = fbi->alpha_channel;
+            bi.clamp = fbi->clamp;
 
-        if (bi.mode >= JXL_PATCH_BLEND_ABOVE) {
-            uint32_t ai = ncolor + bi.alpha_channel;
-            is_alpha_channel = (c == ai);
-            base_alpha = plane_or_null(canvas, ai);
-            new_alpha = plane_or_null(frame, ai);
-            if (bi.alpha_channel < meta->num_extra) {
-                premultiplied = meta->ec_info[bi.alpha_channel].alpha_associated;
+            if (bi.mode >= JXL_PATCH_BLEND_ABOVE) {
+                uint32_t ai = ncolor + bi.alpha_channel;
+                is_alpha_channel = (c == ai);
+                base_alpha = plane_or_null(canvas, ai);
+                new_alpha = plane_or_null(frame, ai);
+                if (bi.alpha_channel < meta->num_extra) {
+                    premultiplied = meta->ec_info[bi.alpha_channel].alpha_associated;
+                }
             }
+
+            bx0 = fh->x0;
+            by0 = fh->y0;
+            w = nf->w;
+            h = nf->h;
+            if (bx0 < 0) { rx0 -= bx0; w += bx0; bx0 = 0; }
+            if (by0 < 0) { ry0 -= by0; h += by0; by0 = 0; }
+            if (bx0 + w > base->w) w = (int64_t)base->w - bx0;
+            if (by0 + h > base->h) h = (int64_t)base->h - by0;
+            if (rx0 + w > nf->w) w = (int64_t)nf->w - rx0;
+            if (ry0 + h > nf->h) h = (int64_t)nf->h - ry0;
+            if (w <= 0 || h <= 0) continue;
+
+            blend_channel(base, nf, base_alpha, new_alpha, is_alpha_channel, &bi,
+                          premultiplied, (int32_t)bx0, (int32_t)by0, (uint32_t)rx0,
+                          (uint32_t)ry0, (uint32_t)w, (uint32_t)h);
         }
-
-        bx0 = fh->x0;
-        by0 = fh->y0;
-        w = nf->w;
-        h = nf->h;
-        if (bx0 < 0) { rx0 -= bx0; w += bx0; bx0 = 0; }
-        if (by0 < 0) { ry0 -= by0; h += by0; by0 = 0; }
-        if (bx0 + w > base->w) w = (int64_t)base->w - bx0;
-        if (by0 + h > base->h) h = (int64_t)base->h - by0;
-        if (rx0 + w > nf->w) w = (int64_t)nf->w - rx0;
-        if (ry0 + h > nf->h) h = (int64_t)nf->h - ry0;
-        if (w <= 0 || h <= 0) continue;
-
-        blend_channel(base, nf, base_alpha, new_alpha, is_alpha_channel, &bi,
-                      premultiplied, (int32_t)bx0, (int32_t)by0, (uint32_t)rx0,
-                      (uint32_t)ry0, (uint32_t)w, (uint32_t)h);
     }
-    (void)ctx;
-    return 0;
 }
 
 /* Allocates a full-image canvas shaped like `like`. */

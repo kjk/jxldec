@@ -2,7 +2,13 @@
 // our decoder and libjxl's djxl, and compare the PAM output.
 //
 //   bun cmd/tests.ts <-all | -rand N | file.jxl ...> [-clang] [-cpu N]
-//                    [-preset a,b] [-asan] [-tol N] [-rms X]
+//                    [-preset a,b] [-asan] [-tol N] [-rms X] [-all-frames]
+//
+// djxl writes only the first frame of an animation to PAM. -all-frames
+// swaps the oracle for jxl_ref (test/jxl_ref.c: libjxl itself, dumping every
+// coalesced frame) and checks each frame of each file, which is the only
+// thing that verifies blending, reference slots and cropped frames. It needs
+// libjxl's static libraries, so like the benchmark it is MSVC-only.
 //
 // Modular (integer) paths must be byte-identical. VarDCT paths are float, so
 // a small per-sample difference is expected; a file passes when it is under
@@ -17,14 +23,15 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "fs";
 import { cpus, tmpdir } from "os";
 import { basename, dirname, isAbsolute, join, relative } from "path";
-import { build, buildAsan, defaultUseClang } from "./build";
-import { corpusSummary, selectFiles } from "./corpus";
+import { build, buildAsan, buildRefDump, defaultUseClang } from "./build";
+import { corpusSummary, selectFiles, skipWithDjxl, tolFor } from "./corpus";
 import { getDeps, refTool } from "./get-deps";
 
 const ROOT = dirname(import.meta.dir);
 const argv = process.argv.slice(2);
 const useClang = argv.includes("-clang") || defaultUseClang;
 const useAsan = argv.includes("-asan");
+const allFrames = argv.includes("-all-frames");
 // Two thresholds, both required, in the shape libjxl's own conformance
 // checker uses (tools/conformance/conformance.py CompareNPY: an RMSE limit
 // and a peak limit, never peak alone).
@@ -65,6 +72,8 @@ options:
   -preset a,b     restrict the generated corpus to these presets
   -clang          build/test with clang instead of MSVC
   -asan           build and run the clang+AddressSanitizer harness
+  -all-frames     check every frame of every file against libjxl (jxl_ref)
+                  instead of the first frame against djxl; MSVC only
   -cpu N          worker count (default: cores - 1)
   -tol N          max allowed peak abs difference, 8-bit steps (default 3)
   -rms X          max allowed RMS difference, 8-bit steps (default 0.6);
@@ -80,6 +89,7 @@ ${corpusSummary()}`,
 
 const EXE = useAsan ? await buildAsan() : await build(useClang);
 const DJXL = refTool("djxl");
+const REF = allFrames ? await buildRefDump() : "";
 
 type Pam = { header: string; width: number; height: number; depth: number;
              maxval: number; data: Uint8Array };
@@ -112,6 +122,27 @@ type Cmp = {
   note?: string;
 };
 
+function compareScaled(a: Pam, b: Pam): Cmp {
+  const wa = a.maxval > 255 ? 2 : 1, wb = b.maxval > 255 ? 2 : 1;
+  const n = Math.min(Math.floor(a.data.length / wa), Math.floor(b.data.length / wb));
+  const ka = 255 / a.maxval, kb = 255 / b.maxval;
+  let maxDiff = 0, sum = 0, sumSq = 0;
+  for (let i = 0; i < n; i++) {
+    const va = wa === 2 ? (a.data[2 * i] << 8) | a.data[2 * i + 1] : a.data[i];
+    const vb = wb === 2 ? (b.data[2 * i] << 8) | b.data[2 * i + 1] : b.data[i];
+    const d = Math.abs(va * ka - vb * kb);
+    if (d > maxDiff) maxDiff = d;
+    sum += d;
+    sumSq += d * d;
+  }
+  return {
+    same: false, maxDiff,
+    meanDiff: n ? sum / n : 0,
+    rmsDiff: n ? Math.sqrt(sumSq / n) : 0,
+    scale: 1,
+  };
+}
+
 function compare(ours: Uint8Array, ref: Uint8Array): Cmp {
   if (ours.length === ref.length && Buffer.compare(Buffer.from(ours), Buffer.from(ref)) === 0) {
     return { same: true, maxDiff: 0, meanDiff: 0, rmsDiff: 0, scale: 1 };
@@ -128,6 +159,11 @@ function compare(ours: Uint8Array, ref: Uint8Array): Cmp {
       note: `geometry ${a.width}x${a.height}x${a.depth} vs ${b.width}x${b.height}x${b.depth}`,
     };
   }
+  // djxl writes the image's own depth (MAXVAL 4095 for a 12-bit file) while
+  // we always emit 8 or 16 bits, so the two sides can disagree on MAXVAL
+  // without disagreeing on a single pixel. Compare those on a common 8-bit
+  // scale; such a file can pass the tolerance but is never "byte-exact".
+  if (a.maxval !== b.maxval) return compareScaled(a, b);
   const n = Math.min(a.data.length, b.data.length);
   let maxDiff = 0, sum = 0, sumSq = 0, count = 0;
   if (a.maxval > 255) {
@@ -170,7 +206,29 @@ type Result = {
   mean8?: number;
   /** Only set when not a pass (FAIL / DIFF / skip). */
   status?: string;
+  /** Every compared frame was byte-identical to the reference. */
+  exact?: boolean;
 };
+
+/** Pass/fail for one compared frame, in 8-bit steps. */
+function judge(file: string, ms: number, cmp: Cmp): Result {
+  if (cmp.same) return { file, ok: true, ms, max8: 0, rms8: 0, mean8: 0, exact: true };
+  if (cmp.note) return { file, ok: false, ms, status: `DIFF ${cmp.note}` };
+  // Tolerances are expressed in 8-bit steps regardless of the output depth.
+  const max8 = cmp.maxDiff / cmp.scale;
+  const mean8 = cmp.meanDiff / cmp.scale;
+  const rms8 = cmp.rmsDiff / cmp.scale;
+  // A preset can carry its own limits (see PRESETS in corpus.ts); an
+  // explicit -tol / -rms still wins.
+  const own = tolFor(file);
+  const peak = tolIdx >= 0 ? PEAK_TOL : (own.peak ?? PEAK_TOL);
+  const rms = rmsIdx >= 0 ? RMS_TOL : (own.rms ?? RMS_TOL);
+  if (rms8 <= rms && max8 <= peak) {
+    return { file, ok: true, ms, max8, rms8, mean8 };
+  }
+  const why = rms8 > rms ? `rms>${rms}` : `peak>${peak}`;
+  return { file, ok: false, ms, max8, rms8, mean8, status: `DIFF ${why}` };
+}
 
 async function testOne(file: string, slot: number): Promise<Result> {
   const tmp = join(tmpdir(), "jxldec-tests", String(slot));
@@ -178,6 +236,10 @@ async function testOne(file: string, slot: number): Promise<Result> {
   const ourPam = join(tmp, "our.pam");
   const refPam = join(tmp, "ref.pam");
   for (const p of [ourPam, refPam]) if (existsSync(p)) rmSync(p);
+
+  if (skipWithDjxl(file)) {
+    return { file, ok: true, ms: 0, status: "skip (djxl output not comparable; use -all-frames)" };
+  }
 
   const t0 = performance.now();
   const ourProc = Bun.spawnSync({
@@ -202,23 +264,52 @@ async function testOne(file: string, slot: number): Promise<Result> {
   }
   if (!ourOk) return { file, ok: false, ms, status: `FAIL ${ourErr}` };
 
-  const cmp = compare(new Uint8Array(readFileSync(ourPam)),
-                      new Uint8Array(readFileSync(refPam)));
-  if (cmp.same) {
-    return { file, ok: true, ms, max8: 0, rms8: 0, mean8: 0 };
+  return judge(file, ms, compare(new Uint8Array(readFileSync(ourPam)),
+                                 new Uint8Array(readFileSync(refPam))));
+}
+
+/** -all-frames: every displayed frame against libjxl's coalesced output. The
+ *  reported numbers are the worst frame's. */
+async function testAllFrames(file: string, slot: number): Promise<Result> {
+  const tmp = join(tmpdir(), "jxldec-tests", String(slot));
+  mkdirSync(tmp, { recursive: true });
+  const ourPam = join(tmp, "our.pam");
+  const prefix = join(tmp, "ref");
+  const refProc = Bun.spawnSync({
+    cmd: [REF, file, prefix], stdout: "pipe", stderr: "pipe",
+  });
+  const nframes = parseInt(refProc.stdout.toString().trim());
+  if (refProc.exitCode !== 0 || !(nframes > 0)) {
+    return { file, ok: true, ms: 0, status: "skip (libjxl failed)" };
   }
-  if (cmp.note) {
-    return { file, ok: false, ms, status: `DIFF ${cmp.note}` };
+  let worst: Result | undefined;
+  let ms = 0, allExact = true;
+  for (let i = 0; i < nframes; i++) {
+    const refPam = `${prefix}.${i}.pam`;
+    if (existsSync(ourPam)) rmSync(ourPam);
+    const t0 = performance.now();
+    const ourProc = Bun.spawnSync({
+      cmd: [EXE, "-frame", String(i), "-out", ourPam, file],
+      stdout: "pipe", stderr: "pipe",
+    });
+    ms += performance.now() - t0;
+    let r: Result;
+    if (ourProc.exitCode !== 0 || !existsSync(ourPam)) {
+      const err = ourProc.stderr.toString().trim().split("\n")[0] ?? "";
+      r = { file, ok: false, ms, status: `FAIL ${err}` };
+    } else {
+      r = judge(file, ms, compare(new Uint8Array(readFileSync(ourPam)),
+                                  new Uint8Array(readFileSync(refPam))));
+    }
+    rmSync(refPam, { force: true });
+    if (!r.exact) allExact = false;
+    if (!r.ok && nframes > 1) r.status = `${r.status} (frame ${i} of ${nframes})`;
+    if (!worst || (!r.ok && worst.ok) ||
+        (r.ok === worst.ok && (r.max8 ?? 0) > (worst.max8 ?? 0))) {
+      worst = r;
+    }
   }
-  // Tolerances are expressed in 8-bit steps regardless of the output depth.
-  const max8 = cmp.maxDiff / cmp.scale;
-  const mean8 = cmp.meanDiff / cmp.scale;
-  const rms8 = cmp.rmsDiff / cmp.scale;
-  if (rms8 <= RMS_TOL && max8 <= PEAK_TOL) {
-    return { file, ok: true, ms, max8, rms8, mean8 };
-  }
-  const why = rms8 > RMS_TOL ? `rms>${RMS_TOL}` : `peak>${PEAK_TOL}`;
-  return { file, ok: false, ms, max8, rms8, mean8, status: `DIFF ${why}` };
+  return { ...worst!, ms, exact: allExact };
 }
 
 /** Path relative to ROOT with forward slashes (absolute if outside the tree). */
@@ -272,6 +363,7 @@ function printResult(r: Result, n: number, total: number) {
 let nextIndex = 0;
 let done = 0;
 let failures = 0;
+let nExact = 0, nSkipped = 0, worstPeak = 0, worstPeakDefault = 0;
 const failed: string[] = [];
 
 console.log(
@@ -286,11 +378,22 @@ async function worker(slot: number) {
   for (;;) {
     const i = nextIndex++;
     if (i >= files.length) return;
-    const r = await testOne(files[i], slot);
+    const r = allFrames ? await testAllFrames(files[i], slot)
+                        : await testOne(files[i], slot);
     done++;
     if (!r.ok) {
       failures++;
       failed.push(files[i]);
+    } else if (r.exact) {
+      nExact++;
+    } else if (r.max8 === undefined) {
+      nSkipped++;
+    } else {
+      worstPeak = Math.max(worstPeak, r.max8);
+      // Files held to the default limits, i.e. not a preset with its own.
+      if (tolFor(files[i]).peak === undefined) {
+        worstPeakDefault = Math.max(worstPeakDefault, r.max8);
+      }
     }
     printResult(r, done, files.length);
   }
@@ -303,6 +406,16 @@ const secs = (performance.now() - t0) / 1000;
 console.log(
   `\n${files.length - failures}/${files.length} ok, ${failures} failed (${secs.toFixed(1)}s)`,
 );
+{
+  const passed = files.length - failures;
+  const tol = passed - nExact - nSkipped;
+  console.log(
+    `${nExact} byte-exact, ${tol} within tolerance` +
+      (tol ? ` (worst peak ${worstPeak.toFixed(2)}; ` +
+             `${worstPeakDefault.toFixed(2)} outside the presets with their own limit)` : "") +
+      (nSkipped ? `, ${nSkipped} skipped` : ""),
+  );
+}
 if (failures) {
   console.log("failing files:");
   for (const f of failed.slice(0, 40)) console.log(`  ${f}`);

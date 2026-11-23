@@ -65,7 +65,6 @@ int jxl_fplane_alloc_uninit(jxl_ctx *ctx, jxl_fplane *p, uint32_t w, uint32_t h)
 }
 
 int jxl_fimage_alloc(jxl_ctx *ctx, jxl_fimage *img, uint32_t nplane) {
-    img->ctx = ctx;
     img->plane = (jxl_fplane *)jxl_calloc(ctx, nplane ? nplane : 1,
                                           sizeof(jxl_fplane));
     if (!img->plane) return -1;
@@ -115,6 +114,145 @@ static void fimage_keep_gray(jxl_ctx *ctx, jxl_fimage *img) {
     for (k = 3; k < img->nplane; k++) img->plane[k - 2] = img->plane[k];
     img->nplane -= 2;
     img->ncolor = 1;
+}
+
+int jxl_has_spot_colour(const jxl_image_metadata *meta) {
+    uint32_t i;
+    for (i = 0; i < meta->num_extra; i++) {
+        if (meta->ec_info[i].type == JXL_EC_SPOT) return 1;
+    }
+    return 0;
+}
+
+/* Spot colours: libjxl's stage_spot.cc. Each spot channel is a coverage map
+   for one ink (r, g, b, solidity), mixed into the colour channels of the
+   image that is displayed -- after blending, and not into what a frame saves
+   as a reference, which is where libjxl's pipeline puts the stage. */
+void jxl_apply_spot_colours(jxl_fimage *img, const jxl_image_metadata *meta) {
+    uint32_t i, x, y, c;
+    if (img->ncolor != 3) return;
+    for (i = 0; i < meta->num_extra; i++) {
+        const jxl_ec_info *ec = &meta->ec_info[i];
+        const jxl_fplane *sp;
+        if (ec->type != JXL_EC_SPOT || 3 + i >= img->nplane) continue;
+        sp = &img->plane[3 + i];
+        if (!sp->data) continue;
+        for (c = 0; c < 3; c++) {
+            jxl_fplane *p = &img->plane[c];
+            uint32_t w = JXL_MIN(p->w, sp->w), h = JXL_MIN(p->h, sp->h);
+            if (!p->data) continue;
+            for (y = 0; y < h; y++) {
+                const float *s = sp->data + (size_t)y * sp->stride;
+                float *d = p->data + (size_t)y * p->stride;
+                for (x = 0; x < w; x++) {
+                    float mix = ec->spot[3] * s[x];
+                    d[x] = mix * ec->spot[c] + (1.0f - mix) * d[x];
+                }
+            }
+        }
+    }
+}
+
+/* A Modular sample holding a float's bit pattern -> float. libjxl's
+   int_to_float (dec_modular.cc): any width from half to single precision,
+   widened to IEEE single, subnormals included. */
+static float modular_sample_to_float(int32_t v, uint32_t bits, uint32_t exp_bits) {
+    uint32_t f = (uint32_t)v, sign, mant_bits, mantissa, out;
+    int32_t exp;
+    float r;
+    if (bits == 32 && exp_bits == 8) {
+        memcpy(&r, &f, sizeof(r));
+        return r;
+    }
+    if (f == 0) return 0.0f;
+    sign = (f >> (bits - 1)) & 1u;
+    f &= (1u << (bits - 1)) - 1;
+    mant_bits = bits - exp_bits - 1;
+    exp = (int32_t)(f >> mant_bits);
+    mantissa = (f & ((1u << mant_bits) - 1)) << (23 - mant_bits);
+    if (exp == 0 && exp_bits < 8) {
+        /* Subnormal in the narrow format, normal once widened. */
+        if (mantissa == 0) return sign ? -0.0f : 0.0f;
+        while ((mantissa & 0x800000u) == 0) {
+            mantissa <<= 1;
+            exp--;
+        }
+        exp++;
+        mantissa &= 0x7fffffu;
+    }
+    exp -= (int32_t)((1u << (exp_bits - 1)) - 1);
+    exp += 127;
+    out = (sign << 31) | ((uint32_t)exp << 23) | mantissa;
+    memcpy(&r, &out, sizeof(r));
+    return r;
+}
+
+/* Gaborish and EPF on a Modular frame. libjxl runs the same two stages for
+   either encoding; a Modular frame has no per-block quantiser to derive the
+   EPF sigma from, so the header carries one constant for the whole frame
+   (epf_sigma_for_modular). A gray frame goes through as three identical
+   channels, which is what libjxl's pipeline feeds its filters and what makes
+   the three-channel SAD come out the same.
+
+   The filters want three planes sharing one stride, padded to whole blocks
+   like the VarDCT coefficient planes they were written for, so the colour
+   planes are moved into buffers of that shape. */
+static int modular_loop_filters(jxl_ctx *ctx, jxl_fimage *out,
+                                const jxl_frame_header *fh) {
+    float *buf[3] = {NULL, NULL, NULL};
+    float *sigma = NULL;
+    uint32_t w, h, bw, bh, ps, ph, x, y;
+    uint32_t nc = out->ncolor;
+    size_t count;
+    int c, rc = -1;
+
+    if (nc != 1 && nc != 3) return 0;
+    if (out->nplane < nc) return 0;
+    w = out->plane[0].w;
+    h = out->plane[0].h;
+    if (w == 0 || h == 0) return 0;
+    for (c = 0; c < (int)nc; c++) {
+        if (!out->plane[c].data || out->plane[c].w != w || out->plane[c].h != h)
+            return 0;
+    }
+    bw = (w + 7) / 8;
+    bh = (h + 7) / 8;
+    ps = bw * 8;
+    ph = bh * 8;
+    if (ps % 1024 < 32 || ps % 1024 > 1024 - 32) ps += 64;
+    if (!jxl_size_mul(ps, ph, &count)) return -1;
+    for (c = 0; c < 3; c++) {
+        const jxl_fplane *src = &out->plane[nc == 1 ? 0 : c];
+        buf[c] = (float *)jxl_calloc(ctx, count, sizeof(float));
+        if (!buf[c]) goto done;
+        for (y = 0; y < h; y++) {
+            memcpy(buf[c] + (size_t)y * ps, src->data + (size_t)y * src->stride,
+                   (size_t)w * sizeof(float));
+        }
+    }
+    if (fh->gab.enabled) {
+        if (jxl_apply_gabor(ctx, buf, w, h, ps, fh->gab.weights) != 0) goto done;
+    }
+    if (fh->epf.enabled) {
+        float s = fh->epf.sigma_for_modular;
+        float v = s >= 0.3f ? JXL_EPF_INV_SIGMA_NUM / s : 0.0f;
+        sigma = (float *)jxl_malloc(ctx, (size_t)bw * bh * sizeof(float));
+        if (!sigma) goto done;
+        for (x = 0; x < bw * bh; x++) sigma[x] = v;
+        if (jxl_apply_epf(ctx, buf, w, h, ps, sigma, bw, &fh->epf) != 0) goto done;
+    }
+    for (c = 0; c < (int)nc; c++) {
+        jxl_free(ctx, out->plane[c].data);
+        out->plane[c].data = buf[c];
+        out->plane[c].stride = ps;
+        buf[c] = NULL;
+    }
+    rc = 0;
+
+done:
+    for (c = 0; c < 3; c++) jxl_free(ctx, buf[c]);
+    jxl_free(ctx, sigma);
+    return rc;
 }
 
 /* ===================================================================== */
@@ -264,8 +402,8 @@ static int split_channel_into_groups(jxl_ctx *ctx, const jxl_mchan *ch,
 /* Decodes one group's modular sub-stream: it carries its own modular header
    (transforms + optionally a local MA tree) over the group's channels. */
 static int decode_group_modular(jxl_ctx *ctx, jxl_br *br, jxl_chanlist *cl,
-                                jxl_ma_config *global_ma, uint32_t group_dim,
-                                uint32_t bit_depth, uint32_t stream_idx) {
+                                jxl_ma_config *global_ma, uint32_t bit_depth,
+                                uint32_t stream_idx) {
     jxl_modular gm;
     jxl_chanlist tcl;
     int rc = -1;
@@ -273,7 +411,7 @@ static int decode_group_modular(jxl_ctx *ctx, jxl_br *br, jxl_chanlist *cl,
     if (cl->n == 0) return 0;
     memset(&tcl, 0, sizeof(tcl));
     if (jxl_modular_init_over(ctx, &gm, br, cl->chans, cl->n, global_ma,
-                              group_dim, bit_depth) != 0)
+                              bit_depth) != 0)
         goto done;
     if (jxl_modular_transform_channels(ctx, &gm, &tcl) != 0) goto done;
     if (jxl_modular_decode(ctx, &gm, &tcl, br, stream_idx) != 0) goto done;
@@ -419,7 +557,7 @@ static int decode_lf_coeff(jxl_ctx *ctx, jxl_br *br, jxl_vardct_state *v,
         specs[plane_of[i]].hshift = 0;
         specs[plane_of[i]].vshift = 0;
     }
-    if (jxl_modular_init(ctx, &mod, br, specs, 3, global_ma, 0, bit_depth) != 0)
+    if (jxl_modular_init(ctx, &mod, br, specs, 3, global_ma, bit_depth) != 0)
         goto done;
     if (jxl_modular_transform_channels(ctx, &mod, &cl) != 0) goto done;
     if (jxl_modular_decode(ctx, &mod, &cl, br, 1 + lf_group_idx) != 0) goto done;
@@ -489,7 +627,7 @@ static void vardct_finish_blocks(jxl_vardct_state *v,
     qm_scale[1] = 1.0f;
     qm_scale[2] = powf(0.8f, (float)fh->b_qm_scale - 2.0f);
 
-    if (jxl_has_avx2_fma() &&
+    if (JXL_HAVE_BATCH_DCT8 && jxl_has_avx2_fma() &&
         !v->hs[0] && !v->vs[0] && !v->hs[1] && !v->vs[1] &&
         !v->hs[2] && !v->vs[2]) {
         size_t i, nblocks = (size_t)v->bw * v->bh;
@@ -687,18 +825,13 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                     (unsigned)fh->upsampling);
             return -1;
         }
-        /* Spot colour has to be mixed into the colour channels after the
-           colour transform -- libjxl's stage_spot.cc, which is simply
-              mix = spot[3] * s[x];  p[c][x] = mix * spot[c] + (1-mix) * p[c][x]
-           for c in 0..2. Ten lines, deliberately not written: nothing in
-           libjxl's testdata carries a spot channel and cjxl cannot produce
-           one, so it would be untested code that merely looks handled.
-           Carrying the channel through instead would leave the colour
-           silently unmixed, so refuse until there is something to verify
-           against. */
-        if (meta->ec_info[i].type == JXL_EC_SPOT) {
-            JXL_ERR(ctx, "frame: extra channel %u is a spot colour; "
-                         "not supported", (unsigned)i);
+        /* Spot colour is mixed into the colour channels of the displayed
+           image (jxl_apply_spot_colours), which needs three of them. A gray image with a spot channel is refused rather than left
+           silently unmixed: there is no file to check that case against. */
+        if (meta->ec_info[i].type == JXL_EC_SPOT &&
+            meta->colour.colour_space == JXLDEC_CS_GRAY) {
+            JXL_ERR(ctx, "frame: extra channel %u is a spot colour on a "
+                         "grayscale image; not supported", (unsigned)i);
             return -1;
         }
     }
@@ -796,8 +929,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     }
 
     if (jxl_modular_init(ctx, &gmod, br, specs, nspecs,
-                         has_global_ma ? &global_ma : NULL, group_dim,
-                         bits) != 0)
+                         has_global_ma ? &global_ma : NULL, bits) != 0)
         goto done;
     if (nspecs) {
         if (jxl_modular_transform_channels(ctx, &gmod, &gcl) != 0) goto done;
@@ -892,8 +1024,8 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                     goto done;
             }
             if (decode_group_modular(ctx, br, &gl.lf[i],
-                                     has_global_ma ? &global_ma : NULL, group_dim,
-                                     bits, 1 + num_lf_groups + i) != 0)
+                                     has_global_ma ? &global_ma : NULL, bits,
+                                     1 + num_lf_groups + i) != 0)
                 goto done;
             if (is_vardct) {
                 jxl_hf_meta hm;
@@ -984,7 +1116,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                 }
                 if (decode_group_modular(ctx, br, cl,
                                          has_global_ma ? &global_ma : NULL,
-                                         group_dim, bits,
+                                         bits,
                                          1 + 3 * num_lf_groups + 17 +
                                              p * num_groups + g) != 0)
                     goto done;
@@ -1086,14 +1218,10 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         uint32_t nplane = (is_vardct ? 3 : gmod.nbase) +
                           (is_vardct ? meta->num_extra : 0);
         uint32_t base = 0;
-        float scale = 1.0f;
         if (jxl_fimage_alloc(ctx, out, nplane) != 0) goto done;
         out->ncolor = is_vardct ? 3 : ncolor;
         out->w = color_w;
         out->h = color_h;
-        if (!meta->bit_depth.float_sample) {
-            scale = 1.0f / (float)((1u << bits) - 1);
-        }
         if (is_vardct) {
             /* The coefficient planes are padded out to whole blocks, so they
                are wider than the image -- but a plane carries its own stride,
@@ -1141,14 +1269,36 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         /* Whether anything after this point reads or rewrites the planes. */
         lazy_int = st->lazy_int_ok && !is_vardct && !meta->xyb_encoded &&
                    !have_patches && !have_splines && !have_noise &&
+                   !fh->gab.enabled && !fh->epf.enabled &&
                    color_upsampling_shift == 0 &&
                    !(apply_ct && fh->do_ycbcr && out->ncolor >= 3);
         for (i = 0; i < gmod.nbase; i++) {
             const jxl_mchan *ch = &gmod.base[i];
             uint32_t x, y;
             uint32_t pi = base + i;
+            /* Each channel is scaled by its own bit depth: an extra channel
+               (16-bit alpha over 12-bit colour, say) declares its own, and
+               libjxl uses it. Float samples are bit patterns, not counts. */
+            const jxl_bit_depth *bd = &meta->bit_depth;
+            float scale = 1.0f;
             if (pi >= nplane) break;
             if (!is_vardct && meta->xyb_encoded && i < 3) continue;
+            if (is_vardct || i >= ncolor) {
+                uint32_t e = is_vardct ? i : i - ncolor;
+                if (e < meta->num_extra) bd = &meta->ec_info[e].bit_depth;
+            }
+            if (bd->float_sample) {
+                uint32_t fb = bd->bits_per_sample, fe = bd->exp_bits;
+                if (jxl_fplane_alloc_uninit(ctx, &out->plane[pi], ch->w, ch->h) != 0) goto done;
+                for (y = 0; y < ch->h; y++) {
+                    const int32_t *src = ch->data + (size_t)y * ch->stride;
+                    float *dst = out->plane[pi].data + (size_t)y * out->plane[pi].stride;
+                    for (x = 0; x < ch->w; x++)
+                        dst[x] = modular_sample_to_float(src[x], fb, fe);
+                }
+                continue;
+            }
+            scale = 1.0f / (float)((1u << bd->bits_per_sample) - 1);
             if (lazy_int) {
                 /* Nothing below reads these samples, so skip the float copy:
                    take the channel's buffer and let the output writer
@@ -1177,6 +1327,10 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                 for (x = 0; x < ch->w; x++) dst[x] = (float)src[x] * scale;
             }
         }
+    }
+
+    if (!is_vardct && (fh->gab.enabled || fh->epf.enabled)) {
+        if (modular_loop_filters(ctx, out, fh) != 0) goto done;
     }
 
     /* Patches blend pre-color-transform samples from a reference frame. */
@@ -1254,9 +1408,9 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         }
     } else if (apply_ct && meta->xyb_encoded && out->ncolor >= 3) {
         uint32_t row, rows = out->plane[0].h, rw = out->plane[0].w;
-        float opsin[9];
+        float opsin[9], luminances[3];
         jxl_colour_encoding out_enc = meta->colour;
-        jxl_opsin_matrix_for(meta, opsin);
+        jxl_opsin_matrix_for(meta, opsin, luminances);
         /* An image declaring a linear transfer function decodes to linear
            light. A caller handing the result straight to a display asks for
            sRGB instead (jxl_ctx_set_srgb_output), otherwise it comes out dark
@@ -1272,6 +1426,13 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                               out->plane[2].data + (size_t)row * out->plane[2].stride,
                               rw, opsin, meta->opsin_bias,
                               meta->tone_mapping.intensity_target);
+            if (!out_enc.tf_have_gamma && out_enc.tf == JXL_TF_HLG) {
+                jxl_hlg_inverse_ootf(
+                    out->plane[0].data + (size_t)row * out->plane[0].stride,
+                    out->plane[1].data + (size_t)row * out->plane[1].stride,
+                    out->plane[2].data + (size_t)row * out->plane[2].stride,
+                    rw, luminances, meta->tone_mapping.intensity_target);
+            }
             for (i = 0; i < 3; i++) {
                 jxl_linear_to_tf(out->plane[i].data +
                                      (size_t)row * out->plane[i].stride,

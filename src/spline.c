@@ -354,6 +354,58 @@ static int upsample_points(jxl_ctx *ctx, const jxl_quant_spline *qs,
     return 0;
 }
 
+/* libjxl's bound on what a frame's splines may cost to draw
+   (QuantizedSpline::Dequantize): roughly length x width^2 x log(colour),
+   summed over the splines, against a limit that grows with the frame. The
+   bitstream puts no ceiling on sigma, so without this a few hundred bytes can
+   ask for every arc sample to splat the whole frame. Returns -1 once the
+   running total passes the limit. */
+static int spline_area_check(const jxl_quant_spline *qs, float inv_qa,
+                             float corr_x, float corr_b, uint64_t image_size,
+                             uint64_t *total) {
+    const uint64_t one = 1;
+    uint64_t area_limit = 1024 * image_size + (one << 32);
+    uint64_t manhattan = 0, colour[3] = {0, 0, 0}, max_colour, logcolour;
+    uint64_t width_estimate = 0;
+    float weight_limit;
+    uint32_t k;
+    int c, j;
+
+    if (area_limit > (one << 42)) area_limit = one << 42;
+    for (k = 1; k < qs->npoints; k++) {
+        int64_t dx = qs->px[k] - qs->px[k - 1];
+        int64_t dy = qs->py[k] - qs->py[k - 1];
+        manhattan += (uint64_t)(dx < 0 ? -dx : dx) + (uint64_t)(dy < 0 ? -dy : dy);
+        if (manhattan > area_limit) return -1;
+    }
+    for (c = 0; c < 3; c++) {
+        for (j = 0; j < 32; j++) {
+            colour[c] += (uint64_t)ceilf(inv_qa * fabsf((float)qs->xyb_dct[c][j]));
+        }
+    }
+    colour[0] += (uint64_t)ceilf(fabsf(corr_x)) * colour[1];
+    colour[2] += (uint64_t)ceilf(fabsf(corr_b)) * colour[1];
+    max_colour = colour[0];
+    if (colour[1] > max_colour) max_colour = colour[1];
+    if (colour[2] > max_colour) max_colour = colour[2];
+    logcolour = 0;
+    while (logcolour < 63 && (one << logcolour) < one + max_colour) logcolour++;
+    if (logcolour < 1) logcolour = 1;
+
+    weight_limit = ceilf(sqrtf(((float)area_limit / (float)logcolour) /
+                               (float)(manhattan ? manhattan : 1)));
+    for (j = 0; j < 32; j++) {
+        float w = ceilf(inv_qa * fabsf((float)qs->sigma_dct[j]));
+        uint64_t weight;
+        if (w < 1.0f) w = 1.0f;
+        if (w > weight_limit) w = weight_limit;
+        weight = (uint64_t)w;
+        width_estimate += weight * weight * logcolour;
+    }
+    *total += width_estimate * manhattan;
+    return *total > area_limit ? -1 : 0;
+}
+
 /* (int32_t)v clamped to [0, hi], without converting an out-of-range or NaN
    float (undefined behaviour). hi is at most 2^30. */
 static int32_t spline_clamp_to(float v, uint32_t hi) {
@@ -369,6 +421,7 @@ int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,
     jxl_pt *up = NULL;
     jxl_pt *arc_pt = NULL;
     float *arc_len = NULL;
+    uint64_t total_area = 0;
 #ifdef JXL_SPLINE_SSE2
     const int use_avx2 = jxl_has_avx2();
 #endif
@@ -388,6 +441,7 @@ int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,
     for (si = 0; si < sp->n; si++) {
         const jxl_quant_spline *qs = &sp->splines[si];
         float xyb_dct[3][32], sigma_dct[32];
+        if (jxl_aborted(ctx)) goto done;
         float qa = (float)sp->quant_adjust;
         float inv_qa = qa >= 0.0f ? 1.0f / (1.0f + qa / 8.0f) : 1.0f - qa / 8.0f;
         static const float chan_w[4] = {0.0042f, 0.075f, 0.07f, 0.3333f};
@@ -396,6 +450,12 @@ int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,
         jxl_pt current;
         int c, j;
 
+        if (spline_area_check(qs, inv_qa, corr_x, corr_b,
+                              (uint64_t)fh->width * fh->height,
+                              &total_area) != 0) {
+            JXL_ERR(ctx, "splines: estimated draw area too large");
+            goto done;
+        }
         for (c = 0; c < 3; c++) {
             for (j = 0; j < 32; j++) {
                 xyb_dct[c][j] = (float)qs->xyb_dct[c][j] * chan_w[c] * inv_qa;

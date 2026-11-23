@@ -4,16 +4,24 @@ Milestone log for the C JPEG XL decoder. Newest first.
 
 ## Status summary
 
-`bun cmd/tests.ts -all` — 1245 corpus files (libjxl's testdata images × 17 cjxl
-presets, its JPEGs transcoded, plus the `.jxl` files that ship with libjxl):
+`bun cmd/tests.ts -all` — 1547 corpus files (libjxl's testdata images × 21 cjxl
+presets, its JPEGs transcoded, the `.jxl` files that ship with libjxl, and the
+24 JPEG XL conformance testcases):
 
 ```
-1245/1245 ok, 0 failed
+1547/1547 ok, 0 failed
+538 byte-exact, 1006 within tolerance (worst peak 23.00; 2.00 outside the presets with their own limit), 3 skipped
 ```
 
 "ok" means byte-identical to `djxl file.jxl out.pam`, or inside the float
-tolerance for the VarDCT paths. 387 files are byte-exact; across the other 858
-no sample differs from libjxl by more than one 8-bit step.
+tolerance for the lossy paths. Outside the two HDR presets, which carry their
+own limits (see `cmd/corpus.ts` for why), no sample differs from libjxl by
+more than two 8-bit steps, and by more than one only in two conformance
+files. The three skips are files `djxl` cannot write comparably (CMYK and
+spot colour get extra PAM planes, float samples are refused).
+
+`bun cmd/tests.ts -all -all-frames` checks every frame of every file against
+libjxl directly (`test/jxl_ref.c`), skips nothing, and is also 1547/1547.
 
 | area | state |
 |---|---|
@@ -25,14 +33,20 @@ no sample differs from libjxl by more than one 8-bit step.
 | VarDCT, progressive (LF frames) | within 1 |
 | gaborish, EPF | done |
 | non-sRGB primaries (P3, Rec.2100) | within 1 (Bradford-adapted matrix) |
-| transfer functions: sRGB, 709 | within 1 |
-| transfer functions: PQ, HLG | **unverified** — cjxl here cannot emit a lossy frame declaring them |
+| transfer functions: sRGB, 709, HLG (with inverse OOTF) | within 1 |
+| transfer function: PQ | verified loosely — float noise at black is tens of steps under PQ |
 | images with an embedded ICC profile | done |
 | patches / reference frames | **byte-exact** |
 | splines, noise | within 1 |
 | 2x/4x/8x upsampling (`--resampling`) | within 1 |
 | EXIF orientation, all 8 values | within 1 |
-| animation (frames after the first) | done |
+| animation (frames after the first) | done, every frame checked against libjxl |
+| layers, all blend modes, cropped frames | done (conformance: blendmodes, sunset_logo, cmyk_layers) |
+| spot colour | done for RGB (conformance: spot); gray + spot is rejected |
+| extra channels with their own bit depth | done |
+| lossless float samples | done (conformance: lossless_pfm) |
+| Gaborish / EPF on Modular frames | within 1 |
+| preview frame | skipped at open; **untested**, no file has one |
 | YCbCr / JPEG transcode frames | done, all subsampling modes |
 | cooperative abort (`jxl_request_abort`) | done: checked per frame and per LF / pass group |
 
@@ -1750,6 +1764,68 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Conformance files, an all-frames oracle, and everything they exposed
+The previous entry ended with a list of suspected bugs that had no test file.
+Two things changed that. The JPEG XL conformance testcases
+(`deps/conformance`, now cloned by `get-deps` and part of the corpus) are
+hand-made files for what `cjxl` will not emit. And `test/jxl_ref.c` links
+libjxl and dumps every *coalesced* frame, so `tests.ts -all-frames` can check
+frames after the first -- `djxl` only ever wrote frame 0 to PAM, which is why
+nothing had noticed that animation was wrong.
+
+What was wrong, each now matching libjxl:
+- **Animation frames after the first** (`animation_icos4d`, peak 255). A
+  cropped frame whose blend source slot was never written must blend onto
+  transparent black; we fell back to the previous canvas. And a displayed
+  frame with `save_as_reference == 0` must not be saved at all.
+- **Layers** (`blendmodes`, `sunset_logo`, `cmyk_layers`). Zero-duration
+  frames were stored raw instead of blended. `walk_frames` now follows
+  libjxl's pipeline order; the rules are in AGENTS.md under "Frames".
+- **Gaborish/EPF on a Modular frame** (`grayscale_public_university`, peak
+  68): the filters only ran for VarDCT.
+- **16-bit alpha over 12-bit colour** (`alpha_premultiplied`): extra channels
+  were scaled with the colour bit depth.
+- **Float samples** (`lossless_pfm`) were read as integers.
+- **Spot colour** (`spot`) was refused; it is ten lines, placed after
+  blending.
+- **HLG** had no inverse OOTF, and **PQ** ignored `intensity_target`. It
+  turned out `cjxl -x color_space=RGB_D65_202_Rel_PeQ` (or `..._HLG`) does
+  emit them on a lossy frame, so both are corpus presets now.
+
+Fixed from reading alone, no file available: palette channel width with
+`nb_deltas > 0`, the preview frame (stepped over at open), three varblock
+checks (quant field clamp, sharpness range, multi-block transform with
+chroma subsampling), leftover non-zeros at the end of a block.
+
+Denial of service: `jxl_read_permutation` was quadratic (a memmove per
+Lehmer entry, with the entry count straight from the file); it is libjxl's
+Fenwick-tree decode now. Splines get libjxl's estimated-draw-area bound.
+
+Housekeeping that changes behaviour:
+- A still image reports one frame without walking the file, so
+  `jxl_doc_info` / `jxl_decode_size` are header-only as documented.
+  `jxl_doc_frame_info` no longer decodes pixels.
+- `-DJXL_DCT_FORCE_SCALAR` / `-DJXL_VARDCT_FORCE_SCALAR` on an AVX2+FMA
+  machine used to run empty stubs for the batched DCT8 path. The
+  "bit-identical to scalar" comments were wrong for the AVX2+FMA kernels and
+  now say so.
+- The `JXL_DEBUG_TREE` / `JXL_DEBUG_TRACK` dumps need `-DJXL_DEBUG_MODULAR`;
+  a normal build no longer calls `getenv`.
+- The `sec_half` table for DCT64..256 is a constant, not filled on first use
+  (a data race across contexts).
+- Write-only struct fields and the header values nothing reads are gone; the
+  bits are still consumed.
+
+Test side: presets `m_rct7`, `m_p13`, `v_pq`, `v_hlg`; `tests.ts` compares
+files whose `djxl` output has a different MAXVAL (12-bit files) and prints
+how many files were byte-exact; the fuzz target derives its flags from the
+last byte and the length (the first byte is always 0xFF or 0x00, so only two
+combinations ever ran), turns on `srgb_output`, and exercises
+`jxl_frame_render_into` and `jxl_decode_size`.
+
+The 1245 files of the old corpus decode to exactly the same per-file numbers
+as before all of this. Performance was not re-measured.
+
 ### Whole-project audit: two decode bugs, parser hardening, libjxl divergences
 A read of every source file against libjxl and jxl-oxide. None of what follows
 was visible to `cmd/tests.ts`: the corpus still decodes 1245/1245 with the
@@ -1800,7 +1876,7 @@ frame compositing for zero-duration layers and the reference-slot rule
 (`walk_frames`), the preview frame is not skipped, extra channels are scaled
 with the colour bit depth, float samples are read as integers, Modular frames
 never get Gaborish/EPF, palette `nb_deltas` channel width, and the quadratic
-Lehmer decode in `jxl_read_permutation`.
+Lehmer decode in `jxl_read_permutation`. (All closed by the next entry up.)
 
 ### Optional sRGB output for linear-light images
 SumatraPDF issue #5919: a 6000x4000 photo came out dark and over-contrasty

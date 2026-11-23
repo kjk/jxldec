@@ -62,7 +62,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     jxl_image_info info;
     const uint8_t *icc;
     size_t icc_len;
-    int nframes, i;
+    int nframes, i, sw, sh;
+    unsigned flags;
 
     /* Nothing shorter can carry a signature; skip rather than spend the
      * mutation budget on inputs jxl_signature_check would reject anyway. */
@@ -72,13 +73,21 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     ctx = jxl_ctx_new(fuzz_alloc, fuzz_free, NULL, NULL);
     if (!ctx) return 0;
 
-    /* Both orderings of the two context flags get exercised across inputs by
-     * keying them off the data itself -- cheap, and deterministic per input so
-     * a crash artifact always replays identically. */
-    jxl_ctx_set_bgr(ctx, data[0] & 1);
-    jxl_ctx_set_keep_orientation(ctx, (data[0] >> 1) & 1);
+    /* The context flags are keyed off the input, so every combination gets
+     * exercised across the corpus and a crash artifact still replays
+     * identically. Off the *last* byte and the length, not the first byte:
+     * anything that gets past jxl_doc_open starts with 0xFF (bare codestream)
+     * or 0x00 (container), so data[0] only ever produced two of the
+     * combinations. srgb_output is here because the one real consumer,
+     * SumatraPDF, always turns it on. */
+    flags = (unsigned)data[size - 1] ^ (unsigned)size;
+    jxl_ctx_set_bgr(ctx, flags & 1);
+    jxl_ctx_set_keep_orientation(ctx, (flags >> 1) & 1);
+    jxl_ctx_set_srgb_output(ctx, (flags >> 2) & 1);
 
     (void)jxl_signature_check(data, size);
+    /* Opens and closes a doc of its own; costs a header parse. */
+    (void)jxl_decode_size(ctx, data, size, &sw, &sh);
 
     doc = jxl_doc_open(ctx, data, size);
     if (!doc) {
@@ -111,6 +120,29 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         (void)jxl_doc_frame_info(doc, i, &finfo);
         img = jxl_frame_render(doc, i, fmt);
         if (img) jxl_image_destroy(ctx, img);
+    }
+
+    /* The caller-buffer path, which is how SumatraPDF renders: the geometry
+     * comes from jxl_frame_render_info and the pixels go straight into a
+     * buffer of exactly that size, so a row written one sample too long is a
+     * heap overflow the sanitizer sees. The stride gets a few bytes of
+     * padding on some inputs to cover stride != width * bpp. */
+    {
+        jxl_render_info ri;
+        jxl_format fmt = (flags & 8) ? JXLDEC_FORMAT_RGB24 : JXLDEC_FORMAT_RGBA32;
+        if (jxl_frame_render_info(doc, 0, fmt, &ri) == 0 && ri.width > 0 &&
+            ri.height > 0) {
+            size_t bpp = (size_t)jxl_format_bpp(ri.format);
+            size_t stride = (size_t)ri.width * bpp + ((flags >> 4) & 3);
+            if (stride <= 0x7fffffffu &&
+                stride <= (FUZZ_MEM_BUDGET - fuzz_live) / (size_t)ri.height) {
+                uint8_t *buf = (uint8_t *)malloc(stride * (size_t)ri.height);
+                if (buf) {
+                    (void)jxl_frame_render_into(doc, 0, fmt, buf, (int)stride);
+                    free(buf);
+                }
+            }
+        }
     }
 
     jxl_doc_close(doc);

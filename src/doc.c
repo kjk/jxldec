@@ -1,8 +1,6 @@
 /* doc.c -- top-level document: open, metadata queries, render entry points. */
 #include "jxl_internal.h"
 
-#include <stdlib.h>
-
 jxl_doc *jxl_doc_open(jxl_ctx *ctx, const uint8_t *data, size_t len) {
     jxl_doc *doc;
     jxl_br br;
@@ -11,8 +9,6 @@ jxl_doc *jxl_doc_open(jxl_ctx *ctx, const uint8_t *data, size_t len) {
     doc = (jxl_doc *)jxl_calloc(ctx, 1, sizeof(*doc));
     if (!doc) return NULL;
     doc->ctx = ctx;
-    doc->data = data;
-    doc->len = len;
 
     if (jxl_container_parse(ctx, data, len, &doc->container) != 0) goto fail;
 
@@ -36,8 +32,33 @@ jxl_doc *jxl_doc_open(jxl_ctx *ctx, const uint8_t *data, size_t len) {
         JXL_ERR(ctx, "codestream: truncated headers");
         goto fail;
     }
-    doc->first_frame_bitpos = jxl_br_bits_read(&br);
-    doc->first_frame_off = doc->first_frame_bitpos / 8;
+    doc->first_frame_off = jxl_br_bits_read(&br) / 8;
+
+    /* A preview is a complete frame of its own, coded at the preview's size,
+       sitting between the headers and the first real frame. It is not part
+       of the image, so step over it: parse its header and TOC and continue
+       from the end of its last section. */
+    if (doc->meta.have_preview) {
+        jxl_frame_header fh;
+        jxl_toc toc;
+        uint64_t end;
+        memset(&toc, 0, sizeof(toc));
+        if (jxl_read_frame_header(ctx, &br, &doc->meta.preview, &doc->meta,
+                                  &fh) != 0 ||
+            jxl_read_toc(ctx, &br, &fh, &toc) != 0) {
+            jxl_toc_free(ctx, &toc);
+            jxl_frame_header_free(ctx, &fh);
+            goto fail;
+        }
+        end = (uint64_t)toc.end_off + toc.total_size;
+        jxl_toc_free(ctx, &toc);
+        jxl_frame_header_free(ctx, &fh);
+        if (end >= doc->container.cs_len) {
+            JXL_ERR(ctx, "codestream: nothing after the preview frame");
+            goto fail;
+        }
+        doc->first_frame_off = (size_t)end;
+    }
     return doc;
 
 fail:

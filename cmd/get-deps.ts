@@ -10,6 +10,8 @@
 //                      deps/libjxl works too).
 //   deps/jxl-oxide  -- Rust JPEG XL decoder; the implementation this port
 //                      follows most closely. Read-only reference.
+//   deps/conformance -- the JPEG XL conformance testcases: hand-made files
+//                      for the features cjxl cannot emit (see corpus.ts).
 // Exported as getDeps() so build.ts / tests.ts can self-provision.
 // deps/ is gitignored.
 import { $ } from "bun";
@@ -21,6 +23,7 @@ export const DEPS_DIR = join(ROOT, "deps");
 export const LIBJXL_DIR = process.env.JXLDEC_LIBJXL || join(DEPS_DIR, "libjxl");
 export const LIBJXL_BUILD = join(DEPS_DIR, "libjxl-build");
 export const JXL_OXIDE_DIR = join(DEPS_DIR, "jxl-oxide");
+export const CONFORMANCE_DIR = join(DEPS_DIR, "conformance");
 /* A second libjxl build with debug info, so a profile can attribute libjxl's
    own time to its own functions. Only cmd/prof.ts -vs needs it, and it is
    built on demand -- the Release build above carries no symbols. */
@@ -44,6 +47,10 @@ export async function getDeps(): Promise<void> {
   if (!existsSync(JXL_OXIDE_DIR)) {
     console.log("deps: cloning jxl-oxide");
     await $`git clone --depth 1 https://github.com/tirr-c/jxl-oxide ${JXL_OXIDE_DIR}`;
+  }
+  if (!existsSync(CONFORMANCE_DIR)) {
+    console.log("deps: cloning the JPEG XL conformance testcases");
+    await $`git clone --depth 1 https://github.com/libjxl/conformance ${CONFORMANCE_DIR}`;
   }
   await buildRef();
 }

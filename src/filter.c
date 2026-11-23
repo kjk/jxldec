@@ -8,10 +8,18 @@
  *
  * Gaborish clamps at the borders, EPF mirrors (without repeating the edge
  * sample) -- matching libjxl in both cases. Both resolve that edge handling
- * per row and then run a mirror-free interior, which is where the SSE2 paths
- * live; those are written to associate their adds exactly as the scalar code
- * does, so the two produce bit-identical output (-DJXL_EPF_FORCE_SCALAR
- * builds the scalar side alone to check it).
+ * per row and then run a mirror-free interior, which is where the SIMD paths
+ * live.
+ *
+ * The SSE2 paths associate their adds exactly as the scalar code does and
+ * divide exactly, so SSE2 and scalar output is bit-identical
+ * (-DJXL_EPF_FORCE_SCALAR builds the scalar side alone to check it). The
+ * AVX2 EPF kernels do not carry that guarantee: like libjxl they take the
+ * weight normalisation from the approximate reciprocal (_mm256_rcp_ps), and
+ * pass 1 uses FMA. So on an AVX2 machine EPF output can differ from the
+ * SSE2/scalar result in the last bits -- between the AVX2 interior and the
+ * exact-divide edge columns of one image, and between CPU vendors, whose
+ * rcpps differ. -DJXL_NO_AVX2 gives the reproducible build.
  */
 #include "jxl_internal.h"
 
@@ -21,9 +29,10 @@
 /* SSE2 is baseline on x64. epf_pass is about half the decode of a VarDCT
    file, and step 0 alone is 12 taps x 5 SAD offsets x 3 channels per
    sample, so it is where hand-vectorising pays most. */
-/* -DJXL_EPF_FORCE_SCALAR builds the scalar path only. The vector path is
+/* -DJXL_EPF_FORCE_SCALAR builds the scalar path only. The SSE2 path is
    meant to be bit-identical to it, and that is worth being able to prove
-   rather than assert: build both and diff the output. */
+   rather than assert: build both (with -DJXL_NO_AVX2, see above) and diff
+   the output. */
 #if !defined(JXL_EPF_FORCE_SCALAR) &&     (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) ||      (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
 #define JXL_EPF_SSE2 1
 #include <emmintrin.h>
@@ -869,13 +878,15 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                                        y > (uint32_t)pad, copy_row);
                 continue;
             }
-            /* Four samples at a time down the row. Vectorising across x (not
-               across taps) means every lane runs the same operations in the
-               same order as the scalar path below, so the output is
-               bit-identical -- no tolerance risk, and the scalar path stays
-               the reference. Requires the whole quad to be in the mirror-free
-               interior and inside one sigma block: blocks are 8 wide and the
-               quad is 4-aligned, so x/8 is constant across it. */
+            /* Eight samples at a time with AVX2 (epf_row8, approximate
+               reciprocal -- see the note at the top of the file), then four
+               with SSE2. Vectorising across x (not across taps) means every
+               lane of the SSE2 quad runs the same operations in the same
+               order as the scalar path below, so that one is bit-identical
+               to it and the scalar path stays the reference. Either width
+               needs its whole span in the mirror-free interior and inside
+               one sigma block: blocks are 8 wide and the spans are aligned,
+               so x/8 is constant across them. */
             if (use_avx2 && y_inside && (x & 7u) == 0 &&
                 x >= (uint32_t)pad && x + 7 + (uint32_t)pad < w) {
                 if (sigma_val == 0.0f) {
@@ -942,7 +953,9 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
                     }
                 }
                 /* Real division, not _mm_rcp_ps: the approximate reciprocal
-                   would diverge from the scalar path. */
+                   would diverge from the scalar path, and this SSE2 quad is
+                   the vector path that is kept exact (the AVX2 kernels above
+                   accept that divergence). */
                 sw = _mm_div_ps(_mm_set1_ps(1.0f), sw);
                 for (c = 0; c < 3; c++) {
                     _mm_storeu_ps(out[c] + row + x, _mm_mul_ps(sum4[c], sw));

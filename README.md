@@ -8,7 +8,8 @@ A decode-only [JPEG XL](https://fileformats.dev/jxl) library, in the spirit of
 * simple to integrate: copy `dist/jxl.h` and `dist/jxl.c` into your project.
   That is `src/*` amalgamated into a single translation unit, like sqlite
 * single-threaded by design
-* verified against libjxl on a generated corpus of 1245 `.jxl` files
+* verified against libjxl on a corpus of 1547 `.jxl` files: libjxl's test
+  images encoded 21 ways, plus the JPEG XL conformance testcases
 
 ## API
 Sketch (full documentation in [`src/jxl.h`](src/jxl.h)):
@@ -55,46 +56,50 @@ turns on `jxl_ctx_set_srgb_output`. With no option it prints `-info`.
 
 ## Status
 See [PROGRESS.md](PROGRESS.md) for the full feature matrix. In short,
-`bun cmd/tests.ts -all` decodes 1245 corpus files and compares each against
-`djxl`: **1245 match — 387 byte-exact, and no sample in the other 858 differs
-by more than one 8-bit step.**
+`bun cmd/tests.ts -all` decodes 1547 corpus files and compares each against
+`djxl`: **all 1547 match — 538 byte-exact, the rest inside the tolerance.**
+`bun cmd/tests.ts -all -all-frames` then checks *every frame* of every file
+against libjxl itself (`djxl` writes only the first frame of an animation):
+also 1547 of 1547.
 
 * **Byte-exact** against libjxl: Modular lossless (every effort level,
-  palette, squeeze, RCT), plus patches and reference frames.
+  palette, squeeze, RCT, every predictor), plus patches and reference frames.
 * **Within one 8-bit step**: VarDCT including progressive/LF frames, and
-  lossy Modular (XYB), for sRGB content.
-* Also working: gaborish and EPF, splines, synthetic photon noise, 2x/4x/8x
-  upsampling, all eight EXIF orientations, animation, embedded ICC profiles,
-  non-sRGB primaries (P3 and Rec.2100, Bradford-adapted) with the 709 transfer
-  function, and YCbCr/JPEG-transcoded frames in every chroma subsampling mode.
-* Implemented but **unverified**: the PQ and HLG transfer functions.
-  `bun cmd/coverage.ts` shows that code never runs — nothing this build of
-  `cjxl` can emit declares them on a lossy frame, so nothing checks it
-  against `djxl`.
+  lossy Modular (XYB). Two conformance files reach two steps.
+* Also working: gaborish and EPF (on Modular frames too), splines, synthetic
+  photon noise, 2x/4x/8x upsampling, all eight EXIF orientations, embedded
+  ICC profiles, non-sRGB primaries (P3 and Rec.2100, Bradford-adapted),
+  YCbCr/JPEG-transcoded frames in every chroma subsampling mode, layers and
+  animation with every blend mode and cropped frames, spot colours, extra
+  channels with their own bit depth, and lossless float samples.
+* Transfer functions: sRGB, 709, HLG (with its OOTF) and PQ. PQ is verified
+  only loosely: its slope at black turns the ~1e-5 of float noise between two
+  correct XYB decoders into tens of 8-bit steps, so that preset alone is held
+  to a much wider limit (see `cmd/corpus.ts`).
 
-The 858 non-byte-exact files are lossy VarDCT paths where roughly a quarter of
-the samples land one count either side of libjxl's. libjxl, jxl-oxide and this
+The non-byte-exact files are lossy paths where roughly a quarter of the
+samples land one count either side of libjxl's. libjxl, jxl-oxide and this
 decoder use different IDCT factorizations and different `powf` approximations,
 so exact equality is not achievable — libjxl's own conformance testing uses a
 tolerance too, and like it we gate on RMS and peak together rather than peak
 alone (`-rms`, default 0.6; `-tol`, default 3).
 
-Not implemented: encoding, JPEG reconstruction (`jbrd` boxes are located but
-not applied), and multithreading. Two extra-channel cases are rejected with an
-error rather than decoded wrongly: a channel whose upsampling factor differs
-from the colour channels', and a spot-colour channel (which has to be mixed
-into the colour channels). Neither is producible by `cjxl`, so neither can be
-verified against `djxl` yet.
+Not implemented: encoding, JPEG reconstruction (`jbrd` boxes are skipped), and
+multithreading. Two things are rejected with an error rather than decoded
+wrongly: an extra channel whose upsampling factor differs from the colour
+channels', and a spot colour on a grayscale image. A preview frame is skipped,
+not decoded — untested, since no available file has one.
 
 ## Performance
 `bun cmd/bench.ts -all` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both single-threaded, best of N. Over the
-1245-file corpus this decoder takes **about 1.10x** libjxl's decode time
-(1.0983x in the latest best-of-five sweep). libjxl is AVX2 throughout; the hot
+1245 files the corpus had when it was last measured, this decoder takes
+**about 1.10x** libjxl's decode time (1.0983x in a best-of-five sweep). libjxl is AVX2 throughout; the hot
 loops here use runtime-selected SSE2/AVX2 kernels (noise, upsampling, EPF,
 gaborish, both DCT passes, YCbCr and XYB conversion, the sRGB transfer
 function and the output quantiser), so a constant factor is expected. Each
-keeps a scalar twin it is checked bit-identical against.
+keeps a scalar twin; the SSE2 kernels are bit-identical to theirs, the
+AVX2+FMA ones (DCT, dequantiser, EPF) use approximate reciprocals and are not.
 PROGRESS.md records what closed the gap and, just as usefully, which
 optimizations were measured and thrown away.
 

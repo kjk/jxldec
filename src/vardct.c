@@ -14,9 +14,12 @@
 #include <math.h>
 
 /* SSE2 is baseline on x64. -DJXL_VARDCT_FORCE_SCALAR builds the scalar path
-   alone so the two can be diffed. Both loops vectorised here run across x
-   with no cross-lane dependency, so each lane performs the same operations
-   in the same order as the scalar code and rounds identically. */
+   alone so the two can be diffed. The SSE2 loops here run across x with no
+   cross-lane dependency, so each lane performs the same operations in the
+   same order as the scalar code and rounds identically. The AVX2+FMA
+   dequantiser (dequant_varblock8_core) is the exception: it uses the
+   approximate reciprocal plus one FMA refinement step where the others
+   divide, so its output is close to, not identical to, the scalar path's. */
 #if !defined(JXL_VARDCT_FORCE_SCALAR) && \
     (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
      (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
@@ -712,7 +715,7 @@ int jxl_dequant_matrices_read(jxl_ctx *ctx, jxl_br *br,
                         specs[k].hshift = 0;
                         specs[k].vshift = 0;
                     }
-                    if (jxl_modular_init(ctx, &mod, br, specs, 3, global_ma, 256,
+                    if (jxl_modular_init(ctx, &mod, br, specs, 3, global_ma,
                                          bit_depth) != 0)
                         goto done;
                     if (jxl_modular_transform_channels(ctx, &mod, &cl) != 0) goto done;
@@ -905,6 +908,10 @@ void jxl_jpeg_upsampling_shifts(const uint32_t ju[3], int idx, int *hs,
         default: *hs = hscale; *vs = 0; break;
     }
 }
+
+/* Coefficients accumulate across passes from values a crafted stream fully
+   controls, so the add wraps as unsigned rather than overflowing a signed int. */
+#define JXL_COEFF_ADD(dst, v) ((dst) = (int32_t)((uint32_t)(dst) + (uint32_t)(v)))
 
 int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                        const jxl_hf_coeff_params *p, float *out[3],
@@ -1113,7 +1120,7 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                            variables without a second branch. */
                         coeff = (int32_t)((ucoeff >> 1) ^
                                           (((~ucoeff) & 1u) - 1u));
-                        coeff_out[coeff_offsets[k]] += coeff;
+                        JXL_COEFF_ADD(coeff_out[coeff_offsets[k]], coeff);
                         is_prev_nonzero = ucoeff != 0;
                         non_zeros -= is_prev_nonzero;
                         if (non_zeros == 0) break;
@@ -1141,8 +1148,9 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                             is_prev_nonzero = 0;
                             continue;
                         }
-                        coeff = jxl_unpack_signed(ucoeff) << p->coeff_shift;
-                        coeff_out[coeff_offsets[k]] += coeff;
+                        coeff = (int32_t)((uint32_t)jxl_unpack_signed(ucoeff)
+                                          << p->coeff_shift);
+                        JXL_COEFF_ADD(coeff_out[coeff_offsets[k]], coeff);
                         is_prev_nonzero = 1;
                         non_zeros--;
                         if (non_zeros == 0) break;
@@ -1175,7 +1183,8 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                             is_prev_nonzero = 0;
                             continue;
                         }
-                        coeff = jxl_unpack_signed(ucoeff) << p->coeff_shift;
+                        coeff = (int32_t)((uint32_t)jxl_unpack_signed(ucoeff)
+                                          << p->coeff_shift);
                         if (ord) {
                             memcpy(&xy, ord + k * 2, sizeof(xy));
                             dx = xy & 0xffffu;
@@ -1183,7 +1192,7 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                             if (need_transpose) {
                                 uint32_t t = dx; dx = dy; dy = t;
                             }
-                            coeff_out[(size_t)dy * coeff_stride + dx] += coeff;
+                            JXL_COEFF_ADD(coeff_out[(size_t)dy * coeff_stride + dx], coeff);
                         }
                         is_prev_nonzero = 1;
                         non_zeros--;
@@ -1220,7 +1229,8 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                             is_prev_nonzero = 0;
                             continue;
                         }
-                        coeff = jxl_unpack_signed(ucoeff) << p->coeff_shift;
+                        coeff = (int32_t)((uint32_t)jxl_unpack_signed(ucoeff)
+                                          << p->coeff_shift);
                         if (ord) {
                             memcpy(&xy, ord + k * 2, sizeof(xy));
                             dx = xy & 0xffffu;
@@ -1231,12 +1241,18 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                             /* Coefficients accumulate as integers, stored in
                                the float plane's bit pattern until
                                dequantization. */
-                            coeff_out[(size_t)dy * coeff_stride + dx] += coeff;
+                            JXL_COEFF_ADD(coeff_out[(size_t)dy * coeff_stride + dx], coeff);
                         }
                         is_prev_nonzero = 1;
                         non_zeros--;
                         if (non_zeros == 0) break;
                     }
+                }
+                /* Ran out of block with coefficients still owed: libjxl's
+                   "Invalid AC: nzeros at end of block". */
+                if (non_zeros != 0) {
+                    JXL_ERR(ctx, "vardct: non-zero count exceeds the block");
+                    goto done;
                 }
                 if (br->err || dist->err) {
                     JXL_ERR(ctx, "vardct: truncated HF coefficients");
@@ -1316,7 +1332,7 @@ int jxl_hf_meta_read(jxl_ctx *ctx, jxl_br *br, jxl_hf_meta *m,
     specs[3].w = bw; specs[3].h = bh;
     for (i = 0; i < 4; i++) { specs[i].hshift = 0; specs[i].vshift = 0; }
 
-    if (jxl_modular_init(ctx, &mod, br, specs, 4, global_ma, 0, bit_depth) != 0)
+    if (jxl_modular_init(ctx, &mod, br, specs, 4, global_ma, bit_depth) != 0)
         goto done;
     if (jxl_modular_transform_channels(ctx, &mod, &cl) != 0) goto done;
     if (jxl_modular_decode(ctx, &mod, &cl, br,
@@ -1363,12 +1379,22 @@ int jxl_hf_meta_read(jxl_ctx *ctx, jxl_br *br, jxl_hf_meta *m,
                 goto done;
             }
             dct_select = mod.base[2].data[data_idx];
-            hf_mul = mod.base[2].data[mod.base[2].stride + data_idx] + 1;
-            if (dct_select < 0 || dct_select >= JXL_TR_COUNT || hf_mul <= 0) {
+            /* The quant field is clamped, not validated: libjxl stores
+               1 + clamp(raw, 0, 255) (dec_modular.cc, kQuantMax). */
+            hf_mul = mod.base[2].data[mod.base[2].stride + data_idx];
+            if (hf_mul < 0) hf_mul = 0;
+            if (hf_mul > 255) hf_mul = 255;
+            hf_mul += 1;
+            if (dct_select < 0 || dct_select >= JXL_TR_COUNT) {
                 JXL_ERR(ctx, "vardct: bad varblock descriptor");
                 goto done;
             }
             jxl_tr_select_size(dct_select, &dw, &dh);
+            if ((dw > 1 || dh > 1) && (h_up || v_up)) {
+                JXL_ERR(ctx, "vardct: multi-block transform with chroma "
+                             "subsampling");
+                goto done;
+            }
             if ((x % 32) + dw > 32 || (y % 32) + dh > 32) {
                 JXL_ERR(ctx, "vardct: varblock crosses a pass group border");
                 goto done;
@@ -1393,15 +1419,18 @@ int jxl_hf_meta_read(jxl_ctx *ctx, jxl_br *br, jxl_hf_meta *m,
                     } else {
                         b->dct_select = JXL_BLK_OCCUPIED;
                     }
-                    if (sigma_base != 0.0f) {
+                    /* Validated whether or not EPF is on, as in libjxl. */
+                    if (x + dx < mod.base[3].w && y + dy < mod.base[3].h) {
                         int32_t sharp =
                             mod.base[3].data[(size_t)(y + dy) * mod.base[3].stride + (x + dx)];
                         if (sharp < 0 || sharp >= 8) {
                             JXL_ERR(ctx, "vardct: bad EPF sharpness");
                             goto done;
                         }
-                        m->epf_sigma[(size_t)(y + dy) * bw + (x + dx)] =
-                            sigma_base * epf->sharp_lut[sharp];
+                        if (sigma_base != 0.0f) {
+                            m->epf_sigma[(size_t)(y + dy) * bw + (x + dx)] =
+                                sigma_base * epf->sharp_lut[sharp];
+                        }
                     }
                 }
             }
@@ -1409,7 +1438,6 @@ int jxl_hf_meta_read(jxl_ctx *ctx, jxl_br *br, jxl_hf_meta *m,
             x += dw;
         }
     }
-    m->have = 1;
     rc = 0;
 
 done:
@@ -1602,8 +1630,8 @@ void jxl_dequant_dct8_plane(float *coeff, size_t stride,
     _mm256_zeroupper();
 }
 #else
-/* Declared for the batched VarDCT path in decode.c. That path is gated on
-   jxl_has_avx2_fma(), which is always 0 without x86, so this is never called. */
+/* Declared for the batched VarDCT path in decode.c, which is compiled out
+   together with this kernel (JXL_HAVE_BATCH_DCT8), so this is never called. */
 void jxl_dequant_dct8_plane(float *coeff, size_t stride,
                             const jxl_block_info *blocks,
                             uint32_t blocks_w, uint32_t blocks_h,

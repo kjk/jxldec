@@ -55,7 +55,6 @@ static void pfx_single_into(jxl_pfx_hist *h, uint16_t sym) {
     h->root_mask = 0;
     h->single_symbol = (int)sym;
     h->root[0].bits = pfx_entry(sym, 0, 0);
-    h->nsub = 0;
     h->sub = NULL;
 }
 
@@ -131,7 +130,6 @@ static int pfx_build(jxl_ctx *ctx, jxl_pfx_hist *h, const uint8_t *lens,
         h->sub = (jxl_pfx_entry *)jxl_calloc(ctx, sub_total, sizeof(jxl_pfx_entry));
         if (!h->sub) return -1;
     }
-    h->nsub = sub_total;
     h->root_bits = root_bits;
     h->root_mask = root_mask;
     h->single_symbol = -1;
@@ -292,7 +290,6 @@ static int pfx_parse_complex(jxl_ctx *ctx, jxl_br *br, jxl_pfx_hist *h,
         clh.root_bits = max_len;
         clh.root_mask = (1u << max_len) - 1;
         clh.single_symbol = -1;
-        clh.nsub = 0;
         clh.sub = NULL;
         memset(cl_root, 0, sizeof(jxl_pfx_entry) * ((size_t)1 << max_len));
         for (len = 1; len <= max_len; len++) {
@@ -370,7 +367,6 @@ static int pfx_parse(jxl_ctx *ctx, jxl_br *br, jxl_pfx_hist *h,
 
     h->root = NULL;
     h->sub = NULL;
-    h->nsub = 0;
     h->single_symbol = -1;
 
     if (alphabet_size == 1) return pfx_single(ctx, h, 0);
@@ -578,11 +574,9 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
             h->buckets[i].alias_cutoff = 0;
             h->buckets[i].alias_dist_xor = (uint16_t)(dist[i] ^ ANS_TAB_SIZE);
         }
-        h->single_symbol = single_sym;
         rc = 0;
         goto done;
     }
-    h->single_symbol = -1;
 
     cutoff = (uint16_t *)jxl_calloc(ctx, table_size, sizeof(uint16_t));
     alias_sym = (uint16_t *)jxl_calloc(ctx, table_size, sizeof(uint16_t));
@@ -1102,11 +1096,20 @@ static uint32_t perm_context(uint32_t x) {
     return b < 7 ? b : 7;
 }
 
+/* The Lehmer code is turned into a permutation with an implicit
+   order-statistics (Fenwick) tree over "not yet used" flags, as in libjxl's
+   DecodeLehmerCode: tree[k-1] counts the unused elements in the block of
+   lowbit(k) positions ending at k, so finding the rank-th unused element is
+   one descent and marking it used one ascent. The obvious version -- pull
+   element idx out of an array and memmove the tail down -- is quadratic,
+   and a TOC permutation's length comes straight from the file: a few bytes
+   could ask for a million entries and hours of memmove. */
 int jxl_read_permutation(jxl_ctx *ctx, jxl_dec *dec, jxl_br *br, uint32_t size,
                          uint32_t skip, uint32_t *out) {
     uint32_t *lehmer = NULL;
-    uint32_t *temp = NULL;
-    uint32_t end, i, ntemp;
+    uint32_t *tree = NULL;
+    uint8_t *used = NULL;
+    uint32_t end, i, n, padded, log2n, k;
     uint32_t prev = 0;
     int rc = -1;
 
@@ -1128,23 +1131,56 @@ int jxl_read_permutation(jxl_ctx *ctx, jxl_dec *dec, jxl_br *br, uint32_t size,
         prev = lehmer[i];
     }
 
-    ntemp = size - skip;
-    temp = (uint32_t *)jxl_calloc(ctx, ntemp ? ntemp : 1, sizeof(uint32_t));
-    if (!temp) goto done;
-    for (i = 0; i < ntemp; i++) temp[i] = skip + i;
-
     for (i = 0; i < skip; i++) out[i] = i;
-    for (i = 0; i < end; i++) {
-        uint32_t idx = lehmer[i];
-        out[skip + i] = temp[idx];
-        memmove(temp + idx, temp + idx + 1, (ntemp - idx - 1) * sizeof(uint32_t));
-        ntemp--;
+    n = size - skip;
+    if (end == 0) {
+        for (i = 0; i < n; i++) out[skip + i] = skip + i;
+        return 0;
     }
-    for (i = 0; i < ntemp; i++) out[skip + end + i] = temp[i];
+
+    if (n > ((uint32_t)1 << 30)) {
+        JXL_ERR(ctx, "invalid permutation length");
+        goto done;
+    }
+    log2n = 0;
+    while (((uint32_t)1 << log2n) < n) log2n++;
+    padded = (uint32_t)1 << log2n;
+    tree = (uint32_t *)jxl_malloc(ctx, (size_t)padded * sizeof(uint32_t));
+    used = (uint8_t *)jxl_calloc(ctx, n, 1);
+    if (!tree || !used) goto done;
+    for (i = 0; i < padded; i++) tree[i] = (i + 1) & (0u - (i + 1));
+
+    for (i = 0; i < end; i++) {
+        /* lehmer[i] < n - i was checked above, and positions 0..n-1 hold
+           exactly n - i unused elements, so the descent lands below n. */
+        uint32_t rank = lehmer[i] + 1;
+        uint32_t bit = padded, next = 0, b;
+        for (b = 0; b <= log2n; b++) {
+            uint32_t cand = next + bit;
+            bit >>= 1;
+            if (cand <= padded && tree[cand - 1] < rank) {
+                next = cand;
+                rank -= tree[cand - 1];
+            }
+        }
+        if (next >= n) {
+            JXL_ERR(ctx, "invalid permutation entry");
+            goto done;
+        }
+        out[skip + i] = skip + next;
+        used[next] = 1;
+        for (k = next + 1; k <= padded; k += k & (0u - k)) tree[k - 1]--;
+    }
+    /* The rest keep their natural order. */
+    k = skip + end;
+    for (i = 0; i < n; i++) {
+        if (!used[i]) out[k++] = skip + i;
+    }
     rc = 0;
 
 done:
     jxl_free(ctx, lehmer);
-    jxl_free(ctx, temp);
+    jxl_free(ctx, tree);
+    jxl_free(ctx, used);
     return rc;
 }

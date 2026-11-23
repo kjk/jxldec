@@ -328,7 +328,7 @@ int jxl_read_frame_header(jxl_ctx *ctx, jxl_br *br, const jxl_size_header *size,
         }
         if (meta->have_animation) {
             fh->duration = jxl_br_u32(br, 0, 0, 1, 0, 0, 8, 0, 32);
-            if (meta->animation.have_timecodes) fh->timecode = jxl_br_read(br, 32);
+            if (meta->animation.have_timecodes) (void)jxl_br_read(br, 32);
         }
         fh->is_last = jxl_br_bool(br);
     } else {
@@ -347,7 +347,7 @@ int jxl_read_frame_header(jxl_ctx *ctx, jxl_br *br, const jxl_size_header *size,
                     (fh->duration == 0 || fh->save_as_reference != 0) &&
                     fh->frame_type != JXL_FRAME_LF);
         if (cond) fh->save_before_ct = jxl_br_bool(br);
-        fh->name = jxl_read_name(ctx, br);
+        jxl_skip_name(br);
         if (!jxl_br_bool(br)) {   /* RestorationFilter all_default */
             read_gabor(br, &fh->gab);
             read_epf(br, &fh->epf, fh->encoding);
@@ -371,10 +371,8 @@ void jxl_frame_header_free(jxl_ctx *ctx, jxl_frame_header *fh) {
     if (!fh) return;
     jxl_free(ctx, fh->ec_upsampling);
     jxl_free(ctx, fh->ec_blending);
-    jxl_free(ctx, fh->name);
     fh->ec_upsampling = NULL;
     fh->ec_blending = NULL;
-    fh->name = NULL;
 }
 
 /* ----- table of contents ----- */
@@ -417,7 +415,6 @@ int jxl_read_toc(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
     toc->count = entry_count;
     toc->num_groups = num_groups;
     toc->num_lf_groups = num_lf_groups;
-    toc->num_passes = num_passes;
 
     permutated = jxl_br_bool(br);
     if (permutated) {
@@ -474,13 +471,11 @@ int jxl_read_toc(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
                 goto done;
             }
             toc->entries[i].offset = offs[b];
-            toc->entries[i].size = sizes[b];
         }
         jxl_free(ctx, offs);
     } else {
         for (i = 0; i < entry_count; i++) {
             toc->entries[i].offset = acc;
-            toc->entries[i].size = sizes[i];
             acc += sizes[i];
             toc->total_size += sizes[i];
         }

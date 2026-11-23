@@ -17,8 +17,14 @@
  */
 #include "jxl_internal.h"
 
+/* -DJXL_DEBUG_MODULAR compiles in two stderr dumps, switched on at run time
+   by the JXL_DEBUG_TREE and JXL_DEBUG_TRACK environment variables. They are
+   development aids: a library build does not read the environment or write
+   to stderr. */
+#ifdef JXL_DEBUG_MODULAR
 #include <stdio.h>
 #include <stdlib.h>
+#endif
 
 /* AVX2 squeeze inverse lives beside the scalar path (runtime-gated via
    jxl_has_avx2). The include and kernels are compile-gated so arm64 and
@@ -332,6 +338,7 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
         }
         raw[count++] = node;
     }
+#ifdef JXL_DEBUG_MODULAR
     if (getenv("JXL_DEBUG_TREE")) {
         uint32_t k;
         fprintf(stderr, "tree: %u nodes, %u ctx, prefix=%d nclusters=%u\n",
@@ -350,6 +357,7 @@ int jxl_ma_config_read(jxl_ctx *ctx, jxl_br *br, jxl_ma_config *ma,
             }
         }
     }
+#endif
     if (jxl_dec_finalize(&tree_dec) != 0) {
         JXL_ERR(ctx, "modular: bad MA tree ANS final state (state=0x%x)",
                 (unsigned)tree_dec.state);
@@ -1315,7 +1323,12 @@ static int transform_apply(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
         chanlist_remove_range(cl, begin + 1, end);
 
         memset(&pal, 0, sizeof(pal));
-        pal.w = tr->nb_colours;
+        /* The palette holds the delta entries as well as the colours: libjxl's
+           MetaPalette makes the channel nb_colors + nb_deltas wide (its
+           encoder writes nb_colors with the deltas already subtracted).
+           jxl-oxide uses nb_colours alone, which is the same thing only while
+           nb_deltas is 0. */
+        pal.w = tr->nb_colours + tr->nb_deltas;
         pal.h = tr->num_c;
         pal.hshift = -1;
         pal.vshift = -1;
@@ -1331,7 +1344,6 @@ static int transform_apply(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
             }
             pal.data = tr->pal_buf;
             pal.stride = pal.w;
-            tr->pal = pal;
         }
         return chanlist_insert(ctx, cl, 0, &pal);
     }
@@ -2113,7 +2125,9 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
     jxl_mchan *targets = NULL;
     uint32_t begin, x, y, c, i;
     uint32_t width, height;
-    int32_t nb_colours = (int32_t)tr->nb_colours;
+    /* The palette size: every explicit entry, deltas included (see the
+       matching note where the palette channel is created). */
+    int32_t nb_colours = (int32_t)(tr->nb_colours + tr->nb_deltas);
     int32_t nb_deltas = (int32_t)tr->nb_deltas;
     uint8_t *need_delta = NULL;
     int any_delta = 0;
@@ -2405,13 +2419,11 @@ static int modular_init_common(jxl_ctx *ctx, jxl_modular *m, jxl_br *br,
 
 int jxl_modular_init(jxl_ctx *ctx, jxl_modular *m, jxl_br *br,
                      const jxl_mchan_spec *specs, uint32_t nspecs,
-                     jxl_ma_config *global_ma, uint32_t group_dim,
-                     uint32_t bit_depth) {
+                     jxl_ma_config *global_ma, uint32_t bit_depth) {
     uint32_t i;
 
     memset(m, 0, sizeof(*m));
     m->ctx = ctx;
-    m->group_dim = group_dim;
     m->bit_depth = bit_depth;
     if (nspecs == 0) return 0;
 
@@ -2443,11 +2455,9 @@ int jxl_modular_init(jxl_ctx *ctx, jxl_modular *m, jxl_br *br,
    another image's buffers) -- the "recursive" modular stream of a group. */
 int jxl_modular_init_over(jxl_ctx *ctx, jxl_modular *m, jxl_br *br,
                           const jxl_mchan *chans, uint32_t nchans,
-                          jxl_ma_config *global_ma, uint32_t group_dim,
-                          uint32_t bit_depth) {
+                          jxl_ma_config *global_ma, uint32_t bit_depth) {
     memset(m, 0, sizeof(*m));
     m->ctx = ctx;
-    m->group_dim = group_dim;
     m->bit_depth = bit_depth;
     if (nchans == 0) return 0;
     m->base = (jxl_mchan *)jxl_calloc(ctx, nchans, sizeof(jxl_mchan));
@@ -3089,6 +3099,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
        is a property of the encoder settings, not of the image -- so when a
        preset turns out slow this is the first thing worth knowing. Sibling
        of JXL_DEBUG_TREE above. */
+#ifdef JXL_DEBUG_MODULAR
     if (getenv("JXL_DEBUG_TRACK")) {
         fprintf(stderr, "stream %u: fold=%d mask=0x%x need_sc=%d fixed=%d wplut=%d "
                 "nflat=%u nchan=%u w=%u h=%u\n", (unsigned)stream_idx, can_fold,
@@ -3097,6 +3108,7 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
                 (unsigned)ma->nflat, (unsigned)cl->n,
                 (unsigned)cl->chans[0].w, (unsigned)cl->chans[0].h);
     }
+#endif
     max_prev = ma_max_prev_channels(ma);
     if (max_prev) {
         prev = (const jxl_mchan **)jxl_calloc(ctx, cl->n, sizeof(jxl_mchan *));

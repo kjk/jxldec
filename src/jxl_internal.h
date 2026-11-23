@@ -94,7 +94,10 @@ int jxl_has_avx2_fma(void);
    and EPF kernels, which are spelled that way precisely so they round like
    their scalar twins. Measured: FMA in the upsample kernel bought ~0-1.5%
    (that loop is load-bound, not FLOP-bound) and cost cross-machine
-   reproducibility, so nothing here uses it. */
+   reproducibility, so the plain AVX2 kernels do not use it. The few that do
+   -- the DCT, the dequantiser and EPF pass 1 -- are marked
+   JXL_TARGET_AVX2_FMA one by one and selected with jxl_has_avx2_fma();
+   those are not bit-identical to their scalar twins. */
 #define JXL_TARGET_AVX2 __attribute__((target("avx2")))
 #define JXL_TARGET_AVX2_FMA __attribute__((target("avx2,fma")))
 #else
@@ -240,9 +243,6 @@ typedef struct {
     uint8_t *cs;        /* codestream bytes                               */
     size_t cs_len;
     int cs_owned;       /* 1 when cs must be freed (concatenated jxlp)    */
-    const uint8_t *exif; size_t exif_len;
-    const uint8_t *xmp;  size_t xmp_len;
-    const uint8_t *jbrd; size_t jbrd_len;   /* jpeg reconstruction data   */
 } jxl_container;
 
 int jxl_container_parse(jxl_ctx *ctx, const uint8_t *data, size_t len,
@@ -275,10 +275,8 @@ typedef struct {
     jxl_ec_type type;
     jxl_bit_depth bit_depth;
     uint32_t dim_shift;
-    char *name;              /* NUL-terminated UTF-8, or NULL             */
     int alpha_associated;    /* JXL_EC_ALPHA                              */
     float spot[4];           /* JXL_EC_SPOT: r,g,b,solidity               */
-    uint32_t cfa_channel;    /* JXL_EC_CFA                                */
 } jxl_ec_info;
 
 typedef enum {
@@ -315,20 +313,15 @@ typedef struct {
     int tf_have_gamma;
     uint32_t tf_gamma;       /* gamma * 1e7 (inverse gamma)               */
     jxl_transfer_function tf;
-    uint32_t rendering_intent;
 } jxl_colour_encoding;
 
 typedef struct {
     float intensity_target;
-    float min_nits;
-    int relative_to_max_display;
-    float linear_below;
 } jxl_tone_mapping;
 
 typedef struct {
     uint32_t tps_numerator;
     uint32_t tps_denominator;
-    uint32_t num_loops;
     int have_timecodes;
 } jxl_animation_header;
 
@@ -346,7 +339,6 @@ typedef struct {
     jxl_animation_header animation;
 
     jxl_bit_depth bit_depth;
-    int modular_16bit_buffers;
     uint32_t num_extra;
     jxl_ec_info *ec_info;
     int alpha_index;              /* index into ec_info, or -1            */
@@ -365,7 +357,7 @@ typedef struct {
 
 /* Parses the 0xFF 0x0A signature, SizeHeader and ImageMetadata. */
 /* A length-prefixed UTF-8 name; NULL when empty. Caller frees. */
-char *jxl_read_name(jxl_ctx *ctx, jxl_br *br);
+void jxl_skip_name(jxl_br *br);
 int jxl_read_image_header(jxl_ctx *ctx, jxl_br *br, jxl_size_header *size,
                           jxl_image_metadata *meta);
 void jxl_image_metadata_free(jxl_ctx *ctx, jxl_image_metadata *meta);
@@ -400,7 +392,6 @@ typedef struct {
 typedef struct {
     jxl_pfx_entry *root;
     jxl_pfx_entry *sub;
-    uint32_t nsub;
     int root_bits;
     uint32_t root_mask;
     int single_symbol;   /* >= 0 when the code has exactly one symbol */
@@ -418,7 +409,6 @@ typedef struct {
     jxl_ans_bucket *buckets;
     uint32_t log_bucket_size;
     uint32_t bucket_mask;
-    int single_symbol;
 } jxl_ans_hist;
 
 typedef struct {
@@ -628,7 +618,6 @@ typedef struct {
     uint32_t nsp;
     /* palette runtime state */
     int32_t *pal_buf;      /* nb_colours * num_c, owned */
-    jxl_mchan pal;
     jxl_mchan *saved;      /* member channels removed from the list */
     uint32_t nsaved;
 } jxl_transform;
@@ -659,7 +648,6 @@ typedef struct {
     jxl_ma_config *ma;         /* global config, or &local */
     jxl_ma_config local;
     int has_local;
-    uint32_t group_dim;
     uint32_t bit_depth;
 
     jxl_mchan *base;           /* declared channels, each owning a buffer */
@@ -672,13 +660,11 @@ typedef struct {
    allocates the declared channels. nspecs == 0 makes an empty image. */
 int jxl_modular_init(jxl_ctx *ctx, jxl_modular *m, jxl_br *br,
                      const jxl_mchan_spec *specs, uint32_t nspecs,
-                     jxl_ma_config *global_ma, uint32_t group_dim,
-                     uint32_t bit_depth);
+                     jxl_ma_config *global_ma, uint32_t bit_depth);
 /* Same, but over channel views that already exist (a group's sub-stream). */
 int jxl_modular_init_over(jxl_ctx *ctx, jxl_modular *m, jxl_br *br,
                           const jxl_mchan *chans, uint32_t nchans,
-                          jxl_ma_config *global_ma, uint32_t group_dim,
-                          uint32_t bit_depth);
+                          jxl_ma_config *global_ma, uint32_t bit_depth);
 void jxl_modular_free(jxl_ctx *ctx, jxl_modular *m);
 
 /* Applies every transform to the channel list, producing the list of
@@ -783,12 +769,10 @@ typedef struct {
     jxl_blending_info blending;
     jxl_blending_info *ec_blending;  /* num_extra entries */
     uint32_t duration;
-    uint32_t timecode;
     int is_last;
     uint32_t save_as_reference;
     int resets_canvas;
     int save_before_ct;
-    char *name;
     jxl_gabor gab;
     jxl_epf epf;
 } jxl_frame_header;
@@ -803,7 +787,6 @@ typedef enum {
 
 typedef struct {
     size_t offset;     /* absolute byte offset into the codestream buffer */
-    uint32_t size;
 } jxl_toc_entry;
 
 typedef struct {
@@ -811,7 +794,6 @@ typedef struct {
     uint32_t count;
     uint32_t num_lf_groups;
     uint32_t num_groups;
-    uint32_t num_passes;
     uint64_t total_size;      /* sum of all section sizes */
     size_t end_off;           /* byte offset just past the TOC */
 } jxl_toc;
@@ -926,7 +908,6 @@ typedef struct {
     jxl_block_info *block_info;
     uint32_t bw, bh;
     float *epf_sigma;
-    int have;
 } jxl_hf_meta;
 
 /* Natural (zig-zag-ish) coefficient orders, materialized on demand. */
@@ -996,6 +977,19 @@ int jxl_hf_meta_read(jxl_ctx *ctx, jxl_br *br, jxl_hf_meta *m,
                      jxl_ma_config *global_ma, const jxl_epf *epf,
                      uint32_t quantizer_global_scale);
 
+/* The batched all-DCT8 path (jxl_dequant_dct8_plane + jxl_idct8x8_plane) has
+   only AVX2+FMA kernels. They are compiled out by -DJXL_DCT_FORCE_SCALAR and
+   -DJXL_VARDCT_FORCE_SCALAR and on a build without SSE2, where the two
+   functions are empty stubs -- and jxl_has_avx2_fma() is a *run-time* CPU
+   test that knows nothing about that, so the caller checks this as well. */
+#if !defined(JXL_DCT_FORCE_SCALAR) && !defined(JXL_VARDCT_FORCE_SCALAR) && \
+    (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
+     (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#define JXL_HAVE_BATCH_DCT8 1
+#else
+#define JXL_HAVE_BATCH_DCT8 0
+#endif
+
 void jxl_copy_lf_dequant(float *dst, size_t dstride, const jxl_mchan *src,
                          const jxl_quantizer *q, float m_lf,
                          int extra_precision);
@@ -1047,7 +1041,12 @@ void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
                       float intensity_target);
 /* The opsin inverse matrix adjusted for the image's primaries/white point
    (and collapsed to luminance weights for grayscale output). */
-void jxl_opsin_matrix_for(const jxl_image_metadata *meta, float out[9]);
+/* Also returns the luminance weights (the Y row of RGB -> XYZ) of the output
+   primaries. */
+void jxl_opsin_matrix_for(const jxl_image_metadata *meta, float out[9],
+                          float luminances[3]);
+void jxl_hlg_inverse_ootf(float *r, float *g, float *b, size_t n,
+                          const float luminances[3], float intensity_target);
 
 /* ===================================================================== */
 /* patch -- rectangles blended in from a reference frame                  */
@@ -1085,7 +1084,6 @@ typedef struct {
 typedef struct {
     jxl_patch_ref *refs;
     uint32_t n;
-    uint32_t nblend;
 } jxl_patches;
 
 int jxl_patches_read(jxl_ctx *ctx, jxl_br *br, const jxl_image_metadata *meta,
@@ -1144,7 +1142,6 @@ typedef struct {
 /* One decoded frame: color planes first, then the extra channels. Planes
    can differ in size when a channel is subsampled. */
 typedef struct {
-    jxl_ctx *ctx;
     jxl_fplane *plane;
     uint32_t nplane;
     uint32_t ncolor;
@@ -1179,8 +1176,11 @@ void jxl_frame_state_free(jxl_ctx *ctx, jxl_frame_state *st);
 int jxl_apply_patches(jxl_ctx *ctx, jxl_fimage *img, const jxl_patches *p,
                       const jxl_image_metadata *meta, jxl_fimage refs[4],
                       const int refs_valid[4]);
-int jxl_blend_frame(jxl_ctx *ctx, jxl_fimage *canvas, const jxl_fimage *frame,
-                    const jxl_frame_header *fh, const jxl_image_metadata *meta);
+int jxl_has_spot_colour(const jxl_image_metadata *meta);
+void jxl_apply_spot_colours(jxl_fimage *img, const jxl_image_metadata *meta);
+void jxl_blend_frame(jxl_fimage *canvas, const jxl_fimage *frame,
+                     const jxl_frame_header *fh,
+                     const jxl_image_metadata *meta);
 int jxl_fimage_blank_like(jxl_ctx *ctx, jxl_fimage *out, const jxl_fimage *like,
                           uint32_t w, uint32_t h);
 int jxl_fimage_copy(jxl_ctx *ctx, jxl_fimage *dst, const jxl_fimage *src);
@@ -1212,8 +1212,6 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
 
 struct jxl_doc {
     jxl_ctx *ctx;
-    const uint8_t *data;
-    size_t len;
     jxl_container container;
 
     jxl_size_header size;         /* codestream dimensions                */
@@ -1225,7 +1223,6 @@ struct jxl_doc {
     /* Byte offset (in container.cs) just past the image header, where the
        first frame starts. */
     size_t first_frame_off;
-    size_t first_frame_bitpos;    /* bit offset of first frame            */
     int frame_count;              /* displayed frames; 0 until counted    */
 };
 

@@ -2,8 +2,8 @@
 # libjxl on Windows, Linux, and macOS. Also covers the cross/arch compile
 # variants that have failed consumers before (MSVC Win32, mingw-w64).
 #
-# `bun cmd/tests.ts -all` needs the full deps tree (libjxl tools + generated
-# corpus). deps/ is cached per OS/arch so cold runs pay the clone/build/encode
+# `bun cmd/tests.ts -all` needs the full deps tree (libjxl tools, the
+# conformance testcases and the generated corpus). deps/ is cached per OS/arch so cold runs pay the clone/build/encode
 # cost once and warm runs stay short.
 name: ci
 
@@ -60,6 +60,14 @@ jobs:
             deps-v1-windows-x64-
       - name: Oracle tests (MSVC)
         run: bun cmd/tests.ts -all
+      - name: Every frame against libjxl
+        # djxl writes only frame 0 of an animation; this links libjxl itself
+        # (test/jxl_ref.c) and checks every coalesced frame, which is what
+        # covers blending, reference slots and cropped frames. MSVC only: it
+        # needs the static libraries the oracle build leaves in deps/.
+        run: bun cmd/tests.ts -all -all-frames
+      - name: Output-stride overflow regression
+        run: bun cmd/test-oversize-render.ts
       - name: Amalgamation (clang + msvc + msvc-x86)
         # -require-msvc-x86 uses HostX64/x86/cl when the PATH cl is x64, so we
         # catch Win32-only breaks (_BitScanReverse64) on the same job.
@@ -140,6 +148,8 @@ jobs:
             deps-v1-linux-
       - name: Oracle tests (clang)
         run: bun cmd/tests.ts -all -clang
+      - name: Output-stride overflow regression
+        run: bun cmd/test-oversize-render.ts -clang
       - name: Amalgamation (clang + mingw without -mxsave)
         # mingw must not need -mxsave: that is how SumatraPDF Wine CI compiles
         # jxl.c. gcc's _xgetbv is always_inline and fails without it.
@@ -167,5 +177,7 @@ jobs:
         # Apple clang is on the runner; -clang is the default off Windows but
         # keep it explicit so this job stays parallel to linux.
         run: bun cmd/tests.ts -all -clang
+      - name: Output-stride overflow regression
+        run: bun cmd/test-oversize-render.ts -clang
       - name: Amalgamation (host clang)
         run: bun cmd/build-dist.ts

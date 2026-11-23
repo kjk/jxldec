@@ -8,9 +8,9 @@
 //
 // JXL_SPECS=<dir> overrides the corpus with any directory of .jxl files
 // (scanned recursively), the way DJVU_SPECS does in djvudec.
-import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, statSync, writeFileSync } from "fs";
 import { basename, dirname, join, relative } from "path";
-import { DEPS_DIR, LIBJXL_DIR, refTool } from "./get-deps";
+import { CONFORMANCE_DIR, DEPS_DIR, LIBJXL_DIR, refTool } from "./get-deps";
 import { pngToPam } from "./png";
 
 const CORPUS_DIR = join(DEPS_DIR, "corpus");
@@ -64,14 +64,22 @@ const iccProfile = (name: string) => join(
 // that path the decoder falls back to linear sRGB by design.
 const ICC_PROFILE = iccProfile("ProPhoto-v4");
 
-/** cjxl settings, one per generated variant. */
+/** cjxl settings, one per generated variant. `peakTol` / `rmsTol` replace
+ *  the test driver's default limits for that preset's files. */
 export const PRESETS:
-    { name: string; args: string[] | ((src: string) => string[]) }[] = [
+    { name: string; args: string[] | ((src: string) => string[]);
+      peakTol?: number; rmsTol?: number }[] = [
   { name: "m_e1", args: ["-d", "0", "-e", "1"] },
   { name: "m_e3", args: ["-d", "0", "-e", "3"] },
   { name: "m_e7", args: ["-d", "0", "-e", "7"] },
   { name: "m_e9", args: ["-d", "0", "-e", "9"] },
   { name: "m_resp", args: ["-d", "0", "-e", "7", "--responsive=1"] },
+  // Two Modular paths no other preset reaches, each of which hid a wrong-
+  // pixels bug until it was asked for by name: an RCT that only permutes the
+  // channels (-C 7 is type 0, permutation 1), and the AvgAll predictor
+  // (-P 13), which the weighted-predictor fast path has to step around.
+  { name: "m_rct7", args: ["-d", "0", "-e", "7", "-C", "7"] },
+  { name: "m_p13", args: ["-d", "0", "-e", "5", "-P", "13"] },
   { name: "v_e3", args: ["-d", "1", "-e", "3"] },
   { name: "v_d1", args: ["-d", "1", "-e", "7"] },
   { name: "v_d05", args: ["-d", "0.5", "-e", "7"] },
@@ -104,6 +112,26 @@ export const PRESETS:
                          `icc_pathname=${iccProfile("DisplayP3-v4")}`] },
   { name: "v_2020", args: ["-d", "1", "-e", "7", "-x",
                            `icc_pathname=${iccProfile("Rec2020-v4")}`] },
+  // The two HDR transfer functions. PAM carries no colour information, so
+  // cjxl has to be told; it then declares PQ / HLG on an XYB frame, which is
+  // what takes the decoder through tf_pq and the HLG inverse OOTF.
+  //
+  // Both get wider limits, PQ much wider, and it is worth being exact about
+  // why. A channel that should be zero comes out of XYB -> RGB as zero plus
+  // float noise: the opsin inverse has entries around +-10, so two correct
+  // implementations disagree by ~1e-5 there, on either side of zero. PQ maps
+  // 1e-5 of full scale to ~18 8-bit steps (its slope at black is that steep)
+  // and a negative value to 0. On a photo that is a handful of samples per
+  // image (peak ~9, RMS 0.49 like every other lossy preset); on testdata's
+  // synthetic colour bars, where a third of the image is a saturated primary
+  // with two channels at zero, it is whole regions (peak ~23, RMS up to
+  // 1.7). So these limits only catch a PQ that is grossly wrong -- which is
+  // still more than nothing, and is what the preset is for. HLG's square
+  // root at black does the same thing far more mildly.
+  { name: "v_pq", peakTol: 32, rmsTol: 2,
+    args: ["-d", "1", "-e", "7", "-x", "color_space=RGB_D65_202_Rel_PeQ"] },
+  { name: "v_hlg", peakTol: 16,
+    args: ["-d", "1", "-e", "7", "-x", "color_space=RGB_D65_202_Rel_HLG"] },
   // EXIF orientation, which the writer undoes. The eight values are spread
   // across the sources by orientationFor, so this one preset reaches every
   // arm of unapply_orientation's switch, including the four that transpose.
@@ -125,6 +153,40 @@ function walk(dir: string, pred: (name: string) => boolean): string[] {
     else if (pred(name)) out.push(p);
   }
   return out;
+}
+
+/** The limits a generated file's preset asks for, where it asks for any. */
+export function tolFor(file: string): { peak?: number; rms?: number } {
+  const base = basename(file);
+  for (const p of PRESETS) {
+    if (base.endsWith(`.${p.name}.jxl`)) return { peak: p.peakTol, rms: p.rmsTol };
+  }
+  return {};
+}
+
+// The JPEG XL conformance suite (github.com/libjxl/conformance): two dozen
+// hand-made files covering what cjxl will not emit -- layers and every blend
+// mode, cropped animation frames, spot colours, CMYK, float samples, delta
+// palettes, loop filters on a Modular frame, extra channels with their own
+// bit depth. The `*_5` testcases are symlinks to their Level 10 twins (plain
+// text stubs in a Windows checkout), so they are left out.
+function conformanceFiles(): string[] {
+  const root = join(CONFORMANCE_DIR, "testcases");
+  return walk(root, (n) => n === "input.jxl").filter((f) => {
+    const st = lstatSync(f);
+    return !st.isSymbolicLink() && st.size > 64;
+  });
+}
+
+// Files whose first frame `djxl x.jxl x.pam` writes in a shape we cannot
+// compare: it appends every extra channel as a further PAM plane, so
+// cmyk_layers comes out as five (RGB, K, alpha) and spot as six, where we
+// render RGB + alpha. `tests.ts -all-frames` checks them against libjxl
+// directly instead.
+const DJXL_UNCOMPARABLE = ["cmyk_layers", "spot"];
+export function skipWithDjxl(file: string): boolean {
+  const f = file.replaceAll("\\", "/");
+  return DJXL_UNCOMPARABLE.some((t) => f.includes(`/testcases/${t}/`));
 }
 
 /** Source images shipped in libjxl's testdata, converted to PAM once. */
@@ -250,6 +312,7 @@ export function corpusFiles(presets = PRESETS.map((p) => p.name)): string[] {
   out.push(...walk(join(LIBJXL_DIR, "testdata", "jxl"), (n) =>
     n.toLowerCase().endsWith(".jxl"),
   ));
+  out.push(...conformanceFiles());
   if (generated) console.log(`corpus: generated ${generated} file(s)`);
   if (skipped.length) {
     console.warn(`corpus: ${skipped.length} source(s) cjxl could not encode:`);
@@ -313,12 +376,12 @@ export function corpusSummary(): string {
   const n = process.env.JXL_SPECS
     ? walk(process.env.JXL_SPECS, isJxl).length
     : walk(GEN_DIR, isJxl).length +
-      walk(join(LIBJXL_DIR, "testdata", "jxl"), isJxl).length;
+      walk(join(LIBJXL_DIR, "testdata", "jxl"), isJxl).length +
+      conformanceFiles().length;
   return `${n} .jxl file(s) available from ${src}`;
 }
 
 if (import.meta.main) {
   const files = corpusFiles();
-  console.log(`${files.length} corpus files in ${GEN_DIR}`);
-  writeFileSync(join(CORPUS_DIR, "files.txt"), files.join("\n") + "\n");
+  console.log(`${files.length} corpus files (generated ones in ${GEN_DIR})`);
 }

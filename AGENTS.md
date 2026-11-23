@@ -11,7 +11,8 @@ up-front as an in-memory buffer. We provide:
 - decoded pixels for any frame, in 8- or 16-bit gray/gray+alpha/RGB/RGBA
 - the embedded ICC profile, when present
 
-No encoder. No JPEG reconstruction (`jbrd` boxes are located but not applied).
+No encoder. No JPEG reconstruction (`jbrd` boxes are skipped, like every
+other non-codestream box).
 No multithreading — `jxl_ctx` is not shared across threads. The one exception is `jxl_request_abort`, which another thread may call while a render runs (atomic epoch, see `jxl_render_begin` / `jxl_aborted` in jxl_internal.h).
 
 The consumer that drives the feature set is **SumatraPDF**
@@ -26,7 +27,15 @@ on `jxl_ctx_set_srgb_output`.
   holds cjxl/djxl/jxlinfo built by `cmd/get-deps.ts` (cmake + ninja +
   clang-cl). Consult `lib/jxl/*.cc` for exact tables and constants.
 - `deps/jxl-oxide` — Rust decoder; the implementation this port follows most
-  closely. Its crate layout maps almost 1:1 onto our `src/` modules.
+  closely. Its crate layout maps almost 1:1 onto our `src/` modules. Where it
+  and libjxl disagree, **libjxl wins** — it is the oracle, and every
+  disagreement found so far (see the gotchas) was jxl-oxide being wrong for a
+  file no encoder emits by default.
+- `deps/conformance` — github.com/libjxl/conformance, cloned by
+  `cmd/get-deps.ts`. Two dozen hand-made files for what `cjxl` cannot emit:
+  layers and every blend mode, cropped animation frames, spot colours, CMYK,
+  float samples, delta palettes, loop filters on a Modular frame, extra
+  channels with their own bit depth. Part of the corpus.
 - `JXLDEC_LIBJXL=<dir>` points at an existing libjxl checkout instead of
   cloning (a directory junction at `deps/libjxl` works too).
 - Spec: ISO/IEC 18181-1. The **code** is the more definitive reference.
@@ -48,7 +57,20 @@ PNGs to PNM in TypeScript. Don't re-investigate this.
   `bun cmd/build.ts asan` builds the clang+ASan harness.
 - `bun cmd/tests.ts <-all | -rand N | file.jxl ...>` — the test driver:
   builds, then decodes each corpus file with both our decoder and `djxl`
-  and compares the PAM output.
+  and compares the PAM output. The last lines say how many files were
+  byte-exact, how many passed on tolerance and the worst peak among them.
+- `bun cmd/tests.ts <selection> -all-frames` — the same, but against
+  `jxl_ref` (`test/jxl_ref.c`: libjxl itself, dumping every coalesced frame)
+  and for **every** frame of each file. `djxl` writes only frame 0 of an
+  animation to PAM, so this is the only thing that verifies blending,
+  reference slots and cropped frames; it also covers the three files `djxl`
+  cannot write comparably (CMYK and spot colour come out with extra PAM
+  planes, float samples not at all). MSVC only — it links libjxl's static
+  libraries, like the benchmark. Run it after touching `walk_frames`,
+  `jxl_blend_frame` or anything about extra channels.
+- `bun cmd/test-oversize-render.ts [-clang] [-asan]` — unit regression for
+  the output-stride overflow guard (`jxl_output_buffer_size`); no corpus
+  needed.
 - `bun cmd/coverage.ts [-rand N] [-cpu N] [-all-fns] [-reuse]` — decodes the
   corpus under clang source-based coverage and prints per-file line coverage
   plus, more usefully, every function that never ran. Use it before assuming a
@@ -146,8 +168,18 @@ Manual equivalent:
 libjxl's `testdata/` holds only a handful of `.jxl` files; the corpus is
 *generated* by encoding the testdata source images with `cjxl` across a matrix
 of settings (VarDCT/modular, lossless/lossy, progressive, effort levels), cached
-under `deps/corpus/`. See `cmd/corpus.ts`. `JXL_SPECS=<dir>` overrides the
-corpus with any directory of `.jxl` files.
+under `deps/corpus/`. See `cmd/corpus.ts`. On top of that come the `.jxl`
+files libjxl ships and the conformance testcases. `JXL_SPECS=<dir>` overrides
+the corpus with any directory of `.jxl` files.
+
+A preset in `cmd/corpus.ts` can carry its own `peakTol` / `rmsTol`. Only the
+two HDR ones do, and the comment there says exactly why (PQ's slope at black
+turns float noise into tens of 8-bit steps). Do not reach for that to make a
+failing preset pass: every other preset is held to the default limits.
+
+When a decoder bug turns up in a path the corpus does not reach, add the
+`cjxl` flag that reaches it as a preset (`m_rct7` and `m_p13` exist for
+exactly that reason) rather than only fixing the bug.
 
 ## Source map (`src/` → jxl-oxide crate)
 | C file | jxl-oxide |
@@ -205,6 +237,25 @@ and either `is_last` or a non-zero duration) are visible; LF frames
 `jxl_frame_state` with four reference slots and the most recent LF image.
 Frames saved "before CT" (every LF frame) skip the XYB -> color-space step.
 
+Compositing follows libjxl's pipeline (`dec_cache.cc`), and the order matters:
+1. A normal frame that is not a plain full-frame replace of every channel is
+   blended onto a canvas built from the reference slot each channel's own
+   `BlendingInfo.source` names. **A slot nothing was saved to reads as zeros**
+   (transparent black) — the previously displayed frame is never a fallback.
+2. The result is saved to `save_as_reference` only if the frame can be
+   referenced: not last, and `duration == 0 || save_as_reference != 0`
+   (`FrameHeader::CanBeReferenced`). A displayed animation frame naming slot 0
+   is *not* saved.
+3. Reference-only frames and `save_before_ct` frames are saved as decoded:
+   frame-sized, unblended, pre-colour-transform. That is what patches read.
+4. Spot colours are mixed into the displayed frame last, after blending, and
+   never into a saved reference.
+
+Without an animation header there is exactly one displayed frame, however
+many layers the file has, so `jxl_doc_frame_count` answers 1 without walking.
+`jxl_doc_frame_info` and the count walk read frame headers and TOCs only
+(`img == NULL` in `walk_frames`).
+
 ## Methodology
 Reference-oracle verification: decode with `jxl_test -out x.pam` and with
 `djxl file.jxl x.pam`, compare. Modular (integer) paths must be **byte-exact**;
@@ -258,6 +309,33 @@ current; it lists the exact pass rate and every known gap.
   `max_color` where libjxl takes `log(max_color)`, inflating the draw radius
   and the pixel count for output that is identical at 8 bits. Do not "restore"
   the jxl-oxide form when diffing against that crate.
+- Extra-channel `BlendingInfo.source` is conditional on that channel's **own**
+  mode, and the patch alpha-channel symbol on `num_extra_channels > 1` — both
+  libjxl's rule, both different in jxl-oxide.
+- The palette channel is `nb_colours + nb_deltas` wide (libjxl's encoder
+  writes `nb_colours` with the deltas already subtracted).
+- A permutation-only RCT (rct_type 7, 14, ...) has to move samples. Swapping
+  `jxl_mchan` views is invisible to everything that reads
+  `jxl_modular.base[]`, and breaks squeeze's adjacency assumption.
+- Each extra channel is scaled by its **own** bit depth, and a float channel
+  holds IEEE bit patterns (`modular_sample_to_float`), not counts.
+- Gaborish and EPF apply to Modular frames too, with the constant
+  `epf_sigma_for_modular`; a gray frame goes through as three identical
+  channels (`modular_loop_filters`).
+- HLG needs the inverse OOTF across all three channels before the per-channel
+  curve; PQ is scaled by `intensity_target / 10000` and evaluated with
+  libjxl's rational polynomial, because the exact `powf` form differs by
+  several steps at black.
+- A file with `have_preview` carries a whole extra frame before the first
+  real one; `jxl_doc_open` steps over it.
+- `jxl_dec_init` frees its own partial state on failure, so a caller can
+  simply return.
+- The AVX2+FMA kernels (DCT, dequant, EPF) use approximate reciprocals and
+  are **not** bit-identical to scalar; the SSE2 ones are. `-DJXL_NO_AVX2` is
+  the reproducible build, and `JXL_HAVE_BATCH_DCT8` is what keeps a
+  `*_FORCE_SCALAR` build off the batched path.
+- `-DJXL_DEBUG_MODULAR` compiles in the `JXL_DEBUG_TREE` / `JXL_DEBUG_TRACK`
+  stderr dumps. Without it the library never reads the environment.
 - `epf_pass` and `jxl_render_splines` are written so the per-sample float
   operation order matches what the obvious per-channel loop would produce.
   Reordering an accumulation there changes pixels; the interior fast path and

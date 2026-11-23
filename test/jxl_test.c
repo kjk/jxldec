@@ -111,7 +111,8 @@ static int cmd_frames(jxl_ctx *ctx, const uint8_t *data, size_t len) {
         }
         printf("frame %d: type %d enc %s %ux%u+%d+%d flags 0x%x passes %u "
                "groups %u lfgroups %u toc %u sections %u bytes last %d "
-               "blend %d/src %u ref %u ct %d ycbcr %d ju %u,%u,%u\n",
+               "blend %d/src %u ref %u ct %d ycbcr %d ju %u,%u,%u "
+               "dur %u up %u gab %d epf %u\n",
                idx, (int)fh.frame_type,
                fh.encoding == JXL_ENC_MODULAR ? "modular" : "vardct",
                (unsigned)fh.width, (unsigned)fh.height, (int)fh.x0, (int)fh.y0,
@@ -122,7 +123,9 @@ static int cmd_frames(jxl_ctx *ctx, const uint8_t *data, size_t len) {
                (unsigned)fh.blending.source, (unsigned)fh.save_as_reference,
                fh.save_before_ct, fh.do_ycbcr,
                (unsigned)fh.jpeg_upsampling[0], (unsigned)fh.jpeg_upsampling[1],
-               (unsigned)fh.jpeg_upsampling[2]);
+               (unsigned)fh.jpeg_upsampling[2], (unsigned)fh.duration,
+               (unsigned)fh.upsampling, fh.gab.enabled,
+               fh.epf.enabled ? (unsigned)fh.epf.iters : 0u);
         end = (uint64_t)toc.end_off + toc.total_size;
         idx++;
         {

@@ -8,6 +8,7 @@
 //   bun cmd/build.ts cov      clang + coverage instrumentation (see coverage.ts)
 //   bun cmd/build.ts fuzz     clang + libFuzzer + ASan (see fuzz.ts)
 //   bun cmd/build.ts fuzz-afl afl-clang-fast harness (see fuzz-afl.ts; *nix)
+//   bun cmd/build.ts ref      jxl_ref: libjxl dumping every frame (MSVC only)
 //
 // Objects and exes land in out/msvc/, out/clang/ or out/clang_asan/. The build
 // is incremental: a source is recompiled only when newer than its object, and
@@ -495,6 +496,34 @@ export async function buildBenchHarness(): Promise<string> {
   return exePath;
 }
 
+/** Build jxl_ref: libjxl alone, dumping every coalesced frame as PAM. The
+ *  per-frame oracle behind `tests.ts -all-frames` (djxl writes only frame 0).
+ *  MSVC only, for the same reason as jxl_bench. */
+export async function buildRefDump(): Promise<string> {
+  if (!isWindows) throw new Error("jxl_ref needs the MSVC toolchain");
+  const dir = outDir(false);
+  const exePath = `${dir}/${binName("jxl_ref")}`;
+  const inc = `${ROOT}/deps/libjxl/lib/include`;
+  const incBuild = `${ROOT}/deps/libjxl-build/lib/include`;
+  mkdirSync(dir, { recursive: true });
+  const clMd = JXLDEC_MSVC_CL_C.replace("-MT", "-MD");
+  const obj = `${dir}/jxl_ref.obj`;
+  if (needsRebuild(obj, `${ROOT}/test/jxl_ref.c`)) {
+    await runCmd(
+      `cl ${clMd} -DJXL_STATIC_DEFINE -I${inc} -I${incBuild} -Fo${obj} -c test/jxl_ref.c`,
+      ROOT,
+    );
+  }
+  const libs = libjxlLibs();
+  if (needsRebuild(exePath, obj, ...libs)) {
+    await runCmd(
+      `cl -nologo ${obj} -Fe:${exePath} -link -LTCG ${libs.join(" ")}`,
+      ROOT,
+    );
+  }
+  return exePath;
+}
+
 /** Build jxl_prof: our decoder alone, with debug info so a sampling profiler
  *  can symbolize it. Objects live in out/prof/ so the release build's
  *  no-debug-info objects are not clobbered. */
@@ -539,5 +568,6 @@ if (import.meta.main) {
   else if (args.includes("cov")) await buildCoverage();
   else if (args.includes("fuzz-afl")) await buildAflFuzz();
   else if (args.includes("fuzz")) await buildFuzz();
+  else if (args.includes("ref")) await buildRefDump();
   else await build(useClang);
 }

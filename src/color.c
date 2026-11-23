@@ -255,17 +255,34 @@ static float tf_bt709(float v) {
            0.09929682680944f;
 }
 
-static float tf_pq(float v) {
-    /* SMPTE ST 2084, with 1.0 mapping to 10000 nits. */
-    const float m1 = 2610.0f / 16384.0f;
-    const float m2 = 2523.0f / 4096.0f * 128.0f;
-    const float c1 = 3424.0f / 4096.0f;
-    const float c2 = 2413.0f / 4096.0f * 32.0f;
-    const float c3 = 2392.0f / 4096.0f * 32.0f;
-    float p;
-    if (v <= 0.0f) return 0.0f;
-    p = powf(v, m1);
-    return powf((c1 + c2 * p) / (1.0f + c3 * p), m2);
+/* SMPTE ST 2084. The curve is defined on absolute luminance with 10000 nits
+   at 1.0, while the decoded samples have the image's intensity_target at 1.0;
+   `scale` is intensity_target / 10000 (libjxl's TF_PQ::EncodedFromDisplay).
+   Evaluated with libjxl's rational polynomials in x^(1/4) rather than the
+   two powf of the definition: the curve is so steep at black that the two
+   differ by several 8-bit steps there, and libjxl is what we are compared
+   against. Note the 1e-4 switch is on the unscaled sample, as in libjxl. */
+static float tf_pq(float v, float scale) {
+    static const float p[5] = {1.351392e-02f, -1.095778e+00f, 5.522776e+01f,
+                               1.492516e+02f, 4.838434e+01f};
+    static const float q[5] = {1.012416e+00f, 2.016708e+01f, 9.263710e+01f,
+                               1.120607e+02f, 2.590418e+01f};
+    static const float plo[5] = {9.863406e-06f, 3.881234e-01f, 1.352821e+02f,
+                                 6.889862e+04f, -2.864824e+05f};
+    static const float qlo[5] = {3.371868e+01f, 1.477719e+03f, 1.608477e+04f,
+                                 -4.389884e+04f, -2.072546e+05f};
+    float a = fabsf(v);
+    float x = sqrtf(sqrtf(a * scale));
+    const float *pp = a < 1e-4f ? plo : p;
+    const float *qq = a < 1e-4f ? qlo : q;
+    float yp = pp[4], yq = qq[4], r;
+    int k;
+    for (k = 3; k >= 0; k--) {
+        yp = yp * x + pp[k];
+        yq = yq * x + qq[k];
+    }
+    r = yp / yq;
+    return v < 0.0f ? -r : r;
 }
 
 static float tf_hlg(float v) {
@@ -526,10 +543,36 @@ static void tf_bt709_x4(float *v, size_t n, size_t *pos) {
 }
 #endif
 
+/* The inverse HLG OOTF: display light back to scene light, which is what the
+   HLG OETF in jxl_linear_to_tf encodes. It scales all three channels by a
+   power of the pixel's luminance, so unlike a transfer curve it cannot run a
+   plane at a time. libjxl's HlgOOTF::ToSceneLight, including its rule of
+   skipping the step when the exponent is within 0.01 of zero. */
+void jxl_hlg_inverse_ootf(float *r, float *g, float *b, size_t n,
+                          const float luminances[3], float intensity_target) {
+    float gamma = (1.0f / 1.2f) *
+                  powf(1.111f, -log2f(intensity_target / 1000.0f));
+    float exponent = gamma - 1.0f;
+    size_t i;
+    if (!(exponent < -0.01f || exponent > 0.01f)) return;
+    for (i = 0; i < n; i++) {
+        float y = luminances[0] * r[i] + luminances[1] * g[i] +
+                  luminances[2] * b[i];
+        /* Zero or negative luminance is black plus float noise (a fully
+           transparent pixel, typically). A negative exponent would scale
+           that noise by the 1e9 cap into a saturated channel, so it is
+           forced to black instead; libjxl's fast pow is undefined there. */
+        float ratio = y > 0.0f ? powf(y, exponent) : 0.0f;
+        if (!(ratio < 1e9f)) ratio = 1e9f;
+        r[i] *= ratio;
+        g[i] *= ratio;
+        b[i] *= ratio;
+    }
+}
+
 void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
                       float intensity_target) {
     size_t i;
-    (void)intensity_target;
 
     if (enc->tf_have_gamma) {
         float g = (float)enc->tf_gamma / 1e7f;   /* stored inverted */
@@ -551,7 +594,10 @@ void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
             for (; i < n; i++) v[i] = tf_bt709(v[i]);
             break;
         case JXL_TF_PQ:
-            for (i = 0; i < n; i++) v[i] = tf_pq(v[i]);
+            {
+                float scale = intensity_target / 10000.0f;
+                for (i = 0; i < n; i++) v[i] = tf_pq(v[i], scale);
+            }
             break;
         case JXL_TF_DCI:
             for (i = 0; i < n; i++) {
@@ -699,11 +745,14 @@ static void get_white_point(const jxl_colour_encoding *enc, float *wx, float *wy
    sRGB -> target conversion into it, exactly like libjxl's
    OutputEncodingInfo::SetFromMetadata. Grayscale output instead collapses the
    three rows to the target's luminance weights. */
-void jxl_opsin_matrix_for(const jxl_image_metadata *meta, float out[9]) {
+void jxl_opsin_matrix_for(const jxl_image_metadata *meta, float out[9],
+                          float luminances[3]) {
     const jxl_colour_encoding *enc = &meta->colour;
-    float luminances[3] = {0.2126f, 0.7152f, 0.0722f};
     int is_gray = (enc->colour_space == JXLDEC_CS_GRAY);
 
+    luminances[0] = 0.2126f;
+    luminances[1] = 0.7152f;
+    luminances[2] = 0.0722f;
     memcpy(out, meta->opsin_inv, 9 * sizeof(float));
 
     if (!is_gray &&

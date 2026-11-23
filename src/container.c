@@ -5,9 +5,9 @@
  * codestream lives in a single `jxlc` box, or is split across `jxlp` boxes
  * (each prefixed with a 4-byte index whose high bit marks the last one).
  *
- * We only need the codestream; metadata boxes (Exif, xml, jbrd) are recorded
- * as raw spans for callers that want them. `brob` (Brotli-compressed) boxes
- * are skipped -- nothing in the decode path needs them.
+ * We only need the codestream: every other box -- Exif, xml, jbrd (JPEG
+ * reconstruction data), brob (Brotli-compressed metadata) -- is skipped.
+ * Nothing in the decode path needs them and the API exposes none of them.
  */
 #include "jxl_internal.h"
 
@@ -127,15 +127,6 @@ int jxl_container_parse(jxl_ctx *ctx, const uint8_t *data, size_t len,
             spans[nspans].len = payload_len - 4;
             nspans++;
             total += payload_len - 4;
-        } else if (memcmp(type, "Exif", 4) == 0) {
-            out->exif = payload;
-            out->exif_len = payload_len;
-        } else if (memcmp(type, "xml ", 4) == 0) {
-            out->xmp = payload;
-            out->xmp_len = payload_len;
-        } else if (memcmp(type, "jbrd", 4) == 0) {
-            out->jbrd = payload;
-            out->jbrd_len = payload_len;
         }
 
         pos += (size_t)box_size;

@@ -10,28 +10,36 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
                        int *count_out, jxl_frame_info *info_out);
 
 int jxl_doc_frame_count(jxl_doc *doc) {
-    int count = 0;
+    int count = 0, rc;
     if (!doc) return 0;
     if (doc->frame_count > 0) return doc->frame_count;
+    /* Only a frame with a duration, or the last one, is displayed, and
+       without an animation header no frame has a duration: a still image is
+       one displayed frame however many layers it is coded as. That keeps
+       jxl_doc_info and jxl_decode_size header-only for stills. */
+    if (!doc->meta.have_animation) {
+        doc->frame_count = 1;
+        return 1;
+    }
     jxl_render_begin(doc->ctx);
-    if (walk_frames(doc, -1, NULL, &count, NULL) != 0) return 1;
+    rc = walk_frames(doc, -1, NULL, &count, NULL);
+    /* An abort says nothing about the file: answer 1 and count again next
+       time. A damaged or truncated animation, though, has however many
+       frames could be found, and that will not change by asking again. */
+    if (rc != 0 && jxl_aborted(doc->ctx)) return 1;
     doc->frame_count = count > 0 ? count : 1;
     return doc->frame_count;
 }
 
 int jxl_doc_frame_info(jxl_doc *doc, int frame_no, jxl_frame_info *info) {
-    jxl_fimage img;
-    int rc;
     if (!doc || !info || frame_no < 0) return -1;
     memset(info, 0, sizeof(*info));
     info->tps_numerator = (int)doc->meta.animation.tps_numerator;
     info->tps_denominator = (int)doc->meta.animation.tps_denominator;
     info->is_last = 1;
-    memset(&img, 0, sizeof(img));
     jxl_render_begin(doc->ctx);
-    rc = walk_frames(doc, frame_no, &img, NULL, info);
-    jxl_fimage_free(doc->ctx, &img);
-    return rc;
+    /* No image asked for, so the walk only reads frame headers and TOCs. */
+    return walk_frames(doc, frame_no, NULL, NULL, info);
 }
 
 static jxl_format resolve_format(const jxl_image_info *ii, jxl_format fmt) {
@@ -55,6 +63,7 @@ int jxl_frame_render_info(jxl_doc *doc, int frame_no, jxl_format fmt,
        decoded every frame in the file before reporting "no such frame". */
     if (!doc || !info || frame_no < 0) return -1;
     if (jxl_doc_info(doc, &ii) != 0) return -1;
+    if (frame_no >= ii.num_frames) return -1;
     info->width = ii.width;
     info->height = ii.height;
     info->format = resolve_format(&ii, fmt);
@@ -795,22 +804,53 @@ static int frame_is_keyframe(const jxl_frame_header *fh) {
     return fh->is_last || fh->duration != 0;
 }
 
+/* The canvas a frame is blended onto: each channel comes from the reference
+   slot its own BlendingInfo names (the colour channels share one, every extra
+   channel has its own), and a slot nothing was saved to -- or one holding an
+   image of another shape -- reads as zeros, i.e. transparent black. That is
+   libjxl's blending stage; in particular the previously displayed frame is
+   *not* a fallback. */
+static int blend_base(jxl_ctx *ctx, jxl_fimage *base, const jxl_fimage *frame,
+                      const jxl_frame_header *fh, const jxl_frame_state *st,
+                      uint32_t iw, uint32_t ih) {
+    uint32_t c, y;
+    if (jxl_fimage_blank_like(ctx, base, frame, iw, ih) != 0) return -1;
+    for (c = 0; c < base->nplane; c++) {
+        uint32_t src = fh->blending.source;
+        const jxl_fimage *ref;
+        const jxl_fplane *rp;
+        jxl_fplane *bp = &base->plane[c];
+        if (c >= base->ncolor && fh->ec_blending)
+            src = fh->ec_blending[c - base->ncolor].source;
+        if (src >= 4 || !st->refs_valid[src]) continue;
+        ref = &st->refs[src];
+        if (ref->nplane != base->nplane || ref->ncolor != base->ncolor) continue;
+        rp = &ref->plane[c];
+        if (!rp->data || !bp->data || rp->w != bp->w || rp->h != bp->h) continue;
+        for (y = 0; y < bp->h; y++) {
+            memcpy(bp->data + (size_t)y * bp->stride,
+                   rp->data + (size_t)y * rp->stride, (size_t)bp->w * sizeof(float));
+        }
+    }
+    return 0;
+}
+
 /* Walks the frame chain. frame_no < 0 with count_out set only counts the
-   displayed frames. Displayed frames are composited onto the canvas their
+   displayed frames (and reports how many it found even when it fails part
+   way). With img NULL nothing is decoded at all: the walk reads frame headers
+   and TOCs, which is all the count and jxl_doc_frame_info need. Displayed frames are composited onto the canvas their
    blending info names, so animation frames that carry only a changed
    rectangle land in the right place. */
 static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
                        int *count_out, jxl_frame_info *info_out) {
     jxl_ctx *ctx = doc->ctx;
     jxl_frame_state st;
-    jxl_fimage canvas;
-    int canvas_valid = 0;
     jxl_br br;
     int idx = 0;
     int rc = -1;
+    const int has_spot = jxl_has_spot_colour(&doc->meta);
 
     memset(&st, 0, sizeof(st));
-    memset(&canvas, 0, sizeof(canvas));
     jxl_br_init(&br, doc->container.cs, doc->container.cs_len);
     jxl_br_seek_byte(&br, doc->first_frame_off);
 
@@ -818,7 +858,7 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
         jxl_frame_header fh;
         jxl_toc toc;
         uint64_t end;
-        int last, keyframe, want, apply_ct;
+        int last, keyframe, want, apply_ct, normal, can_ref, needs_blend;
         jxl_fimage tmp;
 
         memset(&toc, 0, sizeof(toc));
@@ -856,8 +896,18 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
             st.invisible_frames++;
         }
 
-        if (count_out && !want) {
-            /* Counting only: skip the pixel work entirely. */
+        if (want && !img) {
+            if (info_out) {
+                info_out->duration_ticks = (int)fh.duration;
+                info_out->is_last = fh.is_last;
+            }
+            jxl_toc_free(ctx, &toc);
+            jxl_frame_header_free(ctx, &fh);
+            rc = 0;
+            goto done;
+        }
+        if (!img) {
+            /* Headers only: skip the pixel work entirely. */
             if (keyframe) idx++;
             jxl_toc_free(ctx, &toc);
             jxl_frame_header_free(ctx, &fh);
@@ -866,11 +916,26 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
             continue;
         }
 
-        /* A wanted frame that replaces the whole canvas and is not kept as
-           a reference goes to the output writer untouched. */
-        st.lazy_int_ok = want && !fh.have_crop &&
-                         fh.blending.mode == JXL_BLEND_REPLACE &&
-                         !(fh.save_as_reference < 4 && !fh.is_last);
+        normal = fh.frame_type == JXL_FRAME_REGULAR ||
+                 fh.frame_type == JXL_FRAME_SKIP_PROGRESSIVE;
+        /* libjxl's FrameHeader::CanBeReferenced, for a non-LF frame: the last
+           frame is never saved, and one that is displayed (non-zero duration)
+           only when it names a slot other than 0. */
+        can_ref = !fh.is_last && (fh.duration == 0 || fh.save_as_reference != 0);
+        /* libjxl's NeedsBlending: anything but a full-frame replace of every
+           channel is composited onto its source. */
+        needs_blend = 0;
+        if (normal) {
+            uint32_t e;
+            needs_blend = fh.have_crop || fh.blending.mode != JXL_BLEND_REPLACE;
+            for (e = 0; e < doc->meta.num_extra && fh.ec_blending; e++) {
+                if (fh.ec_blending[e].mode != JXL_BLEND_REPLACE) needs_blend = 1;
+            }
+        }
+
+        /* A wanted frame that replaces the whole canvas goes to the output
+           writer untouched. */
+        st.lazy_int_ok = want && !needs_blend && !has_spot;
         if (jxl_frame_decode(ctx, doc, &fh, &toc, &st, apply_ct, &tmp) != 0) {
             jxl_toc_free(ctx, &toc);
             jxl_frame_header_free(ctx, &fh);
@@ -882,8 +947,11 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
             st.lf_image = tmp;
             st.lf_valid = 1;
             memset(&tmp, 0, sizeof(tmp));
-        } else if (!keyframe) {
-            if (fh.save_as_reference < 4) {
+        } else if (!normal || !apply_ct) {
+            /* A reference-only frame, or one saved before the colour
+               transform: kept as decoded -- frame-sized, unblended, still in
+               the coded colour space -- which is what patches read. */
+            if (can_ref) {
                 uint32_t slot = fh.save_as_reference;
                 jxl_fimage_free(ctx, &st.refs[slot]);
                 st.refs[slot] = tmp;
@@ -891,77 +959,55 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
                 memset(&tmp, 0, sizeof(tmp));
             }
         } else {
-            uint32_t src = fh.blending.source;
             uint32_t iw = doc->size.width, ih = doc->size.height;
-            int cropped = fh.have_crop || tmp.w != iw || tmp.h != ih;
-            int needs_canvas = cropped || fh.blending.mode != JXL_BLEND_REPLACE;
             int failed = 0;
 
-            /* The blend and the reference copy below want float planes. */
-            if (needs_canvas || (fh.save_as_reference < 4 && !fh.is_last))
-                failed = jxl_fimage_materialize(ctx, &tmp) != 0;
-
-            if (failed) {
-                jxl_fimage_free(ctx, &tmp);
-            } else if (!needs_canvas) {
-                jxl_fimage_free(ctx, &canvas);
-                canvas = tmp;
-                memset(&tmp, 0, sizeof(tmp));
-            } else {
-                /* The output canvas is always the SizeHeader dimensions.
-                   Reference frames (and prior canvases from corrupt files)
-                   can be larger or smaller; adopting their size would make
-                   write_pixels overflow the buffer jxl_frame_render allocates
-                   from jxl_doc_info. Only image-sized bases are reused;
-                   anything else starts from a blank full-size canvas and the
-                   blend clips the frame into it. */
+            /* The output canvas is always the SizeHeader dimensions, so a
+               frame of any other size is clipped into one even when its
+               header claims a plain replace (a corrupt file's doing);
+               adopting its size would make write_pixels overflow the buffer
+               jxl_frame_render allocates from jxl_doc_info. */
+            if (needs_blend || tmp.w != iw || tmp.h != ih) {
                 jxl_fimage base;
                 memset(&base, 0, sizeof(base));
-                if (src < 4 && st.refs_valid[src] &&
-                    st.refs[src].w == iw && st.refs[src].h == ih) {
-                    failed = jxl_fimage_copy(ctx, &base, &st.refs[src]) != 0;
-                } else if (canvas_valid && canvas.w == iw && canvas.h == ih) {
-                    failed = jxl_fimage_copy(ctx, &base, &canvas) != 0;
-                } else {
-                    failed = jxl_fimage_blank_like(ctx, &base, &tmp, iw, ih) != 0;
-                }
-                if (!failed) {
-                    jxl_blend_frame(ctx, &base, &tmp, &fh, &doc->meta);
-                    jxl_fimage_free(ctx, &canvas);
-                    canvas = base;
-                } else {
-                    jxl_fimage_free(ctx, &base);
-                }
+                failed = jxl_fimage_materialize(ctx, &tmp) != 0 ||
+                         blend_base(ctx, &base, &tmp, &fh, &st, iw, ih) != 0;
+                if (!failed) jxl_blend_frame(&base, &tmp, &fh, &doc->meta);
                 jxl_fimage_free(ctx, &tmp);
+                tmp = base;
             }
             if (failed) {
+                jxl_fimage_free(ctx, &tmp);
                 jxl_toc_free(ctx, &toc);
                 jxl_frame_header_free(ctx, &fh);
                 goto done;
             }
-            canvas_valid = 1;
-            if (fh.save_as_reference < 4 && !fh.is_last) {
+            /* tmp is now the composited canvas. It is either the answer or
+               the reference a later frame blends onto -- never both, since
+               the walk ends at the wanted frame -- so it is moved, not
+               copied, either way. */
+            if (want) {
+                if (has_spot) jxl_apply_spot_colours(&tmp, &doc->meta);
+                *img = tmp;
+                memset(&tmp, 0, sizeof(tmp));
+                if (info_out) {
+                    info_out->duration_ticks = (int)fh.duration;
+                    info_out->is_last = fh.is_last;
+                }
+                jxl_toc_free(ctx, &toc);
+                jxl_frame_header_free(ctx, &fh);
+                rc = 0;
+                goto done;
+            }
+            if (can_ref) {
                 uint32_t slot = fh.save_as_reference;
                 jxl_fimage_free(ctx, &st.refs[slot]);
-                memset(&st.refs[slot], 0, sizeof(st.refs[slot]));
-                st.refs_valid[slot] =
-                    jxl_fimage_copy(ctx, &st.refs[slot], &canvas) == 0;
+                st.refs[slot] = tmp;
+                st.refs_valid[slot] = 1;
+                memset(&tmp, 0, sizeof(tmp));
             }
         }
 
-        if (want) {
-            *img = canvas;
-            memset(&canvas, 0, sizeof(canvas));
-            canvas_valid = 0;
-            if (info_out) {
-                info_out->duration_ticks = (int)fh.duration;
-                info_out->is_last = fh.is_last;
-            }
-            jxl_toc_free(ctx, &toc);
-            jxl_frame_header_free(ctx, &fh);
-            rc = 0;
-            goto done;
-        }
         jxl_fimage_free(ctx, &tmp);
         if (keyframe) idx++;
         jxl_toc_free(ctx, &toc);
@@ -978,7 +1024,7 @@ static int walk_frames(jxl_doc *doc, int frame_no, jxl_fimage *img,
     }
 
 done:
-    jxl_fimage_free(ctx, &canvas);
+    if (count_out && rc != 0) *count_out = idx;
     jxl_frame_state_free(ctx, &st);
     return rc;
 }
