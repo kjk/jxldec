@@ -88,6 +88,18 @@ function cacheIsUsable(cc: string): boolean {
   return cached.toLowerCase().includes(`/${cc.toLowerCase()}`);
 }
 
+// clang-cl compiles against MSVC's STL, and each STL release refuses any
+// clang older than the one it was tested with (error STL1000). A clang-cl
+// that is not the one bundled with the installed Visual Studio -- a
+// standalone LLVM on PATH, which is what a CI runner has -- falls behind as
+// soon as VS updates. The first casualty is libjxl's FindAtomics probe,
+// which includes <atomic>, so the failure reads "Neither lock free
+// instructions nor -latomic found" and says nothing about versions. The
+// macro is the STL's documented opt-out; it is a no-op when they match.
+const WIN_STL_FLAGS = isWindows
+  ? ["-DCMAKE_CXX_FLAGS=-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"]
+  : [];
+
 export async function buildRef(): Promise<void> {
   if (existsSync(refTool("cjxl")) && existsSync(refTool("djxl"))) return;
   console.log("deps: building libjxl reference tools (one-time, slow)...");
@@ -107,6 +119,7 @@ export async function buildRef(): Promise<void> {
   const flags = [
     "-DCMAKE_BUILD_TYPE=Release",
     `-DCMAKE_C_COMPILER=${cc}`, `-DCMAKE_CXX_COMPILER=${cxx}`,
+    ...WIN_STL_FLAGS,
     "-DBUILD_TESTING=OFF", "-DBUILD_SHARED_LIBS=OFF",
     "-DJPEGXL_ENABLE_TOOLS=ON", "-DJPEGXL_ENABLE_BENCHMARK=OFF",
     "-DJPEGXL_ENABLE_EXAMPLES=OFF", "-DJPEGXL_ENABLE_MANPAGES=OFF",
@@ -125,7 +138,18 @@ export async function buildRef(): Promise<void> {
     const err = e as { stdout?: unknown; stderr?: unknown };
     const out = [String(err.stdout ?? ""), String(err.stderr ?? "")]
       .join("\n").trimEnd();
-    return out.split("\n").slice(-25).join("\n");
+    return out.split("\n").slice(-25).join("\n") + configureLogErrors();
+  };
+  // A failed compile probe says only "Failed" on the console; the compiler's
+  // actual complaint is in cmake's configure log, so print that too.
+  const configureLogErrors = (): string => {
+    const log = join(LIBJXL_BUILD, "CMakeFiles", "CMakeConfigureLog.yaml");
+    if (!existsSync(log)) return "";
+    const lines = readFileSync(log, "utf8").split("\n")
+      .filter((l) => /\berror\b/i.test(l)).slice(-12);
+    return lines.length
+      ? "\n--- errors from CMakeConfigureLog.yaml ---\n" + lines.join("\n")
+      : "";
   };
 
   try {
@@ -160,6 +184,7 @@ export async function buildRefDebug(): Promise<void> {
   const flags = [
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
     "-DCMAKE_C_COMPILER=clang-cl", "-DCMAKE_CXX_COMPILER=clang-cl",
+    ...WIN_STL_FLAGS,
     "-DBUILD_TESTING=OFF", "-DBUILD_SHARED_LIBS=OFF",
     "-DJPEGXL_ENABLE_TOOLS=ON", "-DJPEGXL_ENABLE_BENCHMARK=OFF",
     "-DJPEGXL_ENABLE_EXAMPLES=OFF", "-DJPEGXL_ENABLE_MANPAGES=OFF",

@@ -129,10 +129,14 @@ export const PRESETS:
   // with two channels at zero, it is whole regions (peak ~23, RMS up to
   // 1.7). So these limits only catch a PQ that is grossly wrong -- which is
   // still more than nothing, and is what the preset is for. HLG's square
-  // root at black does the same thing far more mildly.
+  // root at black, after an OOTF that scales by a negative power of the
+  // luminance, does the same to isolated samples: one or two black pixels
+  // per image where libjxl has a channel at 12-20. How far off depends on the
+  // platform's float code (13 with MSVC, 20 with clang on Linux), so the peak
+  // limit is as wide as PQ's; the RMS limit stays the default.
   { name: "v_pq", peakTol: 32, rmsTol: 2,
     args: ["-d", "1", "-e", "7", "-x", "color_space=RGB_D65_202_Rel_PeQ"] },
-  { name: "v_hlg", peakTol: 16,
+  { name: "v_hlg", peakTol: 32,
     args: ["-d", "1", "-e", "7", "-x", "color_space=RGB_D65_202_Rel_HLG"] },
   // An extra channel stored at a different resolution from the colour
   // channels, which libjxl upsamples on its own, before patches, rather than

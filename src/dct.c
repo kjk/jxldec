@@ -109,6 +109,12 @@ static const float sec_half_big[32 + 64 + 128] = {
 
 static const float *sec_half(int n) {
     switch (n) {
+        /* Every caller handles n <= 8 itself, so these two never run -- but
+           without them sec_half_4 is referenced only from the x86 kernels,
+           and a build for anything else (arm64) fails on an unused variable
+           under -Werror. */
+        case 4: return sec_half_4;
+        case 8: return sec_half_8;
         case 16: return sec_half_16;
         case 32: return sec_half_32;
         default: break;

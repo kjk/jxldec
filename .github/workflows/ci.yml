@@ -38,18 +38,21 @@ jobs:
         # get-deps builds the libjxl oracle with clang-cl.
         shell: pwsh
         run: |
-          if (Get-Command clang-cl -ErrorAction SilentlyContinue) { exit 0 }
-          $candidates = @(
-            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin",
-            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin",
-            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin"
-          )
-          foreach ($d in $candidates) {
-            if (Test-Path (Join-Path $d "clang-cl.exe")) {
-              echo $d | Out-File -FilePath $env:GITHUB_PATH -Append
-              exit 0
+          # Prefer the clang-cl bundled with the installed Visual Studio: it
+          # is the one the MSVC STL on this image was tested with. A
+          # standalone LLVM on PATH can be older than the STL accepts.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            $vs = & $vswhere -latest -products * -property installationPath
+            if ($vs) {
+              $d = Join-Path $vs "VC\Tools\Llvm\x64\bin"
+              if (Test-Path (Join-Path $d "clang-cl.exe")) {
+                echo $d | Out-File -FilePath $env:GITHUB_PATH -Append
+                exit 0
+              }
             }
           }
+          if (Get-Command clang-cl -ErrorAction SilentlyContinue) { exit 0 }
           choco install llvm -y --no-progress
       - name: Cache deps
         uses: actions/cache@v6
@@ -91,18 +94,21 @@ jobs:
       - name: Ensure clang-cl on PATH
         shell: pwsh
         run: |
-          if (Get-Command clang-cl -ErrorAction SilentlyContinue) { exit 0 }
-          $candidates = @(
-            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin",
-            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin",
-            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin"
-          )
-          foreach ($d in $candidates) {
-            if (Test-Path (Join-Path $d "clang-cl.exe")) {
-              echo $d | Out-File -FilePath $env:GITHUB_PATH -Append
-              exit 0
+          # Prefer the clang-cl bundled with the installed Visual Studio: it
+          # is the one the MSVC STL on this image was tested with. A
+          # standalone LLVM on PATH can be older than the STL accepts.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            $vs = & $vswhere -latest -products * -property installationPath
+            if ($vs) {
+              $d = Join-Path $vs "VC\Tools\Llvm\x64\bin"
+              if (Test-Path (Join-Path $d "clang-cl.exe")) {
+                echo $d | Out-File -FilePath $env:GITHUB_PATH -Append
+                exit 0
+              }
             }
           }
+          if (Get-Command clang-cl -ErrorAction SilentlyContinue) { exit 0 }
           choco install llvm -y --no-progress
       - name: Cache deps
         uses: actions/cache@v6
