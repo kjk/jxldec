@@ -94,8 +94,10 @@ for the exceptions.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1580-file corpus we are **about 0.99x libjxl** (0.993x; see "Re-measured
-after the conformance work" in the log for how, and per preset). Before
+1580-file corpus we are **about 0.99x libjxl** (0.988x after the HLG and
+gray-EPF work, 0.993x before it; see "Re-measured after the conformance
+work" in the log for the method, and the entry above it for the latest
+per-preset numbers). Before
 that, over the 1245-file corpus, **about 1.10x libjxl** (the best-of-five sweep
 measured 18089.84ms against 16470.12ms, **1.0983x**; an immediately preceding
 best-of-three sweep measured 18195.22ms against 16560.84ms, **1.0987x**;
@@ -1800,6 +1802,22 @@ constant and instantiated twice through a force-inlined wrapper, so the
 three-channel path compiles to what it was. Checked: every non-HLG corpus
 file renders bit-identically to before in the default, `-DJXL_NO_AVX2` and
 `-DJXL_EPF_FORCE_SCALAR` builds.
+
+Whole corpus afterwards, measured the same way as the entry below
+(`bb1769f` against `31010b4`, pinned to CPU 4, two alternating rounds of
+best-of-three, all 1580 files): **0.9966x -> 0.9875x libjxl**. HLG went
+1.50x -> 1.05x; every other preset stayed within the +-2% noise band
+(libjxl's own total swung 22% between rounds -- other agents were busy --
+which the interleaved ratio absorbs). By family: lossless Modular 0.94x,
+lossy VarDCT 1.08x. Still the slowest relative to libjxl, and so the place
+to look next:
+
+| preset | jxldec / libjxl |
+|---|---|
+| `v_pq` (PQ) | 1.34x |
+| `jpeg` (JPEG transcodes) | 1.28x |
+| `v_rs2`, `v_rs4` (resampled frames) | 1.25x, 1.21x |
+| `v_ec8` (alpha at 1/8 resolution) | 1.25x |
 
 ### Re-measured after the conformance work
 The last numbers (1.10x) were from before the audit and the conformance
