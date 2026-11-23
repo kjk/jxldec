@@ -53,21 +53,21 @@ static const uint16_t tr_matrix_dims[17][2] = {
     {8,8},{64,64},{64,32},{128,128},{128,64},{256,256},{256,128}
 };
 
-void jxl_tr_select_size(int tr, uint32_t *bw, uint32_t *bh) {
+static void jxl_tr_select_size(int tr, uint32_t *bw, uint32_t *bh) {
     *bw = tr_size[tr][0];
     *bh = tr_size[tr][1];
 }
 
-int jxl_tr_matrix_index(int tr) { return tr_matrix_idx[tr]; }
-int jxl_tr_order_id(int tr) { return tr_order[tr]; }
+static int jxl_tr_matrix_index(int tr) { return tr_matrix_idx[tr]; }
+static int jxl_tr_order_id(int tr) { return tr_order[tr]; }
 
-void jxl_tr_matrix_size(int tr, uint32_t *w, uint32_t *h) {
+static void jxl_tr_matrix_size(int tr, uint32_t *w, uint32_t *h) {
     int idx = tr_matrix_idx[tr];
     *w = tr_matrix_dims[idx][0];
     *h = tr_matrix_dims[idx][1];
 }
 
-int jxl_tr_need_transpose(int tr) {
+static int jxl_tr_need_transpose(int tr) {
     switch (tr) {
         case JXL_TR_HORNUSS: case JXL_TR_DCT2: case JXL_TR_DCT4:
         case JXL_TR_DCT4X8: case JXL_TR_DCT8X4:
@@ -116,7 +116,7 @@ static void fill_natural_order(uint32_t bw, uint32_t bh, uint16_t *out) {
     }
 }
 
-const uint16_t *jxl_natural_order(jxl_ctx *ctx, jxl_natural_orders *no,
+static const uint16_t *jxl_natural_order(jxl_ctx *ctx, jxl_natural_orders *no,
                                   int order_id) {
     uint32_t bw, bh;
     if (order_id < 0 || order_id >= 13) return NULL;
@@ -1466,7 +1466,13 @@ void jxl_copy_lf_dequant(float *dst, size_t dstride, const jxl_mchan *src,
 }
 
 /* Smooths the LF image where the local gradient is small -- what the encoder
-   assumed when it quantized. */
+   assumed when it quantized. Every output row reads the *unsmoothed* rows
+   above and below it, and rows are smoothed in place top to bottom, so the
+   one row that has already been overwritten when it is needed -- the one
+   above -- is kept in a buffer. That and the up+down sums take three rows
+   per channel, where this used to precompute the sums for the whole image
+   (three planes of width x height floats). The sums are the same additions
+   in the same order, so the output is unchanged. */
 int jxl_adaptive_lf_smoothing(jxl_ctx *ctx, float *plane[3], uint32_t width,
                               uint32_t height, size_t stride,
                               const float m_lf[3], const jxl_quantizer *q) {
@@ -1475,33 +1481,38 @@ int jxl_adaptive_lf_smoothing(jxl_ctx *ctx, float *plane[3], uint32_t width,
     const float scale_diag = 0.03348292f;
     double scale_inv = (double)q->global_scale * (double)q->quant_lf;
     float lf[3];
-    float *udsum[3];
+    float *buf, *up[3], *next_up[3], *ud[3];
+    size_t n;
     uint32_t x, y;
-    int c, rc = -1;
+    int c;
 
-    udsum[0] = udsum[1] = udsum[2] = NULL;
     if (width <= 2 || height <= 2) return 0;
     for (c = 0; c < 3; c++) lf[c] = (float)(512.0 * (double)m_lf[c] / scale_inv);
 
+    if (!jxl_size_mul(width, 9, &n)) return -1;
+    buf = (float *)jxl_malloc(ctx, n * sizeof(float));
+    if (!buf) return -1;
     for (c = 0; c < 3; c++) {
-        udsum[c] = (float *)jxl_calloc(ctx, (size_t)width * (height - 2),
-                                       sizeof(float));
-        if (!udsum[c]) goto done;
-        for (y = 0; y + 2 < height; y++) {
-            const float *up = plane[c] + (size_t)y * stride;
-            const float *down = plane[c] + (size_t)(y + 2) * stride;
-            float *out = udsum[c] + (size_t)y * width;
-            for (x = 0; x < width; x++) out[x] = up[x] + down[x];
-        }
+        up[c] = buf + (size_t)width * (3 * c);
+        next_up[c] = buf + (size_t)width * (3 * c + 1);
+        ud[c] = buf + (size_t)width * (3 * c + 2);
+        /* Row 0 is never smoothed, but keep the loop uniform. */
+        memcpy(up[c], plane[c], (size_t)width * sizeof(float));
     }
 
     for (y = 0; y + 2 < height; y++) {
         float *row[3];
-        const float *ud[3];
         float prev[3];
         for (c = 0; c < 3; c++) {
+            const float *down = plane[c] + (size_t)(y + 2) * stride;
+            float *t;
             row[c] = plane[c] + (size_t)(y + 1) * stride;
-            ud[c] = udsum[c] + (size_t)y * width;
+            for (x = 0; x < width; x++) ud[c][x] = up[c][x] + down[x];
+            /* Row y + 1 as it was, for the row below to read as its up. */
+            memcpy(next_up[c], row[c], (size_t)width * sizeof(float));
+            t = up[c];
+            up[c] = next_up[c];
+            next_up[c] = t;
             prev[c] = row[c][0];
         }
         for (x = 1; x + 1 < width; x++) {
@@ -1523,11 +1534,8 @@ int jxl_adaptive_lf_smoothing(jxl_ctx *ctx, float *plane[3], uint32_t width,
             }
         }
     }
-    rc = 0;
-
-done:
-    for (c = 0; c < 3; c++) jxl_free(ctx, udsum[c]);
-    return rc;
+    jxl_free(ctx, buf);
+    return 0;
 }
 
 void jxl_cfl_lf(float *x, float *y, float *b, uint32_t w, uint32_t h,

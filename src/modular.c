@@ -2129,8 +2129,9 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
        matching note where the palette channel is created). */
     int32_t nb_colours = (int32_t)(tr->nb_colours + tr->nb_deltas);
     int32_t nb_deltas = (int32_t)tr->nb_deltas;
+    /* Which samples are delta entries, predicted in a second pass. Most
+       palettes have none, so the map is only allocated on the first one. */
     uint8_t *need_delta = NULL;
-    int any_delta = 0;
     int rc = -1;
 
     if (cl->n == 0) return -1;
@@ -2152,9 +2153,6 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
     width = targets[0].w;
     height = targets[0].h;
 
-    need_delta = (uint8_t *)jxl_calloc(ctx, (size_t)width * height + 1, 1);
-    if (!need_delta) goto done;
-
     for (y = 0; y < height; y++) {
         int32_t *row0 = targets[0].data + (size_t)y * targets[0].stride;
         for (x = 0; x < width; x++) {
@@ -2169,8 +2167,13 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
                 continue;
             }
             if (index < nb_deltas) {
+                if (!need_delta) {
+                    size_t n;
+                    if (!jxl_size_mul(width, height, &n)) goto done;
+                    need_delta = (uint8_t *)jxl_calloc(ctx, n ? n : 1, 1);
+                    if (!need_delta) goto done;
+                }
                 need_delta[(size_t)y * width + x] = 1;
-                any_delta = 1;
             }
             if (index >= 0 && index < nb_colours) {
                 for (c = 0; c < num_c; c++) {
@@ -2228,7 +2231,7 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
         }
     }
 
-    if (any_delta) {
+    if (need_delta) {
         jxl_pred_state ps;
         memset(&ps, 0, sizeof(ps));
         for (c = 0; c < num_c; c++) {

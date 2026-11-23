@@ -1,0 +1,14 @@
+name: MSVC environment
+description: >
+  Puts the MSVC command-line environment (cl, link, INCLUDE, LIB, ...) for one
+  architecture into the rest of the job. A composite replacement for
+  ilammy/msvc-dev-cmd, whose last release runs on the deprecated Node 20.
+inputs:
+  arch:
+    description: vcvarsall.bat architecture argument (x64, x86, amd64_x86, ...)
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: pwsh
+      run: '& "${{ github.action_path }}/msvc-env.ps1" -Arch "${{ inputs.arch }}"'

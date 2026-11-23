@@ -13,12 +13,10 @@
 #include "jxl_internal.h"
 
 void jxl_patches_free(jxl_ctx *ctx, jxl_patches *p) {
-    uint32_t i, j;
+    uint32_t i;
     if (!p || !p->refs) return;
     for (i = 0; i < p->n; i++) {
-        for (j = 0; j < p->refs[i].ntargets; j++) {
-            jxl_free(ctx, p->refs[i].targets[j].blending);
-        }
+        jxl_free(ctx, p->refs[i].blends);
         jxl_free(ctx, p->refs[i].targets);
     }
     jxl_free(ctx, p->refs);
@@ -82,6 +80,15 @@ int jxl_patches_read(jxl_ctx *ctx, jxl_br *br, const jxl_image_metadata *meta,
                                                      sizeof(jxl_patch_target));
         if (!pr->targets) goto done;
         pr->ntargets = count;
+        /* Every target's blending infos in one block rather than one small
+           allocation each: a dictionary can hold millions of targets. */
+        {
+            size_t nb;
+            if (!jxl_size_mul(count, nblend, &nb)) goto done;
+            pr->blends = (jxl_patch_blend *)jxl_calloc(ctx, nb,
+                                                       sizeof(jxl_patch_blend));
+            if (!pr->blends) goto done;
+        }
 
         for (t = 0; t < count; t++) {
             jxl_patch_target *tg = &pr->targets[t];
@@ -99,9 +106,7 @@ int jxl_patches_read(jxl_ctx *ctx, jxl_br *br, const jxl_image_metadata *meta,
             px = tg->x;
             py = tg->y;
 
-            tg->blending = (jxl_patch_blend *)jxl_calloc(ctx, nblend,
-                                                         sizeof(jxl_patch_blend));
-            if (!tg->blending) goto done;
+            tg->blending = pr->blends + (size_t)t * nblend;
             for (b = 0; b < nblend; b++) {
                 uint32_t raw = jxl_dec_read(&dec, br, 5);
                 if (raw > JXL_PATCH_MULADD_BELOW) {
@@ -443,19 +448,3 @@ int jxl_fimage_blank_like(jxl_ctx *ctx, jxl_fimage *out, const jxl_fimage *like,
     return 0;
 }
 
-int jxl_fimage_copy(jxl_ctx *ctx, jxl_fimage *dst, const jxl_fimage *src) {
-    uint32_t i, y;
-    if (jxl_fimage_alloc(ctx, dst, src->nplane) != 0) return -1;
-    dst->ncolor = src->ncolor;
-    dst->w = src->w;
-    dst->h = src->h;
-    for (i = 0; i < src->nplane; i++) {
-        const jxl_fplane *s = &src->plane[i];
-        if (jxl_fplane_alloc_uninit(ctx, &dst->plane[i], s->w, s->h) != 0) return -1;
-        for (y = 0; y < s->h; y++) {
-            memcpy(dst->plane[i].data + (size_t)y * dst->plane[i].stride,
-                   s->data + (size_t)y * s->stride, (size_t)s->w * sizeof(float));
-        }
-    }
-    return 0;
-}

@@ -43,7 +43,8 @@ int jxl_fplane_alloc(jxl_ctx *ctx, jxl_fplane *p, uint32_t w, uint32_t h) {
  * allocates a canvas and writes nothing -- so making the common allocator
  * uninitialised would turn a blank canvas into whatever the heap last held.
  * That is a disclosure bug, not a rendering one, so each caller was checked
- * individually and only the four that fill their plane completely use this.
+ * individually and only callers that fill their plane completely use this
+ * (grep for it before adding another).
  *
  * -DJXL_FPLANE_ALWAYS_ZERO turns it back into the zeroing version, so the
  * "every sample is written" claim can be diffed rather than trusted. */

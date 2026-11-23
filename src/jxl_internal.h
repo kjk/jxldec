@@ -445,8 +445,6 @@ int jxl_dec_init(jxl_ctx *ctx, jxl_dec *dec, jxl_br *br, uint32_t num_dist);
 void jxl_dec_begin(jxl_dec *dec, jxl_br *br);
 void jxl_dec_free(jxl_dec *dec);
 uint32_t jxl_dec_read(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx);
-uint32_t jxl_dec_read_mult(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx,
-                           uint32_t dist_multiplier);
 /* Same, but the caller already resolved the context to a cluster (the MA
    tree stores cluster indices directly in its leaves). */
 uint32_t jxl_dec_read_clustered(jxl_dec *dec, jxl_br *br, uint32_t cluster,
@@ -848,12 +846,6 @@ typedef enum {
     JXL_TR_DCT128X256, JXL_TR_COUNT
 } jxl_transform_type;
 
-void jxl_tr_select_size(int tr, uint32_t *bw, uint32_t *bh);
-void jxl_tr_matrix_size(int tr, uint32_t *w, uint32_t *h);
-int jxl_tr_matrix_index(int tr);
-int jxl_tr_order_id(int tr);
-int jxl_tr_need_transpose(int tr);
-
 typedef struct {
     uint32_t global_scale;
     uint32_t quant_lf;
@@ -915,8 +907,6 @@ typedef struct {
     uint16_t *order[13];
 } jxl_natural_orders;
 
-const uint16_t *jxl_natural_order(jxl_ctx *ctx, jxl_natural_orders *no,
-                                  int order_id);
 void jxl_natural_orders_free(jxl_ctx *ctx, jxl_natural_orders *no);
 
 void jxl_quantizer_read(jxl_br *br, jxl_quantizer *q);
@@ -1071,7 +1061,7 @@ typedef struct {
 
 typedef struct {
     int32_t x, y;
-    jxl_patch_blend *blending;   /* num_extra + 1 entries */
+    jxl_patch_blend *blending;   /* num_extra + 1 entries, into the ref's blends */
 } jxl_patch_target;
 
 typedef struct {
@@ -1079,6 +1069,7 @@ typedef struct {
     uint32_t x0, y0, width, height;
     jxl_patch_target *targets;
     uint32_t ntargets;
+    jxl_patch_blend *blends;     /* ntargets x (num_extra + 1), one allocation */
 } jxl_patch_ref;
 
 typedef struct {
@@ -1188,7 +1179,6 @@ void jxl_blend_frame(jxl_fimage *canvas, const jxl_fimage *frame,
                      const jxl_image_metadata *meta);
 int jxl_fimage_blank_like(jxl_ctx *ctx, jxl_fimage *out, const jxl_fimage *like,
                           uint32_t w, uint32_t h);
-int jxl_fimage_copy(jxl_ctx *ctx, jxl_fimage *dst, const jxl_fimage *src);
 /* Converts any integer planes (jxl_fplane.idata) to float planes. */
 int jxl_fimage_materialize(jxl_ctx *ctx, jxl_fimage *img);
 int jxl_render_splines(jxl_ctx *ctx, jxl_fimage *img, const jxl_splines *sp,

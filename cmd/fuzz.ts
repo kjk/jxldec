@@ -19,30 +19,16 @@
 //
 // No extra install on Windows: libFuzzer and ASan ship with the VS-bundled
 // clang (or LLVM clang on PATH). On macOS use Homebrew's llvm.
-import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync,
-         rmSync, statSync } from "fs";
-import { basename, join, resolve } from "path";
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "fs";
+import { join, resolve } from "path";
 import { buildFuzz, FUZZ_EXE } from "./build";
-import { corpusFiles } from "./corpus";
-import { getDeps, JXL_OXIDE_DIR, LIBJXL_DIR } from "./get-deps";
+import { externalSeedFiles, seedCorpusIfEmpty } from "./fuzz-seeds";
+import { getDeps } from "./get-deps";
 
 const ROOT = resolve(import.meta.dir, "..");
 const FUZZ = join(ROOT, "fuzz");
 const CORPUS = join(FUZZ, "corpus");
 const CRASHES = join(FUZZ, "crashes");
-
-// Other people's crash reproducers, which are worth far more per byte than
-// anything we generate: each is a minimised input that already broke a JPEG XL
-// decoder. Both live in deps/, which get-deps already fetches, so they are
-// referenced rather than copied into this repo.
-//   libjxl   -- OSS-Fuzz testcases against djxl_fuzzer
-//   jxl-oxide -- regression findings, each named for the bug it caught
-//                (dequant_matrix_band, hf_varblock_across_group, icc_parse_oob)
-const EXTERNAL_SEEDS = [
-  join(LIBJXL_DIR, "testdata", "oss-fuzz"),
-  join(JXL_OXIDE_DIR, "crates", "jxl-oxide-tests", "tests", "fuzz_findings"),
-];
-
 
 function usage(): never {
   console.error(
@@ -123,10 +109,9 @@ if (check) {
   await getDeps();
   const groups: { label: string; files: string[] }[] = [
     { label: "fuzz/crashes", files: listArtifacts().map((f) => join(CRASHES, f)) },
-    ...EXTERNAL_SEEDS.filter(existsSync).map((dir) => ({
+    ...externalSeedFiles().map(({ dir, files }) => ({
       label: dir.replace(/\\/g, "/").replace(/^.*\/deps\//, "deps/"),
-      files: readdirSync(dir).map((n) => join(dir, n))
-        .filter((f) => statSync(f).isFile()),
+      files,
     })),
   ];
   let bad = 0, total = 0;
@@ -170,29 +155,10 @@ if (minimize) {
   process.exit(0);
 }
 
-// First run: seed from the real corpus so mutation starts from valid
-// codestreams rather than random bytes. The generated corpus has unique
-// names by construction, but the shipped .jxl files can collide with them.
+// First run: seed from the real corpus (shared with cmd/fuzz-afl.ts).
 if (readdirSync(CORPUS).length === 0) {
   await getDeps();
-  let n = 0, skipped = 0, ext = 0;
-  const take = (f: string, prefix: string) => {
-    if (statSync(f).size > maxLen) { skipped++; return false; }
-    let dest = join(CORPUS, prefix + basename(f));
-    if (existsSync(dest)) dest = join(CORPUS, `${prefix}${n}_${basename(f)}`);
-    copyFileSync(f, dest);
-    return true;
-  };
-  for (const f of corpusFiles()) if (take(f, "")) n++;
-  for (const dir of EXTERNAL_SEEDS) {
-    if (!existsSync(dir)) continue;
-    for (const name of readdirSync(dir)) {
-      const f = join(dir, name);
-      if (statSync(f).isFile() && take(f, "ext_")) ext++;
-    }
-  }
-  console.log(`seeded corpus with ${n} file(s) + ${ext} external reproducer(s)` +
-              (skipped ? `; ${skipped} skipped as larger than -max-len` : ""));
+  seedCorpusIfEmpty(CORPUS, maxLen);
 }
 
 const before = new Set(listArtifacts());

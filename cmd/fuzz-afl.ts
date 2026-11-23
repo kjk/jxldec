@@ -30,7 +30,7 @@ import {
   rmSync,
   renameSync,
 } from "node:fs";
-import { resolve, join, basename } from "node:path";
+import { resolve, join } from "node:path";
 import { createHash } from "node:crypto";
 import {
   buildAflFuzz,
@@ -38,19 +38,13 @@ import {
   isWindows,
   isMac,
 } from "./build";
-import { getDeps, JXL_OXIDE_DIR, LIBJXL_DIR } from "./get-deps";
-import { corpusFiles } from "./corpus";
+import { getDeps } from "./get-deps";
+import { seedCorpusIfEmpty } from "./fuzz-seeds";
 
 const FUZZ = resolve(import.meta.dir, "..", "fuzz");
 const CORPUS = join(FUZZ, "corpus");
 const CRASHES = join(FUZZ, "crashes");
 const AFL_OUT = join(FUZZ, "afl-out");
-
-// Same external regression seeds as cmd/fuzz.ts: OSS-Fuzz + jxl-oxide findings.
-const EXTERNAL_SEEDS = [
-  join(LIBJXL_DIR, "testdata", "oss-fuzz"),
-  join(JXL_OXIDE_DIR, "crates", "jxl-oxide-tests", "tests", "fuzz_findings"),
-];
 
 function usage(): never {
   console.error(
@@ -118,40 +112,6 @@ function requireTool(name: string): string {
     process.exit(2);
   }
   return p;
-}
-
-/**
- * Seed fuzz/corpus from the generated deps corpus + external OSS-Fuzz /
- * jxl-oxide reproducers when empty (shared with libFuzzer).
- */
-function seedCorpusIfEmpty(limit: number): void {
-  mkdirSync(CORPUS, { recursive: true });
-  if (readdirSync(CORPUS).length > 0) return;
-  let n = 0;
-  let skipped = 0;
-  let ext = 0;
-  const take = (f: string, prefix: string) => {
-    if (statSync(f).size > limit) {
-      skipped++;
-      return false;
-    }
-    let dest = join(CORPUS, prefix + basename(f));
-    if (existsSync(dest)) dest = join(CORPUS, `${prefix}${n}_${basename(f)}`);
-    copyFileSync(f, dest);
-    return true;
-  };
-  for (const f of corpusFiles()) if (take(f, "")) n++;
-  for (const dir of EXTERNAL_SEEDS) {
-    if (!existsSync(dir)) continue;
-    for (const name of readdirSync(dir)) {
-      const f = join(dir, name);
-      if (statSync(f).isFile() && take(f, "ext_")) ext++;
-    }
-  }
-  console.log(
-    `seeded corpus with ${n} file(s) + ${ext} external reproducer(s)` +
-      (skipped ? `; ${skipped} skipped as larger than -max-len` : ""),
-  );
 }
 
 /** List files under dir (non-recursive) that look like fuzzer inputs. */
@@ -325,7 +285,7 @@ if (doImport && !cmin) {
 // Ensure seeds exist before cmin / fuzz.
 if (readdirSync(CORPUS).length === 0) {
   await getDeps();
-  seedCorpusIfEmpty(maxLen);
+  seedCorpusIfEmpty(CORPUS, maxLen);
 }
 if (readdirSync(CORPUS).length === 0) {
   console.error("corpus is empty; fetch deps (bun cmd/get-deps.ts) and retry");

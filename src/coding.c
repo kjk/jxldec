@@ -419,25 +419,32 @@ static void ans_free(jxl_ctx *ctx, jxl_ans_hist *h) {
     h->buckets = NULL;
 }
 
+/* An ANS alphabet has at most 2^8 symbols (log_alphabet_size is 5..8), so
+   every working array here fits on the stack: this runs once per cluster of
+   every entropy-coded stream, and used to make up to eight heap allocations
+   each time. A run of repeats covers at least 4 symbols, hence the 64. */
+#define ANS_MAX_TABLE 256
+#define ANS_MAX_REPEATS (ANS_MAX_TABLE / 4)
+
 static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
                      uint32_t log_alphabet_size) {
     uint32_t table_size = 1u << log_alphabet_size;
     uint32_t log_bucket_size = 12 - log_alphabet_size;
     uint32_t bucket_size = 1u << log_bucket_size;
-    uint16_t *dist = NULL;
+    uint16_t dist[ANS_MAX_TABLE];
     uint32_t alphabet_size = 0;
     uint32_t i;
-    int rc = -1;
     int32_t single_sym = -1;
 
     /* Working arrays for alias-table construction. */
-    uint16_t *cutoff = NULL, *alias_sym = NULL, *alias_off = NULL;
-    uint32_t *underfull = NULL, *overfull = NULL;
+    uint16_t cutoff[ANS_MAX_TABLE], alias_sym[ANS_MAX_TABLE];
+    uint16_t alias_off[ANS_MAX_TABLE];
+    uint32_t underfull[ANS_MAX_TABLE], overfull[ANS_MAX_TABLE];
     uint32_t nunder = 0, nover = 0;
 
     h->buckets = NULL;
-    dist = (uint16_t *)jxl_calloc(ctx, table_size, sizeof(uint16_t));
-    if (!dist) return -1;
+    if (log_alphabet_size > 8) return -1;
+    memset(dist, 0, table_size * sizeof(dist[0]));
 
     if (jxl_br_bool(br)) {
         if (jxl_br_bool(br)) {
@@ -445,9 +452,9 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
             uint32_t v0 = ans_read_u8(br);
             uint32_t v1 = ans_read_u8(br);
             uint32_t prob;
-            if (v0 == v1) goto done;
+            if (v0 == v1) return -1;
             alphabet_size = (v0 > v1 ? v0 : v1) + 1;
-            if (alphabet_size > table_size) goto done;
+            if (alphabet_size > table_size) return -1;
             prob = jxl_br_read(br, 12);
             dist[v0] = (uint16_t)prob;
             dist[v1] = (uint16_t)(ANS_TAB_SIZE - prob);
@@ -455,14 +462,14 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
             /* unary: one symbol takes the whole range */
             uint32_t val = ans_read_u8(br);
             alphabet_size = val + 1;
-            if (alphabet_size > table_size) goto done;
+            if (alphabet_size > table_size) return -1;
             dist[val] = ANS_TAB_SIZE;
         }
     } else if (jxl_br_bool(br)) {
         /* evenly distributed */
         uint32_t base, leftover;
         alphabet_size = ans_read_u8(br) + 1;
-        if (alphabet_size > table_size) goto done;
+        if (alphabet_size > table_size) return -1;
         base = ANS_TAB_SIZE / alphabet_size;
         leftover = ANS_TAB_SIZE % alphabet_size;
         for (i = 0; i < leftover; i++) dist[i] = (uint16_t)(base + 1);
@@ -474,34 +481,24 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
         uint32_t idx = 0, acc = 0;
         uint16_t prev_dist = 0;
         int32_t omit_log = -1, omit_pos = -1;
-        uint32_t *rep_start = NULL, *rep_end = NULL;
-        uint32_t nrep = 0, rep_cap = 0, rep_idx = 0;
+        uint32_t rep_start[ANS_MAX_REPEATS], rep_end[ANS_MAX_REPEATS];
+        uint32_t nrep = 0, rep_idx = 0;
 
         while (len < 3 && jxl_br_bool(br)) len++;
         shift = (int16_t)(jxl_br_read(br, len) + (1u << len) - 1);
-        if (shift > 13) goto done;
+        if (shift > 13) return -1;
         alphabet_size = ans_read_u8(br) + 3;
-        if (alphabet_size > table_size) goto done;
+        if (alphabet_size > table_size) return -1;
 
         while (idx < alphabet_size) {
             dist[idx] = ans_read_prefix(br);
-            if (br->err) { jxl_free(ctx, rep_start); jxl_free(ctx, rep_end); goto done; }
+            if (br->err) return -1;
             if (dist[idx] == 13) {
                 uint32_t repeat_count = ans_read_u8(br) + 4;
-                if (idx + repeat_count > alphabet_size) {
-                    jxl_free(ctx, rep_start);
-                    jxl_free(ctx, rep_end);
-                    goto done;
-                }
-                if (nrep == rep_cap) {
-                    uint32_t ncap = rep_cap ? rep_cap * 2 : 8;
-                    uint32_t *a = (uint32_t *)jxl_realloc_array(ctx, rep_start, rep_cap, ncap, sizeof(uint32_t));
-                    uint32_t *b = (uint32_t *)jxl_realloc_array(ctx, rep_end, rep_cap, ncap, sizeof(uint32_t));
-                    if (!a || !b) { jxl_free(ctx, a); jxl_free(ctx, b); goto done; }
-                    rep_start = a;
-                    rep_end = b;
-                    rep_cap = ncap;
-                }
+                if (idx + repeat_count > alphabet_size) return -1;
+                /* Each run takes >= 4 of <= 256 symbols, so this cannot
+                   fire; it is here so the bound is checked, not assumed. */
+                if (nrep == ANS_MAX_REPEATS) return -1;
                 rep_start[nrep] = idx;
                 rep_end[nrep] = idx + repeat_count;
                 nrep++;
@@ -515,11 +512,8 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
             idx++;
         }
         if (omit_pos < 0 ||
-            ((uint32_t)omit_pos + 1 < table_size && dist[omit_pos + 1] == 13)) {
-            jxl_free(ctx, rep_start);
-            jxl_free(ctx, rep_end);
-            goto done;
-        }
+            ((uint32_t)omit_pos + 1 < table_size && dist[omit_pos + 1] == 13))
+            return -1;
 
         for (i = 0; i < table_size; i++) {
             uint16_t code = dist[i];
@@ -549,18 +543,16 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
             acc += code;
             if (acc > ANS_TAB_SIZE) break;
         }
-        jxl_free(ctx, rep_start);
-        jxl_free(ctx, rep_end);
-        if (acc > ANS_TAB_SIZE) goto done;
+        if (acc > ANS_TAB_SIZE) return -1;
         dist[omit_pos] = (uint16_t)(ANS_TAB_SIZE - acc);
     }
-    if (br->err) goto done;
+    if (br->err) return -1;
 
     h->log_bucket_size = log_bucket_size;
     h->bucket_mask = bucket_size - 1;
     h->buckets = (jxl_ans_bucket *)jxl_calloc(ctx, table_size,
                                               sizeof(jxl_ans_bucket));
-    if (!h->buckets) goto done;
+    if (!h->buckets) return -1;
 
     for (i = 0; i < table_size; i++) {
         if (dist[i] == ANS_TAB_SIZE) { single_sym = (int32_t)i; break; }
@@ -574,16 +566,8 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
             h->buckets[i].alias_cutoff = 0;
             h->buckets[i].alias_dist_xor = (uint16_t)(dist[i] ^ ANS_TAB_SIZE);
         }
-        rc = 0;
-        goto done;
+        return 0;
     }
-
-    cutoff = (uint16_t *)jxl_calloc(ctx, table_size, sizeof(uint16_t));
-    alias_sym = (uint16_t *)jxl_calloc(ctx, table_size, sizeof(uint16_t));
-    alias_off = (uint16_t *)jxl_calloc(ctx, table_size, sizeof(uint16_t));
-    underfull = (uint32_t *)jxl_calloc(ctx, table_size, sizeof(uint32_t));
-    overfull = (uint32_t *)jxl_calloc(ctx, table_size, sizeof(uint32_t));
-    if (!cutoff || !alias_sym || !alias_off || !underfull || !overfull) goto done;
 
     for (i = 0; i < table_size; i++) {
         cutoff[i] = dist[i];
@@ -618,25 +602,11 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
                 (uint16_t)(dist[i] ^ dist[alias_sym[i]]);
         }
     }
-    rc = 0;
-
-done:
-    jxl_free(ctx, dist);
-    jxl_free(ctx, cutoff);
-    jxl_free(ctx, alias_sym);
-    jxl_free(ctx, alias_off);
-    jxl_free(ctx, underfull);
-    jxl_free(ctx, overfull);
-    return rc;
+    return 0;
 }
 
 static uint32_t read_uint(jxl_br *br, const jxl_int_config *cfg,
                           uint32_t token);
-
-static uint32_t ans_read_symbol(const jxl_ans_hist *h, jxl_br *br,
-                                uint32_t *state) {
-    return jxl_ans_read_symbol(h, br, state);
-}
 
 uint32_t jxl_dec_hybrid_uint(jxl_br *br, const jxl_int_config *cfg,
                              uint32_t token) {
@@ -939,7 +909,7 @@ static int lz77_ensure_window(jxl_dec *dec) {
 
 static uint32_t dec_read_symbol(jxl_dec *dec, jxl_br *br, uint32_t cluster) {
     if (dec->use_prefix) return pfx_read(&dec->pfx[cluster], br);
-    return ans_read_symbol(&dec->ans[cluster], br, &dec->state);
+    return jxl_ans_read_symbol(&dec->ans[cluster], br, &dec->state);
 }
 
 /* Reads one integer using an already-resolved cluster index. */
@@ -1015,7 +985,7 @@ uint32_t jxl_dec_read_clustered_no_lz77(jxl_dec *dec, jxl_br *br,
     return read_uint(br, &dec->configs[cluster], token);
 }
 
-uint32_t jxl_dec_read_mult(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx,
+static uint32_t jxl_dec_read_mult(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx,
                            uint32_t dist_multiplier) {
     if (ctx_idx >= dec->num_dist) { dec->err = 1; return 0; }
     return jxl_dec_read_clustered(dec, br, dec->clusters[ctx_idx],

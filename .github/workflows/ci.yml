@@ -31,7 +31,7 @@ jobs:
         with:
           bun-version: latest
       - name: MSVC environment (x64)
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ./.github/actions/msvc-env
         with:
           arch: x64
       - name: Ensure clang-cl on PATH
@@ -88,7 +88,7 @@ jobs:
       # Build the oracle tools as x64 (clang-cl host tools). The harness below
       # is Win32; the two only exchange PAM files, so arch need not match.
       - name: MSVC environment (x64) for oracle tools
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ./.github/actions/msvc-env
         with:
           arch: x64
       - name: Ensure clang-cl on PATH
@@ -121,7 +121,7 @@ jobs:
       - name: Build libjxl oracle (x64)
         run: bun cmd/get-deps.ts
       - name: MSVC environment (x86) for harness
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ./.github/actions/msvc-env
         with:
           arch: x86
       - name: Oracle tests under Win32 cl
