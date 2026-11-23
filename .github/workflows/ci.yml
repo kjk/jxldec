@@ -71,6 +71,8 @@ jobs:
         run: bun cmd/tests.ts -all -all-frames
       - name: Output-stride overflow regression
         run: bun cmd/test-oversize-render.ts
+      - name: jxl_request_abort
+        run: bun cmd/test-abort.ts
       - name: Amalgamation (clang + msvc + msvc-x86)
         # -require-msvc-x86 uses HostX64/x86/cl when the PATH cl is x64, so we
         # catch Win32-only breaks (_BitScanReverse64) on the same job.
@@ -156,6 +158,10 @@ jobs:
         run: bun cmd/tests.ts -all -clang
       - name: Output-stride overflow regression
         run: bun cmd/test-oversize-render.ts -clang
+      - name: jxl_request_abort (ASan + LeakSanitizer)
+        # On Linux ASan also checks for leaks, which is half of what an
+        # aborted render can get wrong.
+        run: bun cmd/test-abort.ts -asan
       - name: Amalgamation (clang + mingw without -mxsave)
         # mingw must not need -mxsave: that is how SumatraPDF Wine CI compiles
         # jxl.c. gcc's _xgetbv is always_inline and fails without it.
@@ -185,5 +191,7 @@ jobs:
         run: bun cmd/tests.ts -all -clang
       - name: Output-stride overflow regression
         run: bun cmd/test-oversize-render.ts -clang
+      - name: jxl_request_abort
+        run: bun cmd/test-abort.ts -clang
       - name: Amalgamation (host clang)
         run: bun cmd/build-dist.ts

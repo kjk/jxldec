@@ -525,6 +525,26 @@ static void pred_state_free(jxl_ctx *ctx, jxl_pred_state *ps) {
     memset(ps, 0, sizeof(*ps));
 }
 
+/* The predictors the fixed-leaf track (JXL_FIXED_LOOP) computes straight
+   from the channel's own rows: everything that reads only W, N and NW. Must
+   list exactly the cases of the switch over JXL_FIXED_LOOP. */
+static int fixed_loop_predictor(uint8_t predictor) {
+    switch (predictor) {
+        case JXL_PRED_ZERO:
+        case JXL_PRED_WEST:
+        case JXL_PRED_NORTH:
+        case JXL_PRED_NORTH_WEST:
+        case JXL_PRED_GRADIENT:
+        case JXL_PRED_AVG_W_N:
+        case JXL_PRED_AVG_W_NW:
+        case JXL_PRED_AVG_N_NW:
+        case JXL_PRED_SELECT:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 static int pred_state_reset(jxl_ctx *ctx, jxl_pred_state *ps, uint32_t width,
                             int need_neighbor_rows,
                             const jxl_wp_header *wp,
@@ -1228,7 +1248,7 @@ static int squeeze_default_params(jxl_ctx *ctx, jxl_transform *tr,
         }
     }
 
-#define SQ_PUSH(horiz)                                                        \
+#define JXL_SQ_PUSH(horiz)                                                        \
     do {                                                                      \
         if (n == cap) {                                                       \
             jxl_sq_param *ns = (jxl_sq_param *)jxl_realloc_array(             \
@@ -1244,14 +1264,14 @@ static int squeeze_default_params(jxl_ctx *ctx, jxl_transform *tr,
     } while (0)
 
     if (h >= w && h > 8) {
-        SQ_PUSH(0);
+        JXL_SQ_PUSH(0);
         h = div_ceil_u32(h, 2);
     }
     while (w > 8 || h > 8) {
-        if (w > 8) { SQ_PUSH(1); w = div_ceil_u32(w, 2); }
-        if (h > 8) { SQ_PUSH(0); h = div_ceil_u32(h, 2); }
+        if (w > 8) { JXL_SQ_PUSH(1); w = div_ceil_u32(w, 2); }
+        if (h > 8) { JXL_SQ_PUSH(0); h = div_ceil_u32(h, 2); }
     }
-#undef SQ_PUSH
+#undef JXL_SQ_PUSH
 
     tr->sp = sp;
     tr->nsp = n;
@@ -3188,7 +3208,15 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
             }
         }
 
-        if (pred_state_reset(ctx, &ps, ch->w, !wp_only_fast,
+        /* The two scratch rows are only read through predict_sample and
+           pred_record. The WP-only track takes its neighbours from the
+           channel, and so do the fixed-leaf tracks below for every
+           predictor JXL_FIXED_LOOP handles (and the rle1 run, which is
+           always gradient); allocating and zeroing them there was waste. */
+        if (pred_state_reset(ctx, &ps, ch->w,
+                             !wp_only_fast &&
+                                 !(fixed && (rle1_fast ||
+                                             fixed_loop_predictor(fixed->predictor))),
                              channel_need_sc ? &m->header.wp : NULL,
                              prev, nprev) != 0)
             goto done;
@@ -3452,6 +3480,8 @@ int jxl_modular_decode(jxl_ctx *ctx, jxl_modular *m, jxl_chanlist *cl,
         }                                                                     \
     }
 
+                /* Keep in step with fixed_loop_predictor: the scratch rows
+                   were only allocated for the default case. */
                 switch (predictor) {
                     case JXL_PRED_ZERO:
                         JXL_FIXED_LOOP(0) break;

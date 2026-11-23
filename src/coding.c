@@ -26,8 +26,8 @@ uint32_t jxl_bitlen(uint32_t x) {
 /* prefix codes                                                           */
 /* ===================================================================== */
 
-#define PFX_MAX_BITS 15
-#define PFX_ROOT_BITS 8
+#define JXL_PFX_MAX_BITS 15
+#define JXL_PFX_ROOT_BITS 8
 
 static uint32_t pfx_entry(uint32_t sym, uint32_t len, uint32_t nested) {
     return sym | (len << 16) | (nested << 24);
@@ -70,10 +70,10 @@ static int pfx_single(jxl_ctx *ctx, jxl_pfx_hist *h, uint16_t sym) {
    L occupies every table slot whose low L bits equal the reversed code. */
 static int pfx_build(jxl_ctx *ctx, jxl_pfx_hist *h, const uint8_t *lens,
                      uint32_t n) {
-    uint32_t count[PFX_MAX_BITS + 1];
-    uint32_t next_code[PFX_MAX_BITS + 2];
-    uint32_t sub_off[1 << PFX_ROOT_BITS];
-    uint8_t sub_maxlen[1 << PFX_ROOT_BITS];
+    uint32_t count[JXL_PFX_MAX_BITS + 1];
+    uint32_t next_code[JXL_PFX_MAX_BITS + 2];
+    uint32_t sub_off[1 << JXL_PFX_ROOT_BITS];
+    uint8_t sub_maxlen[1 << JXL_PFX_ROOT_BITS];
     uint32_t total = 0, sub_total = 0;
     uint32_t code, i, sym;
     int len, max_len = 0, root_bits;
@@ -81,7 +81,7 @@ static int pfx_build(jxl_ctx *ctx, jxl_pfx_hist *h, const uint8_t *lens,
 
     memset(count, 0, sizeof(count));
     for (sym = 0; sym < n; sym++) {
-        if (lens[sym] > PFX_MAX_BITS) return -1;
+        if (lens[sym] > JXL_PFX_MAX_BITS) return -1;
         if (lens[sym]) {
             count[lens[sym]]++;
             if (lens[sym] > max_len) max_len = lens[sym];
@@ -90,8 +90,8 @@ static int pfx_build(jxl_ctx *ctx, jxl_pfx_hist *h, const uint8_t *lens,
     if (max_len == 0) return -1;
 
     /* Kraft equality: the code must be complete. */
-    for (len = 1; len <= max_len; len++) total += count[len] << (PFX_MAX_BITS - len);
-    if (total != (1u << PFX_MAX_BITS)) return -1;
+    for (len = 1; len <= max_len; len++) total += count[len] << (JXL_PFX_MAX_BITS - len);
+    if (total != (1u << JXL_PFX_MAX_BITS)) return -1;
 
     code = 0;
     for (len = 1; len <= max_len; len++) {
@@ -99,14 +99,14 @@ static int pfx_build(jxl_ctx *ctx, jxl_pfx_hist *h, const uint8_t *lens,
         code = (code + count[len]) << 1;
     }
 
-    root_bits = max_len < PFX_ROOT_BITS ? max_len : PFX_ROOT_BITS;
+    root_bits = max_len < JXL_PFX_ROOT_BITS ? max_len : JXL_PFX_ROOT_BITS;
     root_size = 1u << root_bits;
     root_mask = root_size - 1;
 
     /* Pass 1: longest code under each root prefix that needs a sub-table. */
     memset(sub_maxlen, 0, sizeof(sub_maxlen));
     {
-        uint32_t nc[PFX_MAX_BITS + 2];
+        uint32_t nc[JXL_PFX_MAX_BITS + 2];
         memcpy(nc, next_code, sizeof(nc));
         for (len = 1; len <= max_len; len++) {
             for (sym = 0; sym < n; sym++) {
@@ -168,7 +168,7 @@ static int pfx_build(jxl_ctx *ctx, jxl_pfx_hist *h, const uint8_t *lens,
 }
 
 static uint32_t pfx_read(const jxl_pfx_hist *h, jxl_br *br) {
-    uint32_t peeked = jxl_br_peek(br, PFX_MAX_BITS);
+    uint32_t peeked = jxl_br_peek(br, JXL_PFX_MAX_BITS);
     uint32_t e = h->root[peeked & h->root_mask].bits;
     if (e >> 24) {
         uint32_t sym = e & 0xffff;
@@ -228,7 +228,7 @@ static const uint8_t pfx_code_length_order[18] = {
 static int pfx_parse_complex(jxl_ctx *ctx, jxl_br *br, jxl_pfx_hist *h,
                              uint32_t alphabet_size, uint32_t hskip) {
     uint8_t clcl[18];
-    jxl_pfx_entry cl_root[1 << PFX_ROOT_BITS];
+    jxl_pfx_entry cl_root[1 << JXL_PFX_ROOT_BITS];
     jxl_pfx_hist clh;
     uint8_t *lens = NULL;
     uint32_t bitacc = 0;
@@ -273,9 +273,9 @@ static int pfx_parse_complex(jxl_ctx *ctx, jxl_br *br, jxl_pfx_hist *h,
     } else {
         /* Build into a stack-allocated root table (18 symbols, len <= 5, so
            no sub-table is possible). */
-        uint32_t count[PFX_MAX_BITS + 1];
+        uint32_t count[JXL_PFX_MAX_BITS + 1];
         int len, max_len = 0;
-        uint32_t next_code[PFX_MAX_BITS + 2], code = 0, sym, k, step;
+        uint32_t next_code[JXL_PFX_MAX_BITS + 2], code = 0, sym, k, step;
         memset(count, 0, sizeof(count));
         for (sym = 0; sym < 18; sym++) {
             if (clcl[sym]) {
@@ -347,13 +347,13 @@ static int pfx_parse_complex(jxl_ctx *ctx, jxl_br *br, jxl_pfx_hist *h,
             prev_sym = (uint8_t)sym;
         }
         if (lens[i] != 0) {
-            uint32_t shift = lens[i] >= PFX_MAX_BITS ? 0 : (PFX_MAX_BITS - lens[i]);
+            uint32_t shift = lens[i] >= JXL_PFX_MAX_BITS ? 0 : (JXL_PFX_MAX_BITS - lens[i]);
             bitacc += 1u << shift;
-            if (bitacc > (1u << PFX_MAX_BITS)) goto done;
-            if (bitacc == (1u << PFX_MAX_BITS) && repeat_count == 0) break;
+            if (bitacc > (1u << JXL_PFX_MAX_BITS)) goto done;
+            if (bitacc == (1u << JXL_PFX_MAX_BITS) && repeat_count == 0) break;
         }
     }
-    if (bitacc != (1u << PFX_MAX_BITS) || repeat_count > 0) goto done;
+    if (bitacc != (1u << JXL_PFX_MAX_BITS) || repeat_count > 0) goto done;
     rc = pfx_build(ctx, h, lens, alphabet_size);
 
 done:
@@ -370,7 +370,7 @@ static int pfx_parse(jxl_ctx *ctx, jxl_br *br, jxl_pfx_hist *h,
     h->single_symbol = -1;
 
     if (alphabet_size == 1) return pfx_single(ctx, h, 0);
-    if (alphabet_size > (1u << PFX_MAX_BITS)) return -1;
+    if (alphabet_size > (1u << JXL_PFX_MAX_BITS)) return -1;
 
     hskip = jxl_br_read(br, 2);
     if (hskip == 1) return pfx_parse_simple(ctx, br, h, alphabet_size);
@@ -381,10 +381,10 @@ static int pfx_parse(jxl_ctx *ctx, jxl_br *br, jxl_pfx_hist *h,
 /* ANS                                                                    */
 /* ===================================================================== */
 
-#define ANS_LOG_TAB_SIZE 12
-#define ANS_TAB_SIZE (1 << ANS_LOG_TAB_SIZE)
+#define JXL_ANS_LOG_TAB_SIZE 12
+#define JXL_ANS_TAB_SIZE (1 << JXL_ANS_LOG_TAB_SIZE)
 /* A well-formed ANS stream ends with the state back at this value. */
-#define ANS_SIGNATURE 0x130000
+#define JXL_ANS_SIGNATURE 0x130000
 
 static uint32_t ans_read_u8(jxl_br *br) {
     if (jxl_br_bool(br)) {
@@ -423,23 +423,23 @@ static void ans_free(jxl_ctx *ctx, jxl_ans_hist *h) {
    every working array here fits on the stack: this runs once per cluster of
    every entropy-coded stream, and used to make up to eight heap allocations
    each time. A run of repeats covers at least 4 symbols, hence the 64. */
-#define ANS_MAX_TABLE 256
-#define ANS_MAX_REPEATS (ANS_MAX_TABLE / 4)
+#define JXL_ANS_MAX_TABLE 256
+#define JXL_ANS_MAX_REPEATS (JXL_ANS_MAX_TABLE / 4)
 
 static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
                      uint32_t log_alphabet_size) {
     uint32_t table_size = 1u << log_alphabet_size;
-    uint32_t log_bucket_size = 12 - log_alphabet_size;
+    uint32_t log_bucket_size = JXL_ANS_LOG_TAB_SIZE - log_alphabet_size;
     uint32_t bucket_size = 1u << log_bucket_size;
-    uint16_t dist[ANS_MAX_TABLE];
+    uint16_t dist[JXL_ANS_MAX_TABLE];
     uint32_t alphabet_size = 0;
     uint32_t i;
     int32_t single_sym = -1;
 
     /* Working arrays for alias-table construction. */
-    uint16_t cutoff[ANS_MAX_TABLE], alias_sym[ANS_MAX_TABLE];
-    uint16_t alias_off[ANS_MAX_TABLE];
-    uint32_t underfull[ANS_MAX_TABLE], overfull[ANS_MAX_TABLE];
+    uint16_t cutoff[JXL_ANS_MAX_TABLE], alias_sym[JXL_ANS_MAX_TABLE];
+    uint16_t alias_off[JXL_ANS_MAX_TABLE];
+    uint32_t underfull[JXL_ANS_MAX_TABLE], overfull[JXL_ANS_MAX_TABLE];
     uint32_t nunder = 0, nover = 0;
 
     h->buckets = NULL;
@@ -457,21 +457,21 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
             if (alphabet_size > table_size) return -1;
             prob = jxl_br_read(br, 12);
             dist[v0] = (uint16_t)prob;
-            dist[v1] = (uint16_t)(ANS_TAB_SIZE - prob);
+            dist[v1] = (uint16_t)(JXL_ANS_TAB_SIZE - prob);
         } else {
             /* unary: one symbol takes the whole range */
             uint32_t val = ans_read_u8(br);
             alphabet_size = val + 1;
             if (alphabet_size > table_size) return -1;
-            dist[val] = ANS_TAB_SIZE;
+            dist[val] = JXL_ANS_TAB_SIZE;
         }
     } else if (jxl_br_bool(br)) {
         /* evenly distributed */
         uint32_t base, leftover;
         alphabet_size = ans_read_u8(br) + 1;
         if (alphabet_size > table_size) return -1;
-        base = ANS_TAB_SIZE / alphabet_size;
-        leftover = ANS_TAB_SIZE % alphabet_size;
+        base = JXL_ANS_TAB_SIZE / alphabet_size;
+        leftover = JXL_ANS_TAB_SIZE % alphabet_size;
         for (i = 0; i < leftover; i++) dist[i] = (uint16_t)(base + 1);
         for (; i < alphabet_size; i++) dist[i] = (uint16_t)base;
     } else {
@@ -481,7 +481,7 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
         uint32_t idx = 0, acc = 0;
         uint16_t prev_dist = 0;
         int32_t omit_log = -1, omit_pos = -1;
-        uint32_t rep_start[ANS_MAX_REPEATS], rep_end[ANS_MAX_REPEATS];
+        uint32_t rep_start[JXL_ANS_MAX_REPEATS], rep_end[JXL_ANS_MAX_REPEATS];
         uint32_t nrep = 0, rep_idx = 0;
 
         while (len < 3 && jxl_br_bool(br)) len++;
@@ -498,7 +498,7 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
                 if (idx + repeat_count > alphabet_size) return -1;
                 /* Each run takes >= 4 of <= 256 symbols, so this cannot
                    fire; it is here so the bound is checked, not assumed. */
-                if (nrep == ANS_MAX_REPEATS) return -1;
+                if (nrep == JXL_ANS_MAX_REPEATS) return -1;
                 rep_start[nrep] = idx;
                 rep_end[nrep] = idx + repeat_count;
                 nrep++;
@@ -523,7 +523,7 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
                 } else {
                     dist[i] = prev_dist;
                     acc += dist[i];
-                    if (acc > ANS_TAB_SIZE) break;
+                    if (acc > JXL_ANS_TAB_SIZE) break;
                     continue;
                 }
                 code = dist[i];
@@ -541,10 +541,10 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
             }
             prev_dist = code;
             acc += code;
-            if (acc > ANS_TAB_SIZE) break;
+            if (acc > JXL_ANS_TAB_SIZE) break;
         }
-        if (acc > ANS_TAB_SIZE) return -1;
-        dist[omit_pos] = (uint16_t)(ANS_TAB_SIZE - acc);
+        if (acc > JXL_ANS_TAB_SIZE) return -1;
+        dist[omit_pos] = (uint16_t)(JXL_ANS_TAB_SIZE - acc);
     }
     if (br->err) return -1;
 
@@ -555,7 +555,7 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
     if (!h->buckets) return -1;
 
     for (i = 0; i < table_size; i++) {
-        if (dist[i] == ANS_TAB_SIZE) { single_sym = (int32_t)i; break; }
+        if (dist[i] == JXL_ANS_TAB_SIZE) { single_sym = (int32_t)i; break; }
     }
     if (single_sym >= 0) {
         /* Decoding from this histogram must leave the state unchanged. */
@@ -564,7 +564,7 @@ static int ans_parse(jxl_ctx *ctx, jxl_br *br, jxl_ans_hist *h,
             h->buckets[i].alias_symbol = (uint8_t)single_sym;
             h->buckets[i].alias_offset = (uint16_t)(bucket_size * i);
             h->buckets[i].alias_cutoff = 0;
-            h->buckets[i].alias_dist_xor = (uint16_t)(dist[i] ^ ANS_TAB_SIZE);
+            h->buckets[i].alias_dist_xor = (uint16_t)(dist[i] ^ JXL_ANS_TAB_SIZE);
         }
         return 0;
     }
@@ -686,8 +686,8 @@ static const int8_t lz77_special_distances[120][2] = {
     {8,4},{6,7},{-6,7},{7,6},{-7,6},{8,5},{7,7},{-7,7},{8,6},{8,7}
 };
 
-#define LZ77_WINDOW_SIZE (1u << 20)
-#define LZ77_WINDOW_MASK (LZ77_WINDOW_SIZE - 1)
+#define JXL_LZ77_WINDOW_SIZE (1u << 20)
+#define JXL_LZ77_WINDOW_MASK (JXL_LZ77_WINDOW_SIZE - 1)
 
 void jxl_dec_free(jxl_dec *dec) {
     uint32_t i;
@@ -897,11 +897,11 @@ int jxl_dec_init(jxl_ctx *ctx, jxl_dec *dec, jxl_br *br, uint32_t num_dist) {
 static int lz77_ensure_window(jxl_dec *dec) {
     if (dec->window) return 0;
     dec->window = (uint32_t *)jxl_malloc(
-        dec->ctx, (size_t)LZ77_WINDOW_SIZE * sizeof(uint32_t));
+        dec->ctx, (size_t)JXL_LZ77_WINDOW_SIZE * sizeof(uint32_t));
 #ifdef JXL_POISON_UNINIT
     if (dec->window) {
         memset(dec->window, 0xCD,
-               (size_t)LZ77_WINDOW_SIZE * sizeof(uint32_t));
+               (size_t)JXL_LZ77_WINDOW_SIZE * sizeof(uint32_t));
     }
 #endif
     return dec->window ? 0 : -1;
@@ -927,7 +927,7 @@ uint32_t jxl_dec_read_clustered(jxl_dec *dec, jxl_br *br, uint32_t cluster,
     if (lz77_ensure_window(dec) != 0) { dec->err = 1; return 0; }
 
     if (dec->num_to_copy > 0) {
-        r = dec->window[dec->copy_pos & LZ77_WINDOW_MASK];
+        r = dec->window[dec->copy_pos & JXL_LZ77_WINDOW_MASK];
         dec->copy_pos++;
         dec->num_to_copy--;
     } else {
@@ -959,19 +959,19 @@ uint32_t jxl_dec_read_clustered(jxl_dec *dec, jxl_br *br, uint32_t cluster,
             } else {
                 distance -= 120;
             }
-            if (distance > LZ77_WINDOW_MASK) distance = LZ77_WINDOW_MASK;
+            if (distance > JXL_LZ77_WINDOW_MASK) distance = JXL_LZ77_WINDOW_MASK;
             distance += 1;
             if (distance > dec->num_decoded) distance = dec->num_decoded;
             dec->copy_pos = dec->num_decoded - distance;
 
-            r = dec->window[dec->copy_pos & LZ77_WINDOW_MASK];
+            r = dec->window[dec->copy_pos & JXL_LZ77_WINDOW_MASK];
             dec->copy_pos++;
             dec->num_to_copy--;
         } else {
             r = read_uint(br, &dec->configs[cluster], token);
         }
     }
-    dec->window[dec->num_decoded & LZ77_WINDOW_MASK] = r;
+    dec->window[dec->num_decoded & JXL_LZ77_WINDOW_MASK] = r;
     dec->num_decoded++;
     return r;
 }
@@ -1056,7 +1056,7 @@ uint32_t jxl_dec_read_prefix_rle1(jxl_dec *dec, jxl_br *br, uint32_t cluster,
 int jxl_dec_finalize(jxl_dec *dec) {
     if (dec->err) return -1;
     if (dec->use_prefix) return 0;
-    return dec->state == ANS_SIGNATURE ? 0 : -1;
+    return dec->state == JXL_ANS_SIGNATURE ? 0 : -1;
 }
 
 /* ----- permutation (Lehmer code), used by the frame TOC and coef orders --- */

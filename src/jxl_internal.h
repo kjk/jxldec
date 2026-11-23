@@ -449,14 +449,13 @@ uint32_t jxl_dec_read(jxl_dec *dec, jxl_br *br, uint32_t ctx_idx);
    tree stores cluster indices directly in its leaves). */
 uint32_t jxl_dec_read_clustered(jxl_dec *dec, jxl_br *br, uint32_t cluster,
                                 uint32_t dist_multiplier);
-/* Literal-only entropy streams avoid the general LZ77 state machine. */
 /* One ANS symbol. In the header so a sample loop that stays on one cluster
    can keep the state in a register across samples instead of going through
    dec->state and two calls for each. */
 static JXL_INLINE_HINT uint32_t jxl_ans_read_symbol(const jxl_ans_hist *h,
                                                     jxl_br *br,
                                                     uint32_t *state) {
-    uint32_t idx = *state & 0xfff;
+    uint32_t idx = *state & 0xfff;   /* the 12-bit ANS table position */
     uint32_t i = idx >> h->log_bucket_size;
     uint32_t pos = idx & h->bucket_mask;
     const jxl_ans_bucket *b = &h->buckets[i];
@@ -476,6 +475,7 @@ static JXL_INLINE_HINT uint32_t jxl_ans_read_symbol(const jxl_ans_hist *h,
 /* The hybrid-uint tail of a token that is not its own value. */
 uint32_t jxl_dec_hybrid_uint(jxl_br *br, const jxl_int_config *cfg,
                              uint32_t token);
+/* Literal-only entropy streams avoid the general LZ77 state machine. */
 uint32_t jxl_dec_read_clustered_no_lz77(jxl_dec *dec, jxl_br *br,
                                         uint32_t cluster);
 /* Fast path for prefix-coded LZ77 streams whose distance histogram is the

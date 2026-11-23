@@ -71,6 +71,15 @@ PNGs to PNM in TypeScript. Don't re-investigate this.
 - `bun cmd/test-oversize-render.ts [-clang] [-asan]` — unit regression for
   the output-stride overflow guard (`jxl_output_buffer_size`); no corpus
   needed.
+- `bun cmd/test-abort.ts [file.jxl ...] [-clang] [-asan]` — `jxl_request_abort`
+  (`test/abort_test.c`). The allocator callback requests the abort at chosen
+  allocations across a render, so it is deterministic; every aborted render
+  must fail, free everything, and leave the doc rendering the same pixels.
+  A threaded pass then aborts from a second thread. Runs on a default file
+  set (test/data plus a few corpus files, missing ones skipped). Run it after
+  touching anything on a render's error or abort path. Both unit tests are
+  built by `buildUnitTest` in `cmd/build.ts`; a new one is a `test/<name>.c`
+  and a few lines of script.
 - `bun cmd/coverage.ts [-rand N] [-cpu N] [-all-fns] [-reuse]` — decodes the
   corpus under clang source-based coverage and prints per-file line coverage
   plus, more usefully, every function that never ran. Use it before assuming a

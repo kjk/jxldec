@@ -25,7 +25,7 @@
 #include <immintrin.h>
 #endif
 
-#define SPLINE_MAX_POINTS (1u << 20)
+#define JXL_SPLINE_MAX_POINTS (1u << 20)
 
 void jxl_splines_free(jxl_ctx *ctx, jxl_splines *sp) {
     uint32_t i;
@@ -41,8 +41,8 @@ void jxl_splines_free(jxl_ctx *ctx, jxl_splines *sp) {
 /* libjxl's kSplinePosLimit (ValidateSplinePointPos): not in the spec, but it
    rejects anything outside, and it is what keeps the int64 accumulation below
    and the float-to-int conversions in the renderer from overflowing. */
-#define SPLINE_POS_LIMIT ((int64_t)1 << 23)
-#define SPLINE_POS_OK(v) ((v) > -SPLINE_POS_LIMIT && (v) < SPLINE_POS_LIMIT)
+#define JXL_SPLINE_POS_LIMIT ((int64_t)1 << 23)
+#define JXL_SPLINE_POS_OK(v) ((v) > -JXL_SPLINE_POS_LIMIT && (v) < JXL_SPLINE_POS_LIMIT)
 
 int jxl_splines_read(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
                      jxl_splines *out) {
@@ -83,7 +83,7 @@ int jxl_splines_read(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
         sy[i] = prev_y;
     }
     for (i = 0; i < num_splines; i++) {
-        if (!SPLINE_POS_OK(sx[i]) || !SPLINE_POS_OK(sy[i])) {
+        if (!JXL_SPLINE_POS_OK(sx[i]) || !JXL_SPLINE_POS_OK(sy[i])) {
             JXL_ERR(ctx, "splines: coordinates out of bounds");
             goto done;
         }
@@ -104,7 +104,7 @@ int jxl_splines_read(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
         int c, j;
 
         acc_points += num_points;
-        if (acc_points > JXL_MIN((uint64_t)SPLINE_MAX_POINTS, num_pixels / 2)) {
+        if (acc_points > JXL_MIN((uint64_t)JXL_SPLINE_MAX_POINTS, num_pixels / 2)) {
             JXL_ERR(ctx, "splines: too many control points");
             goto done;
         }
@@ -121,8 +121,8 @@ int jxl_splines_read(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
             dy_acc += jxl_unpack_signed(jxl_dec_read(&dec, br, 4));
             cx += dx_acc;
             cy += dy_acc;
-            if (!SPLINE_POS_OK(dx_acc) || !SPLINE_POS_OK(dy_acc) ||
-                !SPLINE_POS_OK(cx) || !SPLINE_POS_OK(cy)) {
+            if (!JXL_SPLINE_POS_OK(dx_acc) || !JXL_SPLINE_POS_OK(dy_acc) ||
+                !JXL_SPLINE_POS_OK(cx) || !JXL_SPLINE_POS_OK(cy)) {
                 JXL_ERR(ctx, "splines: coordinates out of bounds");
                 goto done;
             }

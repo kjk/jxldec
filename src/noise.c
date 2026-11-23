@@ -15,11 +15,11 @@
  */
 #include "jxl_internal.h"
 
-#define NOISE_LANES 8
+#define JXL_NOISE_LANES 8
 
 typedef struct {
-    uint64_t s0[NOISE_LANES];
-    uint64_t s1[NOISE_LANES];
+    uint64_t s0[JXL_NOISE_LANES];
+    uint64_t s1[JXL_NOISE_LANES];
 } jxl_xorshift;
 
 static uint64_t split_mix_64(uint64_t z) {
@@ -32,16 +32,16 @@ static void xorshift_init(jxl_xorshift *r, uint64_t seed0, uint64_t seed1) {
     int i;
     r->s0[0] = split_mix_64(seed0 + 0x9E3779B97F4A7C15ull);
     r->s1[0] = split_mix_64(seed1 + 0x9E3779B97F4A7C15ull);
-    for (i = 1; i < NOISE_LANES; i++) {
+    for (i = 1; i < JXL_NOISE_LANES; i++) {
         r->s0[i] = split_mix_64(r->s0[i - 1]);
         r->s1[i] = split_mix_64(r->s1[i - 1]);
     }
 }
 
-/* One batch is NOISE_LANES u64s, read as 2 * NOISE_LANES little-endian u32s. */
-static void xorshift_batch(jxl_xorshift *r, uint32_t out[NOISE_LANES * 2]) {
+/* One batch is JXL_NOISE_LANES u64s, read as 2 * JXL_NOISE_LANES little-endian u32s. */
+static void xorshift_batch(jxl_xorshift *r, uint32_t out[JXL_NOISE_LANES * 2]) {
     int i;
-    for (i = 0; i < NOISE_LANES; i++) {
+    for (i = 0; i < JXL_NOISE_LANES; i++) {
         uint64_t s1 = r->s0[i];
         uint64_t s0 = r->s1[i];
         uint64_t ret = s1 + s0;
@@ -92,10 +92,10 @@ static uint32_t noise_mirror(int64_t v, uint32_t len) {
    turning those words into [1, 2) floats is then just an integer shift and
    exponent-bit OR. */
 JXL_TARGET_AVX2
-static void xorshift_batch_x8(jxl_xorshift *r, float out[NOISE_LANES * 2]) {
+static void xorshift_batch_x8(jxl_xorshift *r, float out[JXL_NOISE_LANES * 2]) {
     const __m256i exp = _mm256_set1_epi32(0x3f800000u);
     int i;
-    for (i = 0; i < NOISE_LANES; i += 4) {
+    for (i = 0; i < JXL_NOISE_LANES; i += 4) {
         __m256i s1 = _mm256_loadu_si256((const __m256i *)(r->s0 + i));
         __m256i s0 = _mm256_loadu_si256((const __m256i *)(r->s1 + i));
         __m256i ret = _mm256_add_epi64(s1, s0);
@@ -127,21 +127,21 @@ static void noise_random_row(float *dst, uint32_t width, uint32_t y,
     for (gx = 0; gx < groups_per_row; gx++) {
         uint32_t x0 = gx * group_dim;
         uint32_t gw = JXL_MIN(group_dim, width - x0);
-        uint32_t blocks = (gw + NOISE_LANES * 2 - 1) /
-                          (NOISE_LANES * 2);
+        uint32_t blocks = (gw + JXL_NOISE_LANES * 2 - 1) /
+                          (JXL_NOISE_LANES * 2);
         jxl_xorshift *rng = rngs + (size_t)gy * groups_per_row + gx;
         uint32_t b;
         for (b = 0; b < blocks; b++) {
-            uint32_t bx = b * NOISE_LANES * 2;
-            uint32_t valid = JXL_MIN(NOISE_LANES * 2, gw - bx);
+            uint32_t bx = b * JXL_NOISE_LANES * 2;
+            uint32_t valid = JXL_MIN(JXL_NOISE_LANES * 2, gw - bx);
             float *out = dst + x0 + bx;
             uint32_t k;
 #ifdef JXL_NOISE_SSE2
             if (use_avx2) {
-                if (valid == NOISE_LANES * 2) {
+                if (valid == JXL_NOISE_LANES * 2) {
                     xorshift_batch_x8(rng, out);
                 } else {
-                    float values[NOISE_LANES * 2];
+                    float values[JXL_NOISE_LANES * 2];
                     xorshift_batch_x8(rng, values);
                     memcpy(out, values, valid * sizeof(float));
                 }
@@ -151,7 +151,7 @@ static void noise_random_row(float *dst, uint32_t width, uint32_t y,
             (void)use_avx2;
 #endif
             {
-                uint32_t bits[NOISE_LANES * 2];
+                uint32_t bits[JXL_NOISE_LANES * 2];
                 xorshift_batch(rng, bits);
                 for (k = 0; k < valid; k++) out[k] = bits_to_unit(bits[k]);
             }
@@ -406,7 +406,7 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
             uint32_t x0 = gx * group_dim, y0 = gy * group_dim;
             uint32_t gw = JXL_MIN(group_dim, width - x0);
             uint32_t gh = JXL_MIN(group_dim, height - y0);
-            uint32_t blocks = (gw + NOISE_LANES * 2 - 1) / (NOISE_LANES * 2);
+            uint32_t blocks = (gw + JXL_NOISE_LANES * 2 - 1) / (JXL_NOISE_LANES * 2);
             jxl_xorshift rng;
             xorshift_init(&rng, seed0, ((uint64_t)x0 << 32) + y0);
             /* Generate the two independent planes now. Save the state at the
@@ -415,17 +415,17 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
                 uint32_t row, b;
                 for (row = 0; row < gh; row++) {
                     for (b = 0; b < blocks; b++) {
-                        uint32_t bx = b * NOISE_LANES * 2;
-                        uint32_t valid = JXL_MIN(NOISE_LANES * 2, gw - bx);
+                        uint32_t bx = b * JXL_NOISE_LANES * 2;
+                        uint32_t valid = JXL_MIN(JXL_NOISE_LANES * 2, gw - bx);
                         float *dst = raw[c] +
                             (size_t)(y0 + row) * width + x0 + bx;
                         uint32_t k;
 #ifdef JXL_NOISE_SSE2
                         if (use_avx2) {
-                            if (valid == NOISE_LANES * 2) {
+                            if (valid == JXL_NOISE_LANES * 2) {
                                 xorshift_batch_x8(&rng, dst);
                             } else {
-                                float values[NOISE_LANES * 2];
+                                float values[JXL_NOISE_LANES * 2];
                                 xorshift_batch_x8(&rng, values);
                                 memcpy(dst, values, valid * sizeof(float));
                             }
@@ -433,7 +433,7 @@ int jxl_render_noise(jxl_ctx *ctx, jxl_fimage *img, const jxl_noise_params *np,
                         }
 #endif
                         {
-                            uint32_t bits[NOISE_LANES * 2];
+                            uint32_t bits[JXL_NOISE_LANES * 2];
                             xorshift_batch(&rng, bits);
                             for (k = 0; k < valid; k++)
                                 dst[k] = bits_to_unit(bits[k]);

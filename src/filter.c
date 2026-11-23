@@ -523,7 +523,7 @@ static uint32_t epf_row_pass1_avx2(
  * no active block looks at. */
 enum { EPF_F_H1, EPF_F_H2, EPF_F_VA, EPF_F_VB, EPF_F_VC, EPF_F_V2,
        EPF_F_COUNT };
-#define EPF_P0_CHUNK 32u   /* blocks weighted per batch of distances */
+#define JXL_EPF_P0_CHUNK 32u   /* blocks weighted per batch of distances */
 
 /* Octets j0..j1 inclusive of the row at `row`. sig_a and sig_b are the sigma
    rows of this row and of the row two below, which between them cover the
@@ -548,21 +548,21 @@ static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
    registers: as loops over small arrays the compiler kept them in memory.
    The sums start from their first term instead of from zero, which changes
    no value. */
-#define EPF_FWD_ABS(off, cen) \
+#define JXL_EPF_FWD_ABS(off, cen) \
     _mm256_and_ps(absmask, _mm256_sub_ps(_mm256_loadu_ps(p + (off)), cen))
-#define EPF_FWD_TAP(dist, off, FOLD) do {                                  \
-        __m256 acc = EPF_FWD_ABS((off) - s, cen0);                         \
-        acc = _mm256_add_ps(acc, EPF_FWD_ABS((off) + 1, cen1));            \
-        acc = _mm256_add_ps(acc, EPF_FWD_ABS((off), cen2));                \
-        acc = _mm256_add_ps(acc, EPF_FWD_ABS((off) - 1, cen3));            \
-        acc = _mm256_add_ps(acc, EPF_FWD_ABS((off) + s, cen4));            \
+#define JXL_EPF_FWD_TAP(dist, off, FOLD) do {                                  \
+        __m256 acc = JXL_EPF_FWD_ABS((off) - s, cen0);                         \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off) + 1, cen1));            \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off), cen2));                \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off) - 1, cen3));            \
+        acc = _mm256_add_ps(acc, JXL_EPF_FWD_ABS((off) + s, cen4));            \
         acc = _mm256_mul_ps(cs, acc);                                      \
         dist = FOLD(dist, acc);                                            \
     } while (0)
-#define EPF_FWD_FIRST(dist, acc) (acc)
-#define EPF_FWD_NEXT(dist, acc) _mm256_add_ps(dist, acc)
+#define JXL_EPF_FWD_FIRST(dist, acc) (acc)
+#define JXL_EPF_FWD_NEXT(dist, acc) _mm256_add_ps(dist, acc)
 /* The taps are (1,0) (2,0) (-1,1) (0,1) (1,1) (0,2), as EPF_F_*. */
-#define EPF_FWD_CHANNEL(c, scale, FOLD) do {                               \
+#define JXL_EPF_FWD_CHANNEL(c, scale, FOLD) do {                               \
         const float *p = in[c] + row + q;                                  \
         const __m256 cs = (scale);                                         \
         const __m256 cen0 = _mm256_loadu_ps(p - s);                        \
@@ -570,12 +570,12 @@ static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
         const __m256 cen2 = _mm256_loadu_ps(p);                            \
         const __m256 cen3 = _mm256_loadu_ps(p - 1);                        \
         const __m256 cen4 = _mm256_loadu_ps(p + s);                        \
-        EPF_FWD_TAP(d0, 1, FOLD);                                          \
-        EPF_FWD_TAP(d1, 2, FOLD);                                          \
-        EPF_FWD_TAP(d2, s - 1, FOLD);                                      \
-        EPF_FWD_TAP(d3, s, FOLD);                                          \
-        EPF_FWD_TAP(d4, s + 1, FOLD);                                      \
-        EPF_FWD_TAP(d5, 2 * s, FOLD);                                      \
+        JXL_EPF_FWD_TAP(d0, 1, FOLD);                                          \
+        JXL_EPF_FWD_TAP(d1, 2, FOLD);                                          \
+        JXL_EPF_FWD_TAP(d2, s - 1, FOLD);                                      \
+        JXL_EPF_FWD_TAP(d3, s, FOLD);                                          \
+        JXL_EPF_FWD_TAP(d4, s + 1, FOLD);                                      \
+        JXL_EPF_FWD_TAP(d5, 2 * s, FOLD);                                      \
     } while (0)
 
     for (j = j0; j <= j1; j++) {
@@ -586,9 +586,9 @@ static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
             continue;
         if (q + 7 > x1) q = x1 - 7;
         d0 = d1 = d2 = d3 = d4 = d5 = _mm256_setzero_ps();
-        EPF_FWD_CHANNEL(0, cs0, EPF_FWD_FIRST);
-        EPF_FWD_CHANNEL(1, cs1, EPF_FWD_NEXT);
-        EPF_FWD_CHANNEL(2, cs2, EPF_FWD_NEXT);
+        JXL_EPF_FWD_CHANNEL(0, cs0, JXL_EPF_FWD_FIRST);
+        JXL_EPF_FWD_CHANNEL(1, cs1, JXL_EPF_FWD_NEXT);
+        JXL_EPF_FWD_CHANNEL(2, cs2, JXL_EPF_FWD_NEXT);
         _mm256_storeu_ps(dst[EPF_F_H1] + q, d0);
         _mm256_storeu_ps(dst[EPF_F_H2] + q, d1);
         _mm256_storeu_ps(dst[EPF_F_VA] + q, d2);
@@ -596,11 +596,11 @@ static void epf_pass0_fwd_row(float *in[3], size_t row, uint32_t j0,
         _mm256_storeu_ps(dst[EPF_F_VC] + q, d4);
         _mm256_storeu_ps(dst[EPF_F_V2] + q, d5);
     }
-#undef EPF_FWD_CHANNEL
-#undef EPF_FWD_NEXT
-#undef EPF_FWD_FIRST
-#undef EPF_FWD_TAP
-#undef EPF_FWD_ABS
+#undef JXL_EPF_FWD_CHANNEL
+#undef JXL_EPF_FWD_NEXT
+#undef JXL_EPF_FWD_FIRST
+#undef JXL_EPF_FWD_TAP
+#undef JXL_EPF_FWD_ABS
     _mm256_zeroupper();
 }
 
@@ -849,7 +849,7 @@ static int epf_pass(float *in[3], float *out[3], uint32_t w, uint32_t h,
 #ifdef JXL_EPF_SSE2
             if (p0_x1 && y_inside && x == 8) {
                 while (x < p0_x1) {
-                    uint32_t xe = JXL_MIN(x + 8 * EPF_P0_CHUNK, p0_x1);
+                    uint32_t xe = JXL_MIN(x + 8 * JXL_EPF_P0_CHUNK, p0_x1);
                     /* A chunk's first octet was the previous chunk's last. */
                     epf_pass0_fwd_row(
                         in, row, x == 8 ? 1 : x / 8 + 1, xe / 8, p0_x1,
@@ -1082,7 +1082,7 @@ static void epf_copy_active_row(float *dst[3], float *src[3], uint32_t w,
    are real, and writing the row past them slides the newest `keep` rows to
    the front. The bias is applied as an integer because the biased pointer
    itself lies outside the allocation. */
-#define EPF_RING_ROWS 48u
+#define JXL_EPF_RING_ROWS 48u
 typedef struct {
     float *buf[3];
     float *p[3];
@@ -1103,7 +1103,7 @@ static int epf_ring_init(jxl_ctx *ctx, epf_ring *r, size_t stride,
     int c;
     /* One spare row: the kernels load a vector that may start in the last
        columns of a row and run on into the next. */
-    if (!jxl_size_mul(stride, (EPF_RING_ROWS + 1) * sizeof(float), &n))
+    if (!jxl_size_mul(stride, (JXL_EPF_RING_ROWS + 1) * sizeof(float), &n))
         return -1;
     for (c = 0; c < 3; c++) {
         r->buf[c] = (float *)jxl_malloc(ctx, n);
@@ -1118,10 +1118,10 @@ static int epf_ring_init(jxl_ctx *ctx, epf_ring *r, size_t stride,
 /* Makes row y writable. Rows are written in order. */
 static void epf_ring_advance(epf_ring *r, uint32_t y, size_t stride) {
     int c;
-    if (y - r->base < EPF_RING_ROWS) return;
+    if (y - r->base < JXL_EPF_RING_ROWS) return;
     for (c = 0; c < 3; c++) {
         memmove(r->buf[c],
-                r->buf[c] + (size_t)(EPF_RING_ROWS - r->keep) * stride,
+                r->buf[c] + (size_t)(JXL_EPF_RING_ROWS - r->keep) * stride,
                 (size_t)r->keep * stride * sizeof(float));
     }
     r->base = y - r->keep;

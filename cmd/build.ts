@@ -386,6 +386,57 @@ export async function buildAflFuzz(
   return FUZZ_AFL_EXE;
 }
 
+/** Build a standalone test program: the decoder sources plus test/<name>.c,
+ *  into out/msvc/, out/clang/ or out/clang_asan/ beside the main harness
+ *  (sharing its objects). MSVC by default on Windows; asan implies clang.
+ *  Used by the cmd/test-*.ts unit tests. Returns the exe path. */
+export async function buildUnitTest(
+  name: string,
+  opts: { useClang?: boolean; asan?: boolean; clean?: boolean } = {},
+): Promise<string> {
+  const asan = !!opts.asan;
+  const useClang = asan || (opts.useClang ?? defaultUseClang);
+  if (!useClang && !isWindows) throw new Error("MSVC build requires Windows");
+  const dir = asan ? ASAN_DIR : outDir(useClang);
+  const ext = useClang ? "o" : "obj";
+  const exe = `${dir}/${binName(name)}`;
+  const units: CompileUnit[] = [
+    ...SRCS.map((s) => ({
+      src: `${ROOT}/${s}`, obj: `${dir}/${objBase(s)}.${ext}`, label: s,
+    })),
+    { src: `${ROOT}/test/${name}.c`, obj: `${dir}/${name}.${ext}`,
+      label: `test/${name}.c` },
+  ];
+  mkdirSync(dir, { recursive: true });
+  if (opts.clean) {
+    for (const u of units) rmSync(u.obj, { force: true });
+    rmSync(exe, { force: true });
+  }
+  for (const u of units) {
+    if (!needsRebuild(u.obj, u.src, INTERNAL_H, PUBLIC_H)) continue;
+    if (useClang) {
+      const san = asan ? "-fsanitize=address " : "";
+      const cflags = asan ? clangCFlags("-g -O1") : clangCFlags();
+      await runCmd(`clang ${san}${cflags} -I${ROOT}/src -c -o ${u.obj} ${u.src}`);
+    } else {
+      const rel = u.src.slice(ROOT.length + 1);
+      await runCmd(`cl ${JXLDEC_MSVC_CL_C} -Isrc -Fo${dir}/ -c ${rel}`, ROOT);
+    }
+  }
+  const objs = units.map((u) => u.obj);
+  if (needsRebuild(exe, ...objs)) {
+    if (useClang) {
+      const san = asan ? "-fsanitize=address " : "";
+      const libs = isWindows ? "" : " -lm -lpthread";
+      await runCmd(`clang ${san}${objs.join(" ")} -o ${exe}${libs}`);
+    } else {
+      await runCmd(`cl -nologo ${objs.join(" ")} -Fe:${exe} -link -LTCG`, ROOT);
+    }
+  }
+  if (asan && isWindows) await copyAsanRuntimeDll(dir);
+  return exe;
+}
+
 // clang + source-based coverage instrumentation -> out/clang_cov/.
 // -O0 so that no inlining folds one function's lines into another's and a
 // never-executed branch cannot be optimised away before it is counted.
