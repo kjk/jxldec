@@ -94,11 +94,11 @@ for the exceptions.
 
 `bun cmd/bench.ts` links the `dist/` amalgamation and libjxl's static
 libraries into one process and times both, single-threaded. Over the whole
-1580-file corpus we are **about 0.97x libjxl** (0.973x after the PQ,
-HF-coefficient and 8x-upsampling work; 0.988x after the HLG and gray-EPF
-work, 0.993x before that -- see "Re-measured after the conformance work" in
-the log for the method, and the two entries above it for per-preset
-numbers). Before
+1580-file corpus we are **about 0.96x libjxl** (0.965x after banded
+upsampling; 0.973x after the PQ, HF-coefficient and 8x-upsampling work;
+0.988x after the HLG and gray-EPF work, 0.993x before that -- see
+"Re-measured after the conformance work" in the log for the method, and the
+entries above it for per-preset numbers). Before
 that, over the 1245-file corpus, **about 1.10x libjxl** (the best-of-five sweep
 measured 18089.84ms against 16470.12ms, **1.0983x**; an immediately preceding
 best-of-three sweep measured 18195.22ms against 16560.84ms, **1.0987x**;
@@ -1773,6 +1773,46 @@ latency than three adds.
 Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
+
+### Resampled frames: upsample and colour-convert a band of rows at a time
+An upsampled frame used to be materialised in full: every plane upsampled
+into a new full-resolution float buffer (41 MB for three channels at
+2268x1512), then a colour-transform pass over all of it, then the output
+writer reading it all again. First-touch page faults on the new buffers
+alone cost about as much as the filter.
+
+Now, for the displayed frame when nothing else reads the upsampled planes
+(no blending, reference save, noise, spot colour or gray plane-dropping),
+`jxl_frame_decode` leaves the planes at coded resolution and records the
+work (`jxl_fimage.up_shift`, `ct_pending`). `write_pixels` produces each
+input row's N output rows into a small band buffer -- R, G, B and, when it
+was deferred too, alpha -- runs the colour transform on the band while it
+is in cache, and writes it out. Orientations 1..4 stream; 5..8, a frame
+smaller than the canvas, and anything that calls `jxl_fimage_materialize`
+get `jxl_fimage_finish`, which does the deferred work whole, exactly as
+before. Extra channels the writer never reads are no longer upsampled at
+all on the streaming path.
+
+`jxl_upsample_plane` is now a loop over `jxl_upsample_rows`, which the band
+path calls directly, and the colour transform is `jxl_ct_row_linear` /
+`jxl_ct_row_finish` in both places: the same calls on the same rows, so
+every corpus file renders bit-identically to before.
+
+| preset | before | after |
+|---|---|---|
+| `v_rs2` | 1.220x | 1.013x |
+| `v_rs4` | 1.155x | 0.937x |
+| `v_ec8` (colour 2x, alpha 8x) | 1.248x | 1.018x |
+| whole corpus | 0.9753x | **0.9647x** |
+
+Single files: `flower.v_rs4` 28.9 -> 17.9 ms, `flower.v_rs2` 40.0 -> 29.6,
+`flower_alpha.v_rs2` 95.1 -> 80.5. Nothing else moved outside the noise.
+
+Coverage: no file had both resampling and an orientation, so neither the
+streaming path under orientations 2..4 nor the fallback under 5..8 ran.
+`v_rs4` now carries `v_orient`'s spread of EXIF orientations (decoding is
+unchanged by it; all eight values occur across its 73 files), and matches
+the previous build's output on every one.
 
 ### Lossless alpha: the effort-1 loop, and a store-forwarding stall
 Subtracting each decoder's time on `flower.<preset>` from its time on

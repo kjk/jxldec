@@ -70,6 +70,11 @@ int jxl_fimage_alloc(jxl_ctx *ctx, jxl_fimage *img, uint32_t nplane) {
                                           sizeof(jxl_fplane));
     if (!img->plane) return -1;
     img->nplane = nplane;
+    img->up_shift = 0;
+    img->up_nplane = 0;
+    img->up_kernel = NULL;
+    img->ct_pending = 0;
+    img->defer_meta = NULL;
     return 0;
 }
 
@@ -81,13 +86,101 @@ void jxl_fimage_free(jxl_ctx *ctx, jxl_fimage *img) {
         jxl_free(ctx, img->plane[i].idata);
     }
     jxl_free(ctx, img->plane);
+    jxl_free(ctx, img->up_kernel);
     img->plane = NULL;
     img->nplane = 0;
+    img->up_kernel = NULL;
+    img->up_shift = 0;
+    img->ct_pending = 0;
+}
+
+void jxl_fimage_deferred_size(const jxl_fimage *img, uint32_t i, uint32_t *w,
+                              uint32_t *h) {
+    /* As jxl_frame_decode's own upsampling: each plane by the factor,
+       cropped to the frame, so a plane subsampled relative to colour keeps
+       that relationship. */
+    uint32_t tw = img->plane[i].w << img->up_shift;
+    uint32_t th = img->plane[i].h << img->up_shift;
+    *w = tw > img->w ? img->w : tw;
+    *h = th > img->h ? img->h : th;
+}
+
+void jxl_ct_init(jxl_ctx *ctx, const jxl_image_metadata *meta, int ycbcr,
+                 jxl_ct *ct) {
+    memset(ct, 0, sizeof(*ct));
+    ct->meta = meta;
+    ct->enc = meta->colour;
+    if (ycbcr) {
+        ct->mode = JXL_CT_YCBCR;
+        return;
+    }
+    ct->mode = JXL_CT_XYB;
+    jxl_opsin_matrix_for(meta, ct->opsin, ct->luminances);
+    /* An image declaring a linear transfer function decodes to linear
+       light. A caller handing the result straight to a display asks for
+       sRGB instead (jxl_ctx_set_srgb_output), otherwise it comes out dark
+       and over-contrasty. Doing it here keeps it in float, before the
+       8/16-bit quantisation, so the darks do not band. */
+    if (ctx->srgb_output && !ct->enc.tf_have_gamma &&
+        ct->enc.tf == JXL_TF_LINEAR) {
+        ct->enc.tf = JXL_TF_SRGB;
+    }
+}
+
+void jxl_ct_row_linear(const jxl_ct *ct, float *r, float *g, float *b,
+                       uint32_t w) {
+    if (ct->mode == JXL_CT_YCBCR) {
+        jxl_ycbcr_to_rgb(r, g, b, w);
+        return;
+    }
+    jxl_xyb_to_linear(r, g, b, w, ct->opsin, ct->meta->opsin_bias,
+                      ct->meta->tone_mapping.intensity_target);
+}
+
+void jxl_ct_row_finish(const jxl_ct *ct, float *r, float *g, float *b,
+                       uint32_t w) {
+    float it = ct->meta->tone_mapping.intensity_target;
+    if (ct->mode != JXL_CT_XYB) return;
+    if (!ct->enc.tf_have_gamma && ct->enc.tf == JXL_TF_HLG)
+        jxl_hlg_inverse_ootf(r, g, b, w, ct->luminances, it);
+    jxl_linear_to_tf(r, w, &ct->enc, it);
+    jxl_linear_to_tf(g, w, &ct->enc, it);
+    jxl_linear_to_tf(b, w, &ct->enc, it);
+}
+
+int jxl_fimage_finish(jxl_ctx *ctx, jxl_fimage *img) {
+    uint32_t i, row;
+    if (!img || !img->plane) return 0;
+    if (img->up_shift) {
+        for (i = 0; i < img->up_nplane && i < img->nplane; i++) {
+            uint32_t tw, th;
+            jxl_fimage_deferred_size(img, i, &tw, &th);
+            if (jxl_upsample_plane(ctx, &img->plane[i], img->up_shift,
+                                   img->defer_meta, tw, th) != 0)
+                return -1;
+        }
+        jxl_free(ctx, img->up_kernel);
+        img->up_kernel = NULL;
+        img->up_shift = 0;
+    }
+    if (img->ct_pending) {
+        jxl_fplane *p = img->plane;
+        for (row = 0; row < p[0].h; row++) {
+            float *r = p[0].data + (size_t)row * p[0].stride;
+            float *g = p[1].data + (size_t)row * p[1].stride;
+            float *b = p[2].data + (size_t)row * p[2].stride;
+            jxl_ct_row_linear(&img->ct, r, g, b, p[0].w);
+            jxl_ct_row_finish(&img->ct, r, g, b, p[0].w);
+        }
+        img->ct_pending = 0;
+    }
+    return 0;
 }
 
 int jxl_fimage_materialize(jxl_ctx *ctx, jxl_fimage *img) {
     uint32_t i, x, y;
     if (!img || !img->plane) return 0;
+    if (jxl_fimage_finish(ctx, img) != 0) return -1;
     for (i = 0; i < img->nplane; i++) {
         jxl_fplane *p = &img->plane[i];
         int32_t *idata = p->idata;
@@ -824,6 +917,7 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
        late (after patches and splines). Otherwise each extra channel is
        brought to full size by its own factor first, before patches. */
     int late_ec_upsample = fh->upsampling != 1;
+    int defer_up = 0;
     int any_ec_upsample = 0;
     uint32_t nspecs = 0, i, split;
     uint32_t color_w, color_h, group_dim, group_dim_shift;
@@ -1413,7 +1507,23 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
        factor, libjxl upsamples them all here together ("late_ec_upsample").
        Otherwise the extra channels were already brought to full size above
        and only the colour planes are left. */
-    if (color_upsampling_shift > 0) {
+    /* A frame nothing but the output writer reads, whose upsampled planes
+       nothing here touches again (noise does; a gray image drops planes
+       after its colour transform), leaves upsampling and the colour
+       transform to write_pixels -- see jxl_fimage.up_shift. */
+    defer_up = st->lazy_int_ok && color_upsampling_shift > 0 && apply_ct &&
+               !have_noise && out->ncolor >= 3 && out->nplane >= 3 &&
+               meta->colour.colour_space != JXLDEC_CS_GRAY;
+    if (defer_up) {
+        out->up_kernel =
+            jxl_upsample_kernel(ctx, color_upsampling_shift, meta);
+        if (!out->up_kernel) goto done;
+        out->up_shift = color_upsampling_shift;
+        out->up_nplane = late_ec_upsample ? out->nplane : out->ncolor;
+        out->defer_meta = meta;
+        out->w = jxl_frame_sample_width(fh, 1);
+        out->h = jxl_frame_sample_height(fh, 1);
+    } else if (color_upsampling_shift > 0) {
         uint32_t full_w = jxl_frame_sample_width(fh, 1);
         uint32_t full_h = jxl_frame_sample_height(fh, 1);
         for (i = 0; i < (late_ec_upsample ? out->nplane : out->ncolor); i++) {
@@ -1447,66 +1557,45 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
        handed over with their block padding intact. Both conversions run a
        row at a time, which costs nothing -- a row is thousands of samples,
        far more than enough for the vector loops inside. */
-    if (apply_ct && fh->do_ycbcr && out->ncolor >= 3) {
+    if (apply_ct && fh->do_ycbcr && out->ncolor >= 3 &&
+        meta->colour.colour_space == JXLDEC_CS_GRAY) {
         uint32_t row, rows = out->plane[0].h, rw = out->plane[0].w;
-        if (meta->colour.colour_space == JXLDEC_CS_GRAY) {
-            for (row = 0; row < rows; row++) {
-                jxl_ycbcr_to_gray(
-                    out->plane[0].data + (size_t)row * out->plane[0].stride,
-                    out->plane[1].data + (size_t)row * out->plane[1].stride,
-                    out->plane[2].data + (size_t)row * out->plane[2].stride,
-                    rw);
-            }
-            fimage_keep_gray(ctx, out);
-        } else {
-            for (row = 0; row < rows; row++) {
-                jxl_ycbcr_to_rgb(
-                    out->plane[0].data + (size_t)row * out->plane[0].stride,
-                    out->plane[1].data + (size_t)row * out->plane[1].stride,
-                    out->plane[2].data + (size_t)row * out->plane[2].stride,
-                    rw);
-            }
-        }
-    } else if (apply_ct && meta->xyb_encoded && out->ncolor >= 3) {
-        uint32_t row, rows = out->plane[0].h, rw = out->plane[0].w;
-        float opsin[9], luminances[3];
-        jxl_colour_encoding out_enc = meta->colour;
-        jxl_opsin_matrix_for(meta, opsin, luminances);
-        /* An image declaring a linear transfer function decodes to linear
-           light. A caller handing the result straight to a display asks for
-           sRGB instead (jxl_ctx_set_srgb_output), otherwise it comes out dark
-           and over-contrasty. Doing it here keeps it in float, before the
-           8/16-bit quantisation, so the darks do not band. */
-        if (ctx->srgb_output && !out_enc.tf_have_gamma &&
-            out_enc.tf == JXL_TF_LINEAR) {
-            out_enc.tf = JXL_TF_SRGB;
-        }
         for (row = 0; row < rows; row++) {
-            jxl_xyb_to_linear(out->plane[0].data + (size_t)row * out->plane[0].stride,
-                              out->plane[1].data + (size_t)row * out->plane[1].stride,
-                              out->plane[2].data + (size_t)row * out->plane[2].stride,
-                              rw, opsin, meta->opsin_bias,
-                              meta->tone_mapping.intensity_target);
-            if (st->spot_linear) spot_mix_rows(out, meta, row, row + 1);
-            if (!out_enc.tf_have_gamma && out_enc.tf == JXL_TF_HLG) {
-                jxl_hlg_inverse_ootf(
-                    out->plane[0].data + (size_t)row * out->plane[0].stride,
-                    out->plane[1].data + (size_t)row * out->plane[1].stride,
-                    out->plane[2].data + (size_t)row * out->plane[2].stride,
-                    rw, luminances, meta->tone_mapping.intensity_target);
-            }
-            for (i = 0; i < 3; i++) {
-                jxl_linear_to_tf(out->plane[i].data +
-                                     (size_t)row * out->plane[i].stride,
-                                 rw, &out_enc,
-                                 meta->tone_mapping.intensity_target);
+            jxl_ycbcr_to_gray(
+                out->plane[0].data + (size_t)row * out->plane[0].stride,
+                out->plane[1].data + (size_t)row * out->plane[1].stride,
+                out->plane[2].data + (size_t)row * out->plane[2].stride,
+                rw);
+        }
+        fimage_keep_gray(ctx, out);
+    } else if (apply_ct && (fh->do_ycbcr || meta->xyb_encoded) &&
+               out->ncolor >= 3) {
+        jxl_ct ct;
+        jxl_ct_init(ctx, meta, fh->do_ycbcr, &ct);
+        if (defer_up) {
+            out->ct = ct;
+            out->ct_pending = 1;
+        } else {
+            uint32_t row, rows = out->plane[0].h, rw = out->plane[0].w;
+            for (row = 0; row < rows; row++) {
+                float *r = out->plane[0].data + (size_t)row * out->plane[0].stride;
+                float *g = out->plane[1].data + (size_t)row * out->plane[1].stride;
+                float *b = out->plane[2].data + (size_t)row * out->plane[2].stride;
+                jxl_ct_row_linear(&ct, r, g, b, rw);
+                if (ct.mode == JXL_CT_XYB && st->spot_linear)
+                    spot_mix_rows(out, meta, row, row + 1);
+                jxl_ct_row_finish(&ct, r, g, b, rw);
             }
         }
-        if (st->spot_linear) st->spot_done = 1;
-        /* Grayscale XYB decodes into three identical planes; drop two so the
-           extra channels (alpha!) keep their expected plane indices. */
-        if (meta->colour.colour_space == JXLDEC_CS_GRAY && out->ncolor == 3) {
-            fimage_keep_gray(ctx, out);
+        if (ct.mode == JXL_CT_XYB) {
+            if (st->spot_linear) st->spot_done = 1;
+            /* Grayscale XYB decodes into three identical planes; drop two so
+               the extra channels (alpha!) keep their expected plane
+               indices. */
+            if (meta->colour.colour_space == JXLDEC_CS_GRAY &&
+                out->ncolor == 3) {
+                fimage_keep_gray(ctx, out);
+            }
         }
     }
     rc = 0;

@@ -108,7 +108,8 @@ static float up_dot25(const float *a, const float *b) {
    reduction per output, and the result is bit-identical to the scalar path
    rather than merely close to it, which the per-tap version was not. */
 static void up_block4(const float *const *srow, uint32_t x, uint32_t N,
-                      const float *kernel, float *dst_rows[8], uint32_t ny) {
+                      const float *kernel, float *const *dst_rows,
+                      uint32_t ny) {
     __m128 vlo, vhi;
     uint32_t oy, ox;
     int py, px;
@@ -191,7 +192,8 @@ static void up_block4(const float *const *srow, uint32_t x, uint32_t N,
    paths round twice, and all three are diffed against each other. */
 JXL_TARGET_AVX2
 static void up_block8(const float *const *srow, uint32_t x, uint32_t N,
-                      const float *kernel, float *dst_rows[8], uint32_t ny) {
+                      const float *kernel, float *const *dst_rows,
+                      uint32_t ny) {
     __m256 vlo = _mm256_setzero_ps(), vhi = _mm256_setzero_ps();
     uint32_t oy, ox;
     int py, px;
@@ -508,119 +510,133 @@ static const float *weights_for(const jxl_image_metadata *meta, uint32_t shift) 
     return meta->up8;
 }
 
+float *jxl_upsample_kernel(jxl_ctx *ctx, uint32_t shift,
+                            const jxl_image_metadata *meta) {
+    uint32_t N = 1u << shift;
+    float *kernel;
+    if (shift == 0 || shift > 3) return NULL;
+    kernel = (float *)jxl_calloc(ctx, (size_t)N * N * 25, sizeof(float));
+    if (kernel) build_kernel(kernel, shift, weights_for(meta, shift));
+    return kernel;
+}
+
+void jxl_upsample_rows(const jxl_fplane *p, uint32_t shift,
+                       const float *kernel, uint32_t out_w, uint32_t out_h,
+                       uint32_t y, float *const *drows) {
+    uint32_t N = 1u << shift;
+    uint32_t w = p->w, h = p->h, x;
+#ifdef JXL_UPSAMPLE_SSE2
+    const int use_avx2 = jxl_has_avx2();
+    /* Whether this input row's whole N-row output block is inside the
+       crop -- the wide paths below all write N full rows. */
+    const int y_full = (uint64_t)(y + 1) * N <= out_h;
+#endif
+    /* The five source rows depend only on y, so mirror them once per row
+       rather than once per sample -- and inside the row, only the first
+       and last two columns need mirroring at all. */
+    const float *srow[5];
+    int iy;
+    for (iy = -2; iy <= 2; iy++) {
+        srow[iy + 2] = p->data +
+            (size_t)up_mirror((int64_t)y + iy, h) * p->stride;
+    }
+    for (x = 0; x < w; ) {
+        float nb[25];
+        float lo, hi;
+        uint32_t oy, ox, ny, nx;
+        int ix;
+        int n = 0;
+
+#ifdef JXL_UPSAMPLE_SSE2
+        /* Four (or eight) at a time when they are all interior -- no
+           mirroring, so the taps are plain contiguous loads -- and all of
+           them write a whole N-wide block inside the crop. The eight-wide
+           guard needs four more input samples of margin on the right for
+           the last tap, and four more output blocks inside the crop. */
+        if (y_full) {
+            if (use_avx2 && x >= 2 && x + 10 <= w &&
+                (uint64_t)(x + 8) * N <= out_w) {
+                up_block8(srow, x, N, kernel, drows, N);
+                x += 8;
+                continue;
+            }
+            if (x >= 2 && x + 6 <= w && (uint64_t)(x + 4) * N <= out_w) {
+                up_block4(srow, x, N, kernel, drows, N);
+                x += 4;
+                continue;
+            }
+        }
+#endif
+
+        if (x >= 2 && x + 2 < w) {
+            for (iy = 0; iy < 5; iy++) {
+                const float *r = srow[iy] + x - 2;
+                nb[n] = r[0]; nb[n + 1] = r[1]; nb[n + 2] = r[2];
+                nb[n + 3] = r[3]; nb[n + 4] = r[4];
+                n += 5;
+            }
+        } else {
+            for (iy = 0; iy < 5; iy++) {
+                for (ix = -2; ix <= 2; ix++) {
+                    nb[n++] = srow[iy][up_mirror((int64_t)x + ix, w)];
+                }
+            }
+        }
+        up_minmax25(nb, &lo, &hi);
+        /* The image can end mid-block, so the last input sample of a row
+           or column writes fewer than N outputs. Deciding that once per
+           input sample keeps the per-output bounds test out of the two
+           innermost loops, where it never fires except on that last
+           block. */
+        ny = y * N < out_h ? out_h - y * N : 0;
+        if (ny > N) ny = N;
+        nx = x * N < out_w ? out_w - x * N : 0;
+        if (nx > N) nx = N;
+        for (oy = 0; oy < ny; oy++) {
+            float *drow = drows[oy];
+            const float *krow = kernel + ((size_t)oy * N) * 25;
+            uint32_t dx0 = x * N;
+            for (ox = 0; ox < nx; ox++) {
+                float sum = up_dot25(nb, krow + (size_t)ox * 25);
+                if (sum < lo) sum = lo;
+                if (sum > hi) sum = hi;
+                drow[dx0 + ox] = sum;
+            }
+        }
+        x++;
+    }
+}
+
 int jxl_upsample_plane(jxl_ctx *ctx, jxl_fplane *p, uint32_t shift,
                        const jxl_image_metadata *meta, uint32_t out_w,
                        uint32_t out_h) {
     uint32_t N = 1u << shift;
-    uint32_t w = p->w, h = p->h, x, y;
+    uint32_t w = p->w, h = p->h, y;
     float *kernel = NULL;
     jxl_fplane dst;
     int rc = -1;
-#ifdef JXL_UPSAMPLE_SSE2
-    const int use_avx2 = jxl_has_avx2();
-#endif
 
     if (shift == 0 || shift > 3) return 0;
     if (w == 0 || h == 0) return 0;
 
     memset(&dst, 0, sizeof(dst));
-    kernel = (float *)jxl_calloc(ctx, (size_t)N * N * 25, sizeof(float));
+    kernel = jxl_upsample_kernel(ctx, shift, meta);
     if (!kernel) goto done;
-    build_kernel(kernel, shift, weights_for(meta, shift));
 
     /* The upsampled frame is w*N wide but the image may be a few samples
        narrower, so allocate the crop and simply skip the samples past it. */
     if (jxl_fplane_alloc_uninit(ctx, &dst, out_w, out_h) != 0) goto done;
 
     for (y = 0; y < h; y++) {
-        /* Whether this input row's whole N-row output block is inside the
-           crop -- the wide paths below all write N full rows. */
-#ifdef JXL_UPSAMPLE_SSE2
-        const int y_full = (uint64_t)(y + 1) * N <= out_h;
-#endif
-        /* The five source rows depend only on y, so mirror them once per row
-           rather than once per sample -- and inside the row, only the first
-           and last two columns need mirroring at all. */
-        const float *srow[5];
-        int iy;
-        for (iy = -2; iy <= 2; iy++) {
-            srow[iy + 2] = p->data +
-                (size_t)up_mirror((int64_t)y + iy, h) * p->stride;
+        float *drows[8];
+        uint32_t oy;
+        /* Rows past the crop are never written (jxl_upsample_rows stops
+           at out_h), so their pointers only need to exist. */
+        for (oy = 0; oy < N; oy++) {
+            uint32_t r = y * N + oy;
+            drows[oy] = dst.data + (size_t)(r < out_h ? r : 0) * dst.stride;
         }
-        for (x = 0; x < w; ) {
-            float nb[25];
-            float lo, hi;
-            uint32_t oy, ox, ny, nx;
-            int ix;
-            int n = 0;
-
-#ifdef JXL_UPSAMPLE_SSE2
-            /* Four (or eight) at a time when they are all interior -- no
-               mirroring, so the taps are plain contiguous loads -- and all of
-               them write a whole N-wide block inside the crop. The eight-wide
-               guard needs four more input samples of margin on the right for
-               the last tap, and four more output blocks inside the crop. */
-            if (y_full) {
-                float *drows[8];
-                if (use_avx2 && x >= 2 && x + 10 <= w &&
-                    (uint64_t)(x + 8) * N <= out_w) {
-                    for (oy = 0; oy < N; oy++) {
-                        drows[oy] = dst.data +
-                                    (size_t)(y * N + oy) * dst.stride;
-                    }
-                    up_block8(srow, x, N, kernel, drows, N);
-                    x += 8;
-                    continue;
-                }
-                if (x >= 2 && x + 6 <= w && (uint64_t)(x + 4) * N <= out_w) {
-                    for (oy = 0; oy < N; oy++) {
-                        drows[oy] = dst.data +
-                                    (size_t)(y * N + oy) * dst.stride;
-                    }
-                    up_block4(srow, x, N, kernel, drows, N);
-                    x += 4;
-                    continue;
-                }
-            }
-#endif
-
-            if (x >= 2 && x + 2 < w) {
-                for (iy = 0; iy < 5; iy++) {
-                    const float *r = srow[iy] + x - 2;
-                    nb[n] = r[0]; nb[n + 1] = r[1]; nb[n + 2] = r[2];
-                    nb[n + 3] = r[3]; nb[n + 4] = r[4];
-                    n += 5;
-                }
-            } else {
-                for (iy = 0; iy < 5; iy++) {
-                    for (ix = -2; ix <= 2; ix++) {
-                        nb[n++] = srow[iy][up_mirror((int64_t)x + ix, w)];
-                    }
-                }
-            }
-            up_minmax25(nb, &lo, &hi);
-            /* The image can end mid-block, so the last input sample of a row
-               or column writes fewer than N outputs. Deciding that once per
-               input sample keeps the per-output bounds test out of the two
-               innermost loops, where it never fires except on that last
-               block. */
-            ny = y * N < out_h ? out_h - y * N : 0;
-            if (ny > N) ny = N;
-            nx = x * N < out_w ? out_w - x * N : 0;
-            if (nx > N) nx = N;
-            for (oy = 0; oy < ny; oy++) {
-                float *drow = dst.data + (size_t)(y * N + oy) * dst.stride;
-                const float *krow = kernel + ((size_t)oy * N) * 25;
-                uint32_t dx0 = x * N;
-                for (ox = 0; ox < nx; ox++) {
-                    float sum = up_dot25(nb, krow + (size_t)ox * 25);
-                    if (sum < lo) sum = lo;
-                    if (sum > hi) sum = hi;
-                    drow[dx0 + ox] = sum;
-                }
-            }
-            x++;
-        }
+        jxl_upsample_rows(p, shift, kernel, out_w, out_h, y, drows);
     }
 
     jxl_free(ctx, p->data);

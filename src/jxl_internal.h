@@ -1212,6 +1212,25 @@ typedef struct {
     float iscale;
 } jxl_fplane;
 
+/* YCbCr or XYB to the image's colour space, a row at a time. jxl_ct_init
+   settles everything that does not depend on the samples (the opsin matrix,
+   the output transfer function after jxl_ctx_set_srgb_output). An XYB row is
+   two steps because spot colours are mixed in linear light between them;
+   for YCbCr the second step does nothing. */
+enum { JXL_CT_YCBCR = 1, JXL_CT_XYB = 2 };
+typedef struct {
+    int mode;
+    float opsin[9], luminances[3];
+    jxl_colour_encoding enc;
+    const jxl_image_metadata *meta;
+} jxl_ct;
+void jxl_ct_init(jxl_ctx *ctx, const jxl_image_metadata *meta, int ycbcr,
+                 jxl_ct *ct);
+void jxl_ct_row_linear(const jxl_ct *ct, float *r, float *g, float *b,
+                       uint32_t w);
+void jxl_ct_row_finish(const jxl_ct *ct, float *r, float *g, float *b,
+                       uint32_t w);
+
 /* One decoded frame: color planes first, then the extra channels. Planes
    can differ in size when a channel is subsampled. */
 typedef struct {
@@ -1219,6 +1238,20 @@ typedef struct {
     uint32_t nplane;
     uint32_t ncolor;
     uint32_t w, h;      /* the frame's color-plane dimensions */
+    /* Work jxl_frame_decode left for the output writer (see
+       jxl_frame_state.lazy_int_ok): planes [0, up_nplane) are still at
+       1 / (1 << up_shift) resolution, and with ct_pending the colour
+       transform has not run either. write_pixels produces such a frame a
+       band of rows at a time, so its full-resolution float planes -- 41 MB
+       for a 2268x1512 RGB frame, about as costly to fault in as the filter
+       is to run -- never exist. jxl_fimage_finish does the work in full, as
+       jxl_frame_decode would have, for anything else. */
+    uint32_t up_shift;
+    uint32_t up_nplane;
+    float *up_kernel;
+    int ct_pending;
+    jxl_ct ct;
+    const jxl_image_metadata *defer_meta;
 } jxl_fimage;
 
 int jxl_fimage_alloc(jxl_ctx *ctx, jxl_fimage *img, uint32_t nplane);
@@ -1226,6 +1259,11 @@ int jxl_fplane_alloc(jxl_ctx *ctx, jxl_fplane *p, uint32_t w, uint32_t h);
 /* Uninitialised variant -- only for callers that write every sample. */
 int jxl_fplane_alloc_uninit(jxl_ctx *ctx, jxl_fplane *p, uint32_t w, uint32_t h);
 void jxl_fimage_free(jxl_ctx *ctx, jxl_fimage *img);
+/* Runs any upsampling and colour transform jxl_frame_decode deferred. */
+int jxl_fimage_finish(jxl_ctx *ctx, jxl_fimage *img);
+/* The size deferred plane i reaches once upsampled. */
+void jxl_fimage_deferred_size(const jxl_fimage *img, uint32_t i, uint32_t *w,
+                              uint32_t *h);
 
 /* State carried across the frames of one document: the reference slots a
    frame can blend from, and the low-resolution image an LF frame leaves
@@ -1240,7 +1278,8 @@ typedef struct {
     uint32_t invisible_frames;
     /* Set by the caller for a frame whose planes nothing but the output
        writer will read: integer channels may then be handed over as they
-       are instead of being converted to float planes. */
+       are instead of being converted to float planes, and upsampling and
+       the colour transform left for the writer to do a band at a time. */
     int lazy_int_ok;
     /* Set by the frame walk for a wanted frame whose spot colours belong in
        linear light; jxl_frame_decode mixes them during the XYB transform
@@ -1273,6 +1312,15 @@ int jxl_output_buffer_size(int w, int h, int bpp, int *stride, size_t *total);
 /* upsample -- non-separable 2x/4x/8x upsampling                          */
 /* Replaces the plane with its upsample by 1 << shift, cropped to out_w x
    out_h. shift == 0 is a no-op. */
+/* The pieces jxl_upsample_plane is made of, for producing a band of output
+   rows on demand (write_pixels, for a frame whose upsampling was deferred).
+   jxl_upsample_rows writes the up-to-N output rows of input row y --
+   rows y*N .. min(y*N + N, out_h) - 1 -- to drows[0..], each out_w wide. */
+float *jxl_upsample_kernel(jxl_ctx *ctx, uint32_t shift,
+                            const jxl_image_metadata *meta);
+void jxl_upsample_rows(const jxl_fplane *p, uint32_t shift,
+                       const float *kernel, uint32_t out_w, uint32_t out_h,
+                       uint32_t y, float *const *drows);
 int jxl_upsample_plane(jxl_ctx *ctx, jxl_fplane *p, uint32_t shift,
                        const jxl_image_metadata *meta, uint32_t out_w,
                        uint32_t out_h);

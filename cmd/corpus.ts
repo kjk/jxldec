@@ -99,9 +99,18 @@ export const PRESETS:
   // downsamples the input itself, so the output stays the source's size --
   // no blow-up in the corpus. Both are needed: the 2x weight table has a
   // single quadrant (H=1), so only 4x and up exercise the quadrant mirroring
-  // in build_kernel.
+  // in build_kernel. v_rs4 also carries v_orient's spread of EXIF
+  // orientations: write_pixels produces an upsampled frame a band of rows at
+  // a time for orientations 1..4 and upsamples it whole first for 5..8, and
+  // only an upsampled file with an orientation reaches either branch.
   { name: "v_rs2", args: ["-d", "1", "-e", "7", "--resampling=2"] },
-  { name: "v_rs4", args: ["-d", "1", "-e", "7", "--resampling=4"] },
+  {
+    name: "v_rs4",
+    args: (src) => [
+      "-d", "1", "-e", "7", "--resampling=4",
+      "-x", `exif=${exifOrientationBlob(orientationFor(src))}`,
+    ],
+  },
   // Non-sRGB primaries, which nothing covered until now: everything else here
   // comes from PAM, which carries no colour information, so cjxl tags it sRGB
   // -- names like P3-sRGB-color-bars describe their *content*, not their

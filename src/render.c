@@ -424,6 +424,33 @@ static void write_transposed_rgba8(const jxl_out_planes *op,
 }
 #endif
 
+/* The rows of a deferred frame (jxl_fimage.up_shift) that come from input
+   row by: each wanted plane upsampled into its slot of the band -- planes 0,
+   1, 2, then alpha when alpha_pi >= 0 -- and the colour transform run on
+   them. The same calls on the same rows as jxl_fimage_finish, so the same
+   values; only where they land differs. */
+static void band_fill(const jxl_fimage *img, int alpha_pi, float *band,
+                      uint32_t sw, uint32_t sh, uint32_t by) {
+    uint32_t N = 1u << img->up_shift, k, j, ny;
+    size_t psz = (size_t)N * sw;
+    float *rows[8];
+    for (k = 0; k < 4; k++) {
+        int pi = k < 3 ? (int)k : alpha_pi;
+        if (pi < 0) break;
+        for (j = 0; j < N; j++) rows[j] = band + k * psz + (size_t)j * sw;
+        jxl_upsample_rows(&img->plane[pi], img->up_shift, img->up_kernel, sw,
+                          sh, by, rows);
+    }
+    if (!img->ct_pending) return;
+    ny = sh - by * N;
+    if (ny > N) ny = N;
+    for (j = 0; j < ny; j++) {
+        float *r = band + (size_t)j * sw;
+        jxl_ct_row_linear(&img->ct, r, r + psz, r + 2 * psz, sw);
+        jxl_ct_row_finish(&img->ct, r, r + psz, r + 2 * psz, sw);
+    }
+}
+
 static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, jxl_fimage *img,
                         jxl_format fmt, uint8_t *dst, int stride) {
     const jxl_image_metadata *meta = &doc->meta;
@@ -441,10 +468,54 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, jxl_fimage *img,
     int bgr = ctx->bgr;
     /* Row buffers for planes still held as integers (jxl_fplane.idata). */
     float *lazy_rows = NULL;
+    /* A deferred frame's current band: N rows each of R, G, B (and alpha
+       when alpha_pi >= 0), produced from input row band_by. */
+    float *band = NULL;
+    int alpha_pi = -1;
+    uint32_t band_by = 0xffffffffu;
 #ifdef JXL_RENDER_SSE2
     const int use_avx2 = jxl_has_avx2();
 #endif
 
+    /* A frame whose upsampling and colour transform were deferred is
+       produced a band at a time when its rows are wanted in order --
+       orientations 1..4, every plane read reaching the full image size.
+       Anything else gets the work done in full first. */
+    if (img->up_shift || img->ct_pending) {
+        int stream = img->up_shift != 0 && orientation >= 1 &&
+                     orientation <= 4 && img->w == sw && img->h == sh &&
+                     img->nplane >= 3 && img->up_nplane >= 3 && sw > 0 &&
+                     sh > 0;
+        uint32_t i, tw, th;
+        for (i = 0; i < 3 && stream; i++) {
+            jxl_fimage_deferred_size(img, i, &tw, &th);
+            if (tw != sw || th != sh) stream = 0;
+        }
+        if (stream && meta->alpha_index >= 0) {
+            uint32_t ai = img->ncolor + (uint32_t)meta->alpha_index;
+            if (ai < img->up_nplane && ai < img->nplane) {
+                jxl_fimage_deferred_size(img, ai, &tw, &th);
+                if (tw != sw || th != sh) stream = 0;
+                alpha_pi = (int)ai;
+            } else if (ai < img->nplane &&
+                       (!plane_is_full(&img->plane[ai], sw, sh) ||
+                        img->plane[ai].idata)) {
+                stream = 0;
+            }
+        }
+        if (stream) {
+            size_t n;
+            uint32_t nb = alpha_pi >= 0 ? 4 : 3;
+            if (!jxl_size_mul((size_t)sw << img->up_shift,
+                              nb * sizeof(float), &n))
+                return -1;
+            band = (float *)jxl_malloc(ctx, n);
+            if (!band) return -1;
+        } else {
+            alpha_pi = -1;
+            if (jxl_fimage_finish(ctx, img) != 0) return -1;
+        }
+    }
     pick_planes(img, meta, &op);
     jxl_apply_orientation_dims(orientation, sw, sh, &ow, &oh);
 
@@ -459,6 +530,7 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, jxl_fimage *img,
         case JXLDEC_FORMAT_RGBA64: ncomp = 4; has_alpha = 1; wide = 1; break;
         default:
             JXL_ERR(ctx, "render: unsupported output format %d", (int)fmt);
+            jxl_free(ctx, band);
             return -1;
     }
     maxval = wide ? 65535u : 255u;
@@ -476,6 +548,7 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, jxl_fimage *img,
              (gray || (plane_is_full(op.g, sw, sh) &&
                        plane_is_full(op.b, sw, sh))) &&
              (!op.a || plane_is_full(op.a, sw, sh));
+    if (band) direct = 1;
     reverse_x = orientation == 2 || orientation == 3;
     transposed = orientation >= 5;
 
@@ -523,7 +596,23 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, jxl_fimage *img,
                 sy = (orientation == 3 || orientation == 4)
                          ? sh - 1 - oy : oy;
             }
-            if (lazy_rows) {
+            if (band) {
+                /* Not transposed here either (orientations 1..4). */
+                uint32_t by = sy >> img->up_shift;
+                size_t psz = (size_t)sw << img->up_shift;
+                size_t off = (size_t)(sy - (by << img->up_shift)) * sw;
+                if (by != band_by) {
+                    band_fill(img, alpha_pi, band, sw, sh, by);
+                    band_by = by;
+                }
+                pr = band + off;
+                if (!gray) {
+                    pg = pr + psz;
+                    pb = pr + 2 * psz;
+                }
+                if (alpha_pi >= 0) pa = band + 3 * psz + off;
+                else if (op.a) pa = op.a->data + (size_t)sy * op.a->stride;
+            } else if (lazy_rows) {
                 /* Not transposed here, so sx is 0 and a row is sw samples.
                    A gray image written as RGB has all three colours on one
                    plane, which is converted once. */
@@ -791,6 +880,7 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, jxl_fimage *img,
         }
     }
     jxl_free(ctx, lazy_rows);
+    jxl_free(ctx, band);
     return 0;
 }
 
