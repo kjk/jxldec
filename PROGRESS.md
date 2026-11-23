@@ -4,14 +4,14 @@ Milestone log for the C JPEG XL decoder. Newest first.
 
 ## Status summary
 
-`bun cmd/tests.ts -all` — 1579 corpus files (libjxl's testdata images × 23 cjxl
+`bun cmd/tests.ts -all` — 1580 corpus files (libjxl's testdata images × 23 cjxl
 presets, two of them only for sources with alpha; its JPEGs transcoded; the
 `.jxl` files that ship with libjxl; the 24 JPEG XL conformance testcases; and
-the two fixtures in `test/data/`):
+the three fixtures in `test/data/`):
 
 ```
-1579/1579 ok, 0 failed
-548 byte-exact, 1026 within tolerance (worst peak 23.00; 3.00 outside the presets with their own limit), 5 skipped
+1580/1580 ok, 0 failed
+548 byte-exact, 1027 within tolerance (worst peak 23.00; 3.00 outside the presets with their own limit), 5 skipped
 ```
 
 "ok" means byte-identical to `djxl file.jxl out.pam`, or inside the float
@@ -23,7 +23,7 @@ comparably (CMYK and spot colour get extra PAM planes, float samples are
 refused).
 
 `bun cmd/tests.ts -all -all-frames` checks every frame of every file against
-libjxl directly (`test/jxl_ref.c`), skips nothing, and is also 1579/1579.
+libjxl directly (`test/jxl_ref.c`), skips nothing, and is also 1580/1580.
 
 | area | state |
 |---|---|
@@ -1766,6 +1766,17 @@ latency than three adds.
 Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
+
+### A real file with custom dequant tables
+The x64 scale on custom IDENTITY (Hornuss) and DCT2 dequant weights went in
+with the audit, from reading libjxl's `quant_weights.cc`; nothing could check
+it, because `cjxl` always writes default tables. PR #1 (MadameMinty) reported
+the same bug from the other end -- saturated 8x8 specks on every IDENTITY
+block of files written by the `jixel` Rust encoder, seen in SumatraPDF -- and
+came with a reproducer. It is now `test/data/custom_dequant_identity.jxl`
+(attribution in `test/data/README.md`) and decodes within one step of libjxl.
+That verifies encoding mode 1. Mode 2 (DCT2) is the same omission and the
+same fix, and still has no file behind it.
 
 ### The last two rejections: mixed extra-channel resolution, gray spot colour
 Both used to be refused with an error on the grounds that nothing could

@@ -8,7 +8,7 @@ A decode-only [JPEG XL](https://fileformats.dev/jxl) library, in the spirit of
 * simple to integrate: copy `dist/jxl.h` and `dist/jxl.c` into your project.
   That is `src/*` amalgamated into a single translation unit, like sqlite
 * single-threaded by design
-* verified against libjxl on a corpus of 1579 `.jxl` files: libjxl's test
+* verified against libjxl on a corpus of 1580 `.jxl` files: libjxl's test
   images encoded 23 ways, plus the JPEG XL conformance testcases
 
 ## API
@@ -56,11 +56,11 @@ turns on `jxl_ctx_set_srgb_output`. With no option it prints `-info`.
 
 ## Status
 See [PROGRESS.md](PROGRESS.md) for the full feature matrix. In short,
-`bun cmd/tests.ts -all` decodes 1579 corpus files and compares each against
-`djxl`: **all 1579 match — 548 byte-exact, the rest inside the tolerance.**
+`bun cmd/tests.ts -all` decodes 1580 corpus files and compares each against
+`djxl`: **all 1580 match — 548 byte-exact, the rest inside the tolerance.**
 `bun cmd/tests.ts -all -all-frames` then checks *every frame* of every file
 against libjxl itself (`djxl` writes only the first frame of an animation):
-also 1579 of 1579.
+also 1580 of 1580.
 
 * **Byte-exact** against libjxl: Modular lossless (every effort level,
   palette, squeeze, RCT, every predictor), plus patches and reference frames.

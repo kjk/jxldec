@@ -177,9 +177,10 @@ two HDR ones do, and the comment there says exactly why (PQ's slope at black
 turns float noise into tens of 8-bit steps). Do not reach for that to make a
 failing preset pass: every other preset is held to the default limits.
 
-`test/data/` holds fixtures no tool here can produce, made once with
-libjxl's encoder API (`test/gen_gray_spot.c` says how to rebuild them). They
-are part of the corpus.
+`test/data/` holds fixtures no tool here can produce; its README says where
+each came from and what it covers (two were made with libjxl's encoder API,
+`test/gen_gray_spot.c`; one is a third-party file with custom dequant
+tables, CC BY 4.0). They are part of the corpus.
 
 When a decoder bug turns up in a path the corpus does not reach, add the
 `cjxl` flag that reaches it as a preset (`m_rct7` and `m_p13` exist for
