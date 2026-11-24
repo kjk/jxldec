@@ -7,54 +7,27 @@
  *   bun cmd/fuzz.ts      clang -fsanitize=address,fuzzer (libFuzzer supplies main)
  *   bun cmd/fuzz-afl.ts  afl-clang-fast -fsanitize=fuzzer (AFL++ libAFLDriver)
  *
+ * The other targets each take one component on its own (fuzz_headers.c,
+ * fuzz_icc.c, fuzz_entropy.c, fuzz_modular.c) and run thousands of times
+ * faster; this one is what reaches the interactions between them.
+ *
  * The corpus this fuzzer seeds from is 1200+ *valid* files, and a valid file
  * never takes an error path: jxl_errorf, the target of every JXL_ERR in the
  * decoder, does not execute once across the whole of cmd/tests.ts. Everything
  * the decoder does when it is lied to is what this is here to cover.
  */
-#include "jxl.h"
-
-#include <stdlib.h>
-#include <string.h>
-
-/* Budgeted allocator. A crafted size header can declare an enormous canvas,
- * and the decoder has no built-in pixel limit, so bound live bytes instead:
- * such inputs then fail through the library's own allocation-failure paths --
- * which is more of the error handling under test -- rather than tripping
- * libFuzzer's RSS limit and stopping the run. The size lives in a 16-byte
- * header so the returned pointer keeps malloc's alignment. */
-#define FUZZ_MEM_BUDGET ((size_t)512 << 20)   /* live bytes per input */
-
-static size_t fuzz_live;
-
-static void *fuzz_alloc(void *user, void *ctx, size_t size) {
-    uint8_t *p;
-    (void)user;
-    (void)ctx;
-    if (size > FUZZ_MEM_BUDGET - fuzz_live) return NULL;
-    p = (uint8_t *)malloc(size + 16);
-    if (!p) return NULL;
-    memcpy(p, &size, sizeof(size));
-    fuzz_live += size;
-    return p + 16;
-}
-
-static void fuzz_free(void *user, void *ctx, void *ptr) {
-    uint8_t *p;
-    size_t size;
-    (void)user;
-    (void)ctx;
-    if (!ptr) return;
-    p = (uint8_t *)ptr - 16;
-    memcpy(&size, p, sizeof(size));
-    fuzz_live -= size;
-    free(p);
-}
+#include "fuzz_common.h"
 
 /* Animations are decoded in order and each frame costs a full decode, so a
  * crafted header claiming thousands of frames would stall the fuzzer without
  * covering anything new. */
 #define FUZZ_MAX_FRAMES 4
+
+/* Pixels a frame may have and still be rendered. Most of a large image's
+ * time goes on decoding many groups that all take the same paths, so past
+ * this the input buys one execution where a small one buys hundreds; its
+ * headers are still walked. 2 Mpx still spans 32 groups and 2 LF groups. */
+#define FUZZ_MAX_PIXELS ((uint64_t)2 << 20)
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     jxl_ctx *ctx;
@@ -69,8 +42,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
      * mutation budget on inputs jxl_signature_check would reject anyway. */
     if (size < 4) return 0;
 
-    fuzz_live = 0;
-    ctx = jxl_ctx_new(fuzz_alloc, fuzz_free, NULL, NULL);
+    ctx = fuzz_ctx_new();
     if (!ctx) return 0;
 
     /* The context flags are keyed off the input, so every combination gets
@@ -111,23 +83,34 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
     nframes = jxl_doc_frame_count(doc);
     if (nframes > FUZZ_MAX_FRAMES) nframes = FUZZ_MAX_FRAMES;
+    if ((uint64_t)info.width * (uint64_t)info.height > FUZZ_MAX_PIXELS) {
+        for (i = 0; i < nframes; i++) {
+            jxl_frame_info finfo;
+            (void)jxl_doc_frame_info(doc, i, &finfo);
+        }
+        jxl_doc_close(doc);
+        jxl_ctx_free(ctx);
+        return 0;
+    }
+    /* At most two decodes per input. Rendering a frame walks (decodes)
+     * every frame before it, and each render starts over, so rendering
+     * frames 0..3 one by one cost ten frame walks -- and a 145-byte input
+     * declaring five layered 1-Mpx frames ran past the 25 s timeout under
+     * the sanitizers while libjxl, decoding it once, took half a second.
+     * Frame 0 goes through one of the two render entry points, chosen per
+     * input; an animation adds its fourth (or last) frame, whose walk covers
+     * the blending and reference slots of the ones before it. */
     for (i = 0; i < nframes; i++) {
         jxl_frame_info finfo;
-        jxl_image *img;
-        /* NATIVE resolves from the image; the second format forces the
-         * conversion path (gray->rgb, 16->8, alpha attach) instead. */
-        jxl_format fmt = (i & 1) ? JXLDEC_FORMAT_RGBA32 : JXLDEC_FORMAT_NATIVE;
         (void)jxl_doc_frame_info(doc, i, &finfo);
-        img = jxl_frame_render(doc, i, fmt);
-        if (img) jxl_image_destroy(ctx, img);
     }
-
-    /* The caller-buffer path, which is how SumatraPDF renders: the geometry
-     * comes from jxl_frame_render_info and the pixels go straight into a
-     * buffer of exactly that size, so a row written one sample too long is a
-     * heap overflow the sanitizer sees. The stride gets a few bytes of
-     * padding on some inputs to cover stride != width * bpp. */
-    {
+    if (flags & 0x40) {
+        /* The caller-buffer path, which is how SumatraPDF renders: the
+         * geometry comes from jxl_frame_render_info and the pixels go
+         * straight into a buffer of exactly that size, so a row written one
+         * sample too long is a heap overflow the sanitizer sees. The stride
+         * gets a few bytes of padding on some inputs to cover
+         * stride != width * bpp. */
         jxl_render_info ri;
         jxl_format fmt = (flags & 8) ? JXLDEC_FORMAT_RGB24 : JXLDEC_FORMAT_RGBA32;
         if (jxl_frame_render_info(doc, 0, fmt, &ri) == 0 && ri.width > 0 &&
@@ -143,6 +126,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 }
             }
         }
+    } else {
+        /* NATIVE resolves from the image; RGBA32 forces the conversion path
+         * (gray->rgb, 16->8, alpha attach) instead. */
+        jxl_image *img = jxl_frame_render(doc, 0, (flags & 8) ? JXLDEC_FORMAT_RGBA32
+                                                              : JXLDEC_FORMAT_NATIVE);
+        if (img) jxl_image_destroy(ctx, img);
+    }
+    if (nframes > 1) {
+        jxl_image *img = jxl_frame_render(doc, nframes - 1,
+                                          (flags & 0x80) ? JXLDEC_FORMAT_NATIVE
+                                                         : JXLDEC_FORMAT_RGBA32);
+        if (img) jxl_image_destroy(ctx, img);
     }
 
     jxl_doc_close(doc);

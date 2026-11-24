@@ -217,8 +217,9 @@ static float tf_srgb(float s) {
  * own rational polynomial (tf_pq). The gamma and DCI paths still call powf:
  * no corpus file exercises them, so a change there could not be verified.
  *
- * Undefined for x <= 0, as libjxl's is; both callers below test the
- * threshold first, and the vector one selects the lane afterwards. */
+ * For x <= 0 the result is meaningless but well defined -- pure integer and
+ * float arithmetic on the bits, exactly as libjxl's -- and the HLG OOTF
+ * depends on getting libjxl's value there (hlg_ootf_ratio). */
 static float fast_log2f(float x) {
     const float p0 = -1.8503833400518310E-06f, p1 = 1.4287160470083755E+00f;
     const float p2 = 7.4245873327820566E-01f;
@@ -305,14 +306,23 @@ static float tf_hlg(float v) {
     return JXL_HLG_A_LN2 * fast_log2f(12.0f * v - JXL_HLG_B) + JXL_HLG_C;
 }
 
-/* pow(y, e) for the HLG OOTF ratio: libjxl's FastPowf. The argument is held
-   at -126 or above so fast_pow2f's exponent stays a normal float even for a
-   large positive e (a very dim intensity_target) and a denormal y. */
+/* pow(y, e) for the HLG OOTF ratio: libjxl's FastPowf, capped at 1e9 as
+   libjxl caps it -- including for y <= 0, which libjxl does not special-case:
+   a zero luminance gives log2 ~ -127 and, with the usual negative exponent,
+   a ratio in the millions that saturates whatever float noise the channels
+   hold. That is the oracle's output (djxl), so it is ours; an earlier
+   version forced such pixels to black, and the differential fuzzer found
+   the difference on one of libjxl's own OSS-Fuzz testcases. The argument is
+   held to [-126, 30] only to keep fast_pow2f's float-to-int conversion
+   defined (a crafted intensity_target can make e huge): below -126 the ratio
+   is 0 either way, and above 30 it is past the cap either way. A NaN
+   luminance gives 0. */
 static float hlg_ootf_ratio(float y, float e) {
     float a, ratio;
-    if (!(y > 0.0f)) return 0.0f;
+    if (y != y) return 0.0f;
     a = fast_log2f(y) * e;
     if (a < -126.0f) a = -126.0f;
+    if (a > 30.0f) a = 30.0f;
     ratio = fast_pow2f(a);
     return ratio < 1e9f ? ratio : 1e9f;
 }
@@ -611,24 +621,24 @@ static void tf_hlg_x8(float *v, size_t n, size_t *pos) {
 }
 
 /* The OOTF ratio applied to four / eight pixels, as hlg_ootf_ratio. The
-   luminance sum associates left to right like the scalar expression. A lane
-   with y <= 0 (or NaN) computes garbage that the final mask discards; the
-   cap is applied first, which for those lanes changes nothing. */
+   luminance sum associates left to right like the scalar expression. A NaN
+   lane computes garbage that the final mask discards. */
 static void hlg_ootf_x4(float *r, float *g, float *b, size_t n,
                         const float lum[3], float e, size_t *pos) {
     const __m128 l0 = _mm_set1_ps(lum[0]), l1 = _mm_set1_ps(lum[1]);
     const __m128 l2 = _mm_set1_ps(lum[2]), ve = _mm_set1_ps(e);
-    const __m128 lo = _mm_set1_ps(-126.0f), cap = _mm_set1_ps(1e9f);
-    const __m128 zero = _mm_setzero_ps();
+    const __m128 lo = _mm_set1_ps(-126.0f), hi = _mm_set1_ps(30.0f);
+    const __m128 cap = _mm_set1_ps(1e9f);
     size_t i = *pos;
     for (; i + 4 <= n; i += 4) {
         __m128 vr = _mm_loadu_ps(r + i), vg = _mm_loadu_ps(g + i);
         __m128 vb = _mm_loadu_ps(b + i);
         __m128 y = _mm_add_ps(_mm_add_ps(_mm_mul_ps(l0, vr), _mm_mul_ps(l1, vg)),
                               _mm_mul_ps(l2, vb));
-        __m128 a = _mm_max_ps(_mm_mul_ps(fast_log2f_x4(y), ve), lo);
+        __m128 a = _mm_min_ps(_mm_max_ps(_mm_mul_ps(fast_log2f_x4(y), ve), lo),
+                              hi);
         __m128 ratio = _mm_min_ps(fast_pow2f_x4(a), cap);
-        ratio = _mm_and_ps(_mm_cmpgt_ps(y, zero), ratio);
+        ratio = _mm_and_ps(_mm_cmpord_ps(y, y), ratio);
         _mm_storeu_ps(r + i, _mm_mul_ps(vr, ratio));
         _mm_storeu_ps(g + i, _mm_mul_ps(vg, ratio));
         _mm_storeu_ps(b + i, _mm_mul_ps(vb, ratio));
@@ -707,8 +717,8 @@ static void hlg_ootf_x8(float *r, float *g, float *b, size_t n,
                         const float lum[3], float e, size_t *pos) {
     const __m256 l0 = _mm256_set1_ps(lum[0]), l1 = _mm256_set1_ps(lum[1]);
     const __m256 l2 = _mm256_set1_ps(lum[2]), ve = _mm256_set1_ps(e);
-    const __m256 lo = _mm256_set1_ps(-126.0f), cap = _mm256_set1_ps(1e9f);
-    const __m256 zero = _mm256_setzero_ps();
+    const __m256 lo = _mm256_set1_ps(-126.0f), hi = _mm256_set1_ps(30.0f);
+    const __m256 cap = _mm256_set1_ps(1e9f);
     size_t i = *pos;
     for (; i + 8 <= n; i += 8) {
         __m256 vr = _mm256_loadu_ps(r + i), vg = _mm256_loadu_ps(g + i);
@@ -716,9 +726,10 @@ static void hlg_ootf_x8(float *r, float *g, float *b, size_t n,
         __m256 y = _mm256_add_ps(
             _mm256_add_ps(_mm256_mul_ps(l0, vr), _mm256_mul_ps(l1, vg)),
             _mm256_mul_ps(l2, vb));
-        __m256 a = _mm256_max_ps(_mm256_mul_ps(fast_log2f_x8(y), ve), lo);
+        __m256 a = _mm256_min_ps(
+            _mm256_max_ps(_mm256_mul_ps(fast_log2f_x8(y), ve), lo), hi);
         __m256 ratio = _mm256_min_ps(fast_pow2f_x8(a), cap);
-        ratio = _mm256_and_ps(_mm256_cmp_ps(y, zero, _CMP_GT_OQ), ratio);
+        ratio = _mm256_and_ps(_mm256_cmp_ps(y, y, _CMP_ORD_Q), ratio);
         _mm256_storeu_ps(r + i, _mm256_mul_ps(vr, ratio));
         _mm256_storeu_ps(g + i, _mm256_mul_ps(vg, ratio));
         _mm256_storeu_ps(b + i, _mm256_mul_ps(vb, ratio));
@@ -747,10 +758,7 @@ void jxl_hlg_inverse_ootf(float *r, float *g, float *b, size_t n,
     for (; i < n; i++) {
         float y = luminances[0] * r[i] + luminances[1] * g[i] +
                   luminances[2] * b[i];
-        /* Zero or negative luminance is black plus float noise (a fully
-           transparent pixel, typically). A negative exponent would scale
-           that noise by the 1e9 cap into a saturated channel, so it is
-           forced to black instead; libjxl's fast pow is undefined there. */
+        /* Zero or negative luminance included: see hlg_ootf_ratio. */
         float ratio = hlg_ootf_ratio(y, exponent);
         r[i] *= ratio;
         g[i] *= ratio;

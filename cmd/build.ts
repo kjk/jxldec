@@ -182,12 +182,66 @@ export async function buildAsan(): Promise<string> {
   return exe;
 }
 
-// clang + libFuzzer + ASan -> out/fuzz/. Unlike the other variants this one
-// links test/fuzz_target.c instead of test/jxl_test.c, since libFuzzer brings
-// its own main(). No external libraries are involved, so there is nothing here
-// like heicdec's /MD import shim.
-const FUZZ_DIR = `${OUT_ROOT}/fuzz`;
-export const FUZZ_EXE = `${FUZZ_DIR}/${binName("jxl_fuzz")}`;
+// clang + libFuzzer -> out/fuzz/ (ASan, plus UBSan off Windows) or
+// out/fuzz-msan/ (MemorySanitizer, Linux only). One executable per target --
+// test/fuzz_target.c (whole files, "doc") or test/fuzz_<target>.c -- since
+// libFuzzer brings its own main(). The decoder objects are shared by every
+// target in a directory.
+export const FUZZ_TARGETS = ["doc", "headers", "icc", "entropy", "modular", "diff"] as const;
+export type FuzzTarget = typeof FUZZ_TARGETS[number];
+export type FuzzSanitizer = "asan" | "msan";
+
+const fuzzDir = (san: FuzzSanitizer) => `${OUT_ROOT}/${san === "msan" ? "fuzz-msan" : "fuzz"}`;
+
+export function fuzzExe(target: FuzzTarget = "doc", san: FuzzSanitizer = "asan"): string {
+  return `${fuzzDir(san)}/${binName(target === "doc" ? "jxl_fuzz" : `jxl_fuzz_${target}`)}`;
+}
+export const FUZZ_EXE = fuzzExe();
+
+// The doc target also links the TOC-aware custom mutator; AFL++ builds
+// fuzz_target.c alone (see buildAflFuzz).
+const FUZZ_TARGET_SRCS: Record<FuzzTarget, string[]> = {
+  doc: ["test/fuzz_target.c", "test/fuzz_mutator.c"],
+  headers: ["test/fuzz_headers.c"],
+  icc: ["test/fuzz_icc.c"],
+  entropy: ["test/fuzz_entropy.c"],
+  modular: ["test/fuzz_modular.c"],
+  diff: ["test/fuzz_diff.c", "test/fuzz_diff_ours.c"],
+};
+const FUZZ_COMMON_H = `${ROOT}/test/fuzz_common.h`;
+
+function fuzzSanFlags(san: FuzzSanitizer): string {
+  if (san === "msan") {
+    return "-fsanitize=memory,fuzzer -fsanitize-memory-track-origins";
+  }
+  // UBSan rides along with ASan wherever its runtime ships next to
+  // libFuzzer's, so every fuzzing run -- not only crash replay -- stops on
+  // signed overflow, out-of-range shifts and the like. The Windows clang
+  // has no UBSan runtime for this configuration.
+  return isWindows
+    ? "-fsanitize=address,fuzzer"
+    : "-fsanitize=address,undefined,fuzzer -fno-sanitize-recover=undefined";
+}
+
+// libjxl's static libraries, for the differential target. Built by
+// get-deps for cjxl/djxl; on Windows they are MSVC libraries that a
+// clang+libFuzzer link cannot use.
+function libjxlStaticLibs(): string[] {
+  const b = `${ROOT}/deps/libjxl-build`;
+  const libs = [
+    `${b}/lib/libjxl.a`, `${b}/lib/libjxl_cms.a`,
+    `${b}/third_party/brotli/libbrotlidec.a`,
+    `${b}/third_party/brotli/libbrotlicommon.a`,
+    `${b}/third_party/highway/libhwy.a`,
+  ];
+  for (const extra of [`${b}/third_party/libskcms.a`, `${b}/third_party/lcms2/liblcms2.a`,
+                       `${b}/third_party/liblcms2.a`]) {
+    if (existsSync(extra)) libs.push(extra);
+  }
+  const missing = libs.filter((l) => !existsSync(l));
+  if (missing.length) throw new Error(`libjxl static libraries missing: ${missing.join(", ")}`);
+  return libs;
+}
 
 // Apple's clang ships without libFuzzer; Homebrew's has it.
 function findFuzzClang(): string {
@@ -202,61 +256,116 @@ function findFuzzClang(): string {
   return "clang";
 }
 
-export async function buildFuzz(clean = false): Promise<string> {
-  mkdirSync(FUZZ_DIR, { recursive: true });
-  const target = `${ROOT}/test/fuzz_target.c`;
+export async function buildFuzz(target: FuzzTarget = "doc",
+                                san: FuzzSanitizer = "asan",
+                                clean = false): Promise<string> {
+  if (san === "msan" && (isWindows || isMac)) {
+    throw new Error("MemorySanitizer is Linux only");
+  }
+  if (target === "diff" && isWindows) {
+    throw new Error("the diff target links libjxl's static libraries, which are MSVC builds on Windows; run it on Linux or macOS");
+  }
+  if (target === "diff" && san === "msan") {
+    throw new Error("the diff target cannot run under MSan: libjxl is not instrumented");
+  }
+  const dir = fuzzDir(san);
+  const exe = fuzzExe(target, san);
+  mkdirSync(dir, { recursive: true });
+  const mains = FUZZ_TARGET_SRCS[target];
   const units = [
-    ...SRCS.map((s) => ({ src: `${ROOT}/${s}`, obj: `${FUZZ_DIR}/${objBase(s)}.o` })),
-    { src: target, obj: `${FUZZ_DIR}/fuzz_target.o` },
+    ...SRCS.map((s) => ({ src: `${ROOT}/${s}`, obj: `${dir}/${objBase(s)}.o` })),
+    ...mains.map((m) => ({
+      src: `${ROOT}/${m}`,
+      obj: `${dir}/${m.replace(/^test\//, "").replace(/\.c$/, "")}.o`,
+    })),
   ];
   if (clean) {
     for (const u of units) rmSync(u.obj, { force: true });
-    rmSync(FUZZ_EXE, { force: true });
+    rmSync(exe, { force: true });
   }
 
   const cc = findFuzzClang();
-  // -O1 keeps ASan traces readable; the fuzzer is not a benchmark.
-  const flags = `-fsanitize=address,fuzzer ${clangCFlags("-g -O1")}`;
-  const stale = units.filter((u) => needsRebuild(u.obj, u.src, INTERNAL_H, PUBLIC_H));
+  const sanFlags = fuzzSanFlags(san);
+  const inc = target === "diff"
+    ? ` -I${ROOT}/deps/libjxl/lib/include -I${ROOT}/deps/libjxl-build/lib/include`
+    : "";
+  // -O1 keeps sanitizer traces readable; the fuzzer is not a benchmark.
+  const flags = `${sanFlags} ${clangCFlags("-g -O1")} -I${ROOT}/src${inc}`;
+  const stale = units.filter((u) =>
+    needsRebuild(u.obj, u.src, INTERNAL_H, PUBLIC_H, FUZZ_COMMON_H));
   const objs = units.map((u) => u.obj);
-  if (stale.length === 0 && !needsRebuild(FUZZ_EXE, ...objs) && existsSync(FUZZ_EXE)) {
-    if (isWindows) await copyAsanRuntimeDll(FUZZ_DIR);
-    console.log("jxl_fuzz up to date");
-    return FUZZ_EXE;
+  const libjxl = target === "diff" ? libjxlStaticLibs() : [];
+  if (stale.length === 0 && !needsRebuild(exe, ...objs, ...libjxl) && existsSync(exe)) {
+    if (isWindows) await copyAsanRuntimeDll(dir);
+    console.log(`${binName(exe.replace(/^.*\//, ""))} up to date`);
+    return exe;
   }
   try {
     for (const u of stale) {
-      await runCmd(`${cc} ${flags} -I${ROOT}/src -c -o ${u.obj} ${u.src}`);
+      await runCmd(`${cc} ${flags} -c -o ${u.obj} ${u.src}`);
     }
-    if (needsRebuild(FUZZ_EXE, ...objs)) {
+    if (needsRebuild(exe, ...objs, ...libjxl)) {
       // ASan inflates stack frames and the Modular/VarDCT paths nest deeply;
       // Windows' default 1MB is tight once the fuzzer starts shrinking inputs.
       const stack = isWindows ? " -Wl,/STACK:8388608" : "";
+      // libjxl is C++: link with clang++ so its runtime comes along.
+      const linker = target === "diff" ? cc.replace(/clang(-\d+)?$/, "clang++$1") : cc;
       const libs = isWindows ? "" : " -lpthread -lm";
-      await runCmd(`${cc} -fsanitize=address,fuzzer ${objs.join(" ")}` +
-                   `${stack}${libs} -o ${FUZZ_EXE}`);
+      await runCmd(`${linker} ${sanFlags} ${objs.join(" ")} ${libjxl.join(" ")}` +
+                   `${stack}${libs} -o ${exe}`);
     }
   } catch (e) {
     if (isMac && cc === "clang") {
       console.error("\nfuzz build failed: Apple's clang has no libFuzzer.");
       console.error("  brew install llvm   (then re-run; it is auto-detected)\n");
     } else if (!isWindows && !isMac) {
-      // Debian/Ubuntu ship libFuzzer and the ASan runtime in a separate
-      // package from clang itself; a missing one fails at link time.
+      // Debian/Ubuntu ship libFuzzer and the sanitizer runtimes in a
+      // separate package from clang itself; a missing one fails at link time.
       console.error("\nfuzz build failed. On Debian/Ubuntu, libFuzzer is in");
       console.error("  libclang-rt-<N>-dev   (N = clang's major version)\n");
     }
     throw e;
   }
-  if (isWindows) await copyAsanRuntimeDll(FUZZ_DIR);
-  console.log("built jxl_fuzz");
-  return FUZZ_EXE;
+  if (isWindows) await copyAsanRuntimeDll(dir);
+  console.log(`built ${exe}`);
+  return exe;
+}
+
+// The seed extractor for the component targets (test/fuzz_seeds.c): the
+// decoder built with -DJXL_FUZZ_SEEDS, no sanitizer, in its own directory
+// since the define changes every object.
+const FUZZ_SEEDS_DIR = `${OUT_ROOT}/fuzz-seeds`;
+export const FUZZ_SEEDS_EXE = `${FUZZ_SEEDS_DIR}/${binName("jxl_fuzz_seeds")}`;
+
+export async function buildFuzzSeeds(): Promise<string> {
+  mkdirSync(FUZZ_SEEDS_DIR, { recursive: true });
+  const units = [
+    ...SRCS.map((s) => ({ src: `${ROOT}/${s}`, obj: `${FUZZ_SEEDS_DIR}/${objBase(s)}.o` })),
+    { src: `${ROOT}/test/fuzz_seeds.c`, obj: `${FUZZ_SEEDS_DIR}/fuzz_seeds.o` },
+  ];
+  const flags = `-DJXL_FUZZ_SEEDS ${clangCFlags("-O1")} -I${ROOT}/src`;
+  for (const u of units) {
+    if (!needsRebuild(u.obj, u.src, INTERNAL_H, PUBLIC_H)) continue;
+    await runCmd(`clang ${flags} -c -o ${u.obj} ${u.src}`);
+  }
+  const objs = units.map((u) => u.obj);
+  if (needsRebuild(FUZZ_SEEDS_EXE, ...objs)) {
+    const libm = isWindows ? "" : " -lm";
+    await runCmd(`clang ${objs.join(" ")} -o ${FUZZ_SEEDS_EXE}${libm}`);
+  }
+  return FUZZ_SEEDS_EXE;
 }
 
 /* ----- AFL++ target (driven by cmd/fuzz-afl.ts; macOS / *nix) ----- */
 
 const FUZZ_AFL_DIR = `${OUT_ROOT}/fuzz-afl`;
 export const FUZZ_AFL_EXE = `${FUZZ_AFL_DIR}/jxl_afl`;
+// The CmpLog companion: the same harness with AFL_LLVM_CMPLOG, which logs
+// every comparison's operands so afl-fuzz -c can solve magic values and
+// checksums byte-mutation cannot reach. Built without sanitizers, as AFL++
+// recommends -- it only ever runs to collect comparisons.
+const FUZZ_AFL_CMPLOG_DIR = `${OUT_ROOT}/fuzz-afl-cmplog`;
+export const FUZZ_AFL_CMPLOG_EXE = `${FUZZ_AFL_CMPLOG_DIR}/jxl_afl_cmplog`;
 
 /** Prefer Homebrew AFL++ wrappers (afl-clang-fast → Homebrew LLVM). */
 export function findAflCc(): string {
@@ -288,7 +397,7 @@ export function aflTool(name: string): string | null {
 // with afl-clang-fast -fsanitize=fuzzer (AFL++ swaps that for libAFLDriver.a
 // + persistent-mode shared-memory input). Optional ASan via AFL_USE_ASAN.
 export async function buildAflFuzz(
-  opts: { clean?: boolean; asan?: boolean } = {},
+  opts: { clean?: boolean; asan?: boolean; cmplog?: boolean } = {},
 ): Promise<string> {
   if (isWindows) {
     throw new Error(
@@ -296,8 +405,12 @@ export async function buildAflFuzz(
     );
   }
   const clean = !!opts.clean;
-  const asan = opts.asan !== false; // default on
-  mkdirSync(FUZZ_AFL_DIR, { recursive: true });
+  const cmplog = !!opts.cmplog;
+  const asan = !cmplog && opts.asan !== false; // default on; never for CmpLog
+  const dir = cmplog ? FUZZ_AFL_CMPLOG_DIR : FUZZ_AFL_DIR;
+  const exe = cmplog ? FUZZ_AFL_CMPLOG_EXE : FUZZ_AFL_EXE;
+  const label = cmplog ? "jxl_afl_cmplog" : "jxl_afl";
+  mkdirSync(dir, { recursive: true });
 
   const cc = findAflCc();
   const ccOk =
@@ -316,13 +429,13 @@ export async function buildAflFuzz(
   const units: { src: string; obj: string }[] = [
     ...SRCS.map((s) => ({
       src: `${ROOT}/${s}`,
-      obj: `${FUZZ_AFL_DIR}/${objBase(s)}.o`,
+      obj: `${dir}/${objBase(s)}.o`,
     })),
-    { src: testSrc, obj: `${FUZZ_AFL_DIR}/fuzz_target.o` },
+    { src: testSrc, obj: `${dir}/fuzz_target.o` },
   ];
 
-  const stampWant = `asan=${asan ? 1 : 0};cc=${cc}`;
-  const stampPath = `${FUZZ_AFL_DIR}/.afl_features`;
+  const stampWant = `asan=${asan ? 1 : 0};ubsan=${asan ? 1 : 0};cmplog=${cmplog ? 1 : 0};cc=${cc}`;
+  const stampPath = `${dir}/.afl_features`;
   const stampPrev = existsSync(stampPath)
     ? readFileSync(stampPath, "utf8").trim()
     : "";
@@ -330,17 +443,17 @@ export async function buildAflFuzz(
 
   if (clean || stampChanged) {
     for (const u of units) rmSync(u.obj, { force: true });
-    rmSync(FUZZ_AFL_EXE, { force: true });
+    rmSync(exe, { force: true });
   }
 
-  const headers = [INTERNAL_H, PUBLIC_H];
+  const headers = [INTERNAL_H, PUBLIC_H, FUZZ_COMMON_H];
   const objStale = (u: { src: string; obj: string }) =>
     needsRebuild(u.obj, u.src, ...headers);
   const staleObj = units.some(objStale);
-  const staleExe = needsRebuild(FUZZ_AFL_EXE, ...units.map((u) => u.obj));
-  if (!staleObj && !staleExe && existsSync(FUZZ_AFL_EXE) && !stampChanged) {
-    console.log("jxl_afl up to date");
-    return FUZZ_AFL_EXE;
+  const staleExe = needsRebuild(exe, ...units.map((u) => u.obj));
+  if (!staleObj && !staleExe && existsSync(exe) && !stampChanged) {
+    console.log(`${label} up to date`);
+    return exe;
   }
 
   // -O1 for readable ASan traces; -fsanitize=fuzzer → AFL++ libAFLDriver.
@@ -353,11 +466,19 @@ export async function buildAflFuzz(
     AFL_LLVM_NO_ERROR: process.env.AFL_LLVM_NO_ERROR ?? "1",
     AFL_QUIET: process.env.AFL_QUIET ?? "1",
   };
-  if (asan) env.AFL_USE_ASAN = "1";
-  else delete env.AFL_USE_ASAN;
+  // UBSan rides along with ASan, as in cmd/fuzz.ts.
+  if (asan) {
+    env.AFL_USE_ASAN = "1";
+    env.AFL_USE_UBSAN = "1";
+  } else {
+    delete env.AFL_USE_ASAN;
+    delete env.AFL_USE_UBSAN;
+  }
+  if (cmplog) env.AFL_LLVM_CMPLOG = "1";
+  else delete env.AFL_LLVM_CMPLOG;
 
   console.log(
-    `building jxl_afl (afl-clang-fast+fuzzer${asan ? "+asan" : ""})...`,
+    `building ${label} (afl-clang-fast+fuzzer${asan ? "+asan+ubsan" : ""}${cmplog ? "+cmplog" : ""})...`,
   );
   try {
     for (const u of units) {
@@ -367,8 +488,8 @@ export async function buildAflFuzz(
         .env(env);
     }
     const objs = units.map((u) => u.obj);
-    if (needsRebuild(FUZZ_AFL_EXE, ...objs) || stampChanged) {
-      await $`${cc} -fsanitize=fuzzer ${{ raw: objs.join(" ") }} -lpthread -lm -o ${FUZZ_AFL_EXE}`
+    if (needsRebuild(exe, ...objs) || stampChanged) {
+      await $`${cc} -fsanitize=fuzzer ${{ raw: objs.join(" ") }} -lpthread -lm -o ${exe}`
         .cwd(ROOT)
         .env(env);
     }
@@ -382,8 +503,8 @@ export async function buildAflFuzz(
     throw e;
   }
   writeFileSync(stampPath, stampWant);
-  console.log("built jxl_afl");
-  return FUZZ_AFL_EXE;
+  console.log(`built ${label}`);
+  return exe;
 }
 
 /** Build a standalone test program: the decoder sources plus test/<name>.c,

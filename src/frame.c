@@ -483,11 +483,13 @@ int jxl_read_toc(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
                 goto done;
             }
             toc->entries[i].offset = offs[b];
+            toc->entries[i].size = sizes[b];
         }
         jxl_free(ctx, offs);
     } else {
         for (i = 0; i < entry_count; i++) {
             toc->entries[i].offset = acc;
+            toc->entries[i].size = sizes[i];
             acc += sizes[i];
             toc->total_size += sizes[i];
         }

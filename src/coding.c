@@ -864,6 +864,16 @@ void jxl_dec_begin(jxl_dec *dec, jxl_br *br) {
 }
 
 int jxl_dec_init(jxl_ctx *ctx, jxl_dec *dec, jxl_br *br, uint32_t num_dist) {
+#ifdef JXL_FUZZ_SEEDS
+    {
+        uint8_t p[4];
+        p[0] = (uint8_t)num_dist;
+        p[1] = (uint8_t)(num_dist >> 8);
+        p[2] = (uint8_t)(num_dist >> 16);
+        p[3] = (uint8_t)(num_dist >> 24);
+        JXL_FUZZ_SEED(JXL_SEED_ENTROPY, br, jxl_br_bits_read(br), p, 4);
+    }
+#endif
     memset(dec, 0, sizeof(*dec));
     dec->ctx = ctx;
     dec->lz77_enabled = jxl_br_bool(br);

@@ -1774,6 +1774,49 @@ Corpus **2.02x -> 1.99x**, the first time under 2x.
 
 ## Log
 
+### Fuzzing: component targets, a TOC-aware mutator, libjxl as a live oracle
+One whole-file target ran a few inputs a second and spent most mutations
+on the truncation check. Now (AGENTS.md has the commands):
+
+- **Component targets** -- `headers`, `icc`, `entropy`, `modular` -- each
+  drive one part of the decoder on its own. Their inputs start mid-byte, so
+  seeds cannot be cut out of files with a chunk extractor; instead
+  `-DJXL_FUZZ_SEEDS` compiles in hooks at each component's entry and
+  `test/fuzz_seeds.c` writes out, while decoding the corpus, the bit it
+  starts at, its parameters and the bytes that follow (6082 entropy, 512
+  Modular, 76 ICC seeds).
+- **Whole files** get a custom mutator that mutates one TOC section and
+  re-encodes the TOC (a permuted one comes back unpermuted), a container
+  dictionary, a 2 Mpx render cap, at most two renders per input and a
+  256 KB input cap. The mutator round-trips byte-exactly: 2095 of 2232
+  identity "mutations" on 186 files came back identical, the other 137
+  (permuted TOCs) decode to the same pixels.
+- **`diff`** decodes each input with libjxl too and, when both succeed,
+  requires the same geometry, channels and frame count, the same samples on
+  integer-path frames, and no gross error elsewhere.
+- **Sanitizers**: UBSan on every Linux run, MemorySanitizer (`-msan`).
+- **AFL++** gets a CmpLog binary and the dictionary (not yet run: AFL++ is
+  not installed on the WSL machine).
+
+Throughput on Linux, inputs a second summed over jobs, second 10-minute
+session: entropy 8088, headers 3022, icc 2214, modular 969, diff 310, whole
+files 64 (29 before the two-render cap).
+
+What it found, in the first 10 minutes and the reproducer replay:
+
+| finding | found by | fix |
+|---|---|---|
+| HLG OOTF forced zero/negative luminance to black; libjxl's FastPowf saturates it | `diff` on libjxl's OSS-Fuzz testcase 5582808628723712 | follow libjxl (no corpus file changes) |
+| A one-channel palette sent out-of-range indices to the implicit colours; libjxl's fast path clamps them | `diff` | clamp under libjxl's exact conditions |
+| The default squeeze parameters leaked when a channel needed no squeeze steps -- in real decodes too | `modular`, LeakSanitizer | free the empty array |
+| `(int64_t)v << 3` on negative values (weighted predictor), undefined behaviour | UBSan on 11 external reproducers | `* 8` |
+| Three whole-file timeouts | `doc` | not decoder bugs: libjxl takes as long; the harness decoded each input ten times |
+
+Also, while chasing the palette difference: a TOC section's reader ran on
+into the next section's bytes; it now ends with the section, as libjxl's
+does. Every corpus file still renders identically; the second session found
+nothing.
+
 ### Resampled frames: upsample and colour-convert a band of rows at a time
 An upsampled frame used to be materialised in full: every plane upsampled
 into a new full-resolution float buffer (41 MB for three channels at

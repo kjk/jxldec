@@ -133,6 +133,23 @@ static inline size_t jxl_br_bits_read(const jxl_br *br) {
     return br->byte_pos * 8 - (size_t)br->nbits;
 }
 
+/* Seeds for the component fuzz targets (test/fuzz_icc.c, fuzz_entropy.c,
+   fuzz_modular.c). Their inputs are bitstreams that start mid-byte inside a
+   codestream, which no chunk extractor can cut out; built with
+   -DJXL_FUZZ_SEEDS, each component's entry instead reports the bit at which
+   its input starts and the parameters it was called with, and
+   test/fuzz_seeds.c writes those out as seeds while decoding the corpus.
+   Every other build compiles this to nothing. */
+enum { JXL_SEED_ICC = 0, JXL_SEED_ENTROPY = 1, JXL_SEED_MODULAR = 2 };
+#ifdef JXL_FUZZ_SEEDS
+void jxl_fuzz_seed(int kind, const jxl_br *br, size_t bitpos,
+                   const uint8_t *param, size_t param_len);
+#define JXL_FUZZ_SEED(kind, br, bitpos, param, len) \
+    jxl_fuzz_seed(kind, br, bitpos, param, len)
+#else
+#define JXL_FUZZ_SEED(kind, br, bitpos, param, len) ((void)0)
+#endif
+
 void jxl_br_init(jxl_br *br, const uint8_t *data, size_t len);
 void jxl_br_refill(jxl_br *br);
 /* peek / consume / read are defined inline further down, after the inline
@@ -863,6 +880,7 @@ typedef enum {
 
 typedef struct {
     size_t offset;     /* absolute byte offset into the codestream buffer */
+    size_t size;       /* bytes in the section; its reader stops there */
 } jxl_toc_entry;
 
 typedef struct {

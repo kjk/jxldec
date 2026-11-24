@@ -403,6 +403,19 @@ typedef struct {
     int single;
 } jxl_sections;
 
+/* A reader over section `idx` alone. It ends where the section does, as
+   libjxl's does: a sub-stream that needs more bits than its section holds
+   runs out (br->err) instead of carrying on into the next section's bytes,
+   which used to decode a corrupt frame -- one libjxl rejects -- into
+   plausible pixels. The differential fuzzer found it (fuzz/crashes/diff). */
+static void section_open(jxl_sections *s, uint32_t idx) {
+    const jxl_toc_entry *e = &s->toc->entries[idx];
+    size_t end = e->offset + e->size;
+    if (end < e->offset || end > s->cs_len) end = s->cs_len;
+    jxl_br_init(&s->br, s->cs, end);
+    jxl_br_seek_byte(&s->br, e->offset);
+}
+
 static void sections_init(jxl_sections *s, const uint8_t *cs, size_t cs_len,
                           const jxl_toc *toc) {
     s->cs = cs;
@@ -410,7 +423,7 @@ static void sections_init(jxl_sections *s, const uint8_t *cs, size_t cs_len,
     s->toc = toc;
     s->single = toc->count <= 1;
     jxl_br_init(&s->br, cs, cs_len);
-    if (s->single) jxl_br_seek_byte(&s->br, toc->entries[0].offset);
+    if (s->single) section_open(s, 0);
 }
 
 /* Returns the reader positioned at the start of the given section. With a
@@ -421,8 +434,7 @@ static jxl_br *section_reader(jxl_sections *s, jxl_toc_kind kind,
     if (s->single) return &s->br;
     idx = jxl_toc_index(s->toc, kind, pass_idx, group_idx);
     if (idx >= s->toc->count) return NULL;
-    jxl_br_init(&s->br, s->cs, s->cs_len);
-    jxl_br_seek_byte(&s->br, s->toc->entries[idx].offset);
+    section_open(s, idx);
     return &s->br;
 }
 
@@ -918,6 +930,9 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
        brought to full size by its own factor first, before patches. */
     int late_ec_upsample = fh->upsampling != 1;
     int defer_up = 0;
+#ifdef JXL_FUZZ_SEEDS
+    size_t gm_bitpos = 0;
+#endif
     int any_ec_upsample = 0;
     uint32_t nspecs = 0, i, split;
     uint32_t color_w, color_h, group_dim, group_dim_shift;
@@ -1019,6 +1034,9 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     }
 
     /* ----- global modular ----- */
+#ifdef JXL_FUZZ_SEEDS
+    gm_bitpos = jxl_br_bits_read(br);
+#endif
     if (jxl_br_bool(br)) {
         uint64_t num_channels = ncolor + meta->num_extra;
         uint64_t limit = 1024 + (uint64_t)fh->width * fh->height * num_channels / 16;
@@ -1064,6 +1082,24 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         specs[base + i].vshift = actual;
     }
 
+#ifdef JXL_FUZZ_SEEDS
+    /* The GlobalModular stream from its global-tree flag on, with the
+       geometry test/fuzz_modular.c needs to decode it alone: channel count,
+       bit depth, then each channel's width, height and shift. */
+    if (nspecs > 0 && nspecs <= 8) {
+        uint8_t p[2 + 8 * 5];
+        p[0] = (uint8_t)nspecs;
+        p[1] = (uint8_t)bits;
+        for (i = 0; i < nspecs; i++) {
+            p[2 + i * 5] = (uint8_t)specs[i].w;
+            p[3 + i * 5] = (uint8_t)(specs[i].w >> 8);
+            p[4 + i * 5] = (uint8_t)specs[i].h;
+            p[5 + i * 5] = (uint8_t)(specs[i].h >> 8);
+            p[6 + i * 5] = (uint8_t)specs[i].hshift;
+        }
+        JXL_FUZZ_SEED(JXL_SEED_MODULAR, br, gm_bitpos, p, 2 + nspecs * 5);
+    }
+#endif
     if (jxl_modular_init(ctx, &gmod, br, specs, nspecs,
                          has_global_ma ? &global_ma : NULL, bits) != 0)
         goto done;

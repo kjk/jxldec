@@ -643,7 +643,7 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
        feed them have gone back to zero yet. */
     if ((te_w | te_n | te_nw | te_ne) == 0 && n == w && nw == w && ne == w &&
         (sc->default_wp || nn == n)) {
-        w3 = (int64_t)w << 3;
+        w3 = (int64_t)w * 8;
         out->subpred[0] = w3;
         out->subpred[1] = w3;
         out->subpred[2] = w3;
@@ -685,11 +685,11 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
     /* Compute sub-predictions only after the relatively large weight
        calculation. They are independent of the weights, and delaying them
        keeps four int64 values from being spilled across that whole block. */
-    n3 = (int64_t)n << 3;
-    nw3 = (int64_t)nw << 3;
-    ne3 = (int64_t)ne << 3;
-    w3 = (int64_t)w << 3;
-    nn3 = (int64_t)nn << 3;
+    n3 = (int64_t)n * 8;
+    nw3 = (int64_t)nw * 8;
+    ne3 = (int64_t)ne * 8;
+    w3 = (int64_t)w * 8;
+    nn3 = (int64_t)nn * 8;
     sp0 = w3 + ne3 - n3;
     if (sc->default_wp) {
         sp1 = n3 - (((te_w + te_n + te_ne) * 16) >> 5);
@@ -743,7 +743,7 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
 }
 
 static void sc_record(jxl_sc_pred *sc, const jxl_sc_result *pred, int32_t sample) {
-    int64_t s = (int64_t)sample << 3;
+    int64_t s = (int64_t)sample * 8;
     int64_t true_err = pred->prediction - s;
     uint32_t subpred_err[4];
     uint32_t x = sc->x;
@@ -804,7 +804,7 @@ static void sc_record(jxl_sc_pred *sc, const jxl_sc_result *pred, int32_t sample
    transition that is actually taken. */
 static JXL_INLINE_HINT void
 sc_record_nec(jxl_sc_pred *sc, const jxl_sc_result *pred, int32_t sample) {
-    int64_t s = (int64_t)sample << 3;
+    int64_t s = (int64_t)sample * 8;
     int64_t true_err = pred->prediction - s;
     uint32_t subpred_err0, subpred_err1, subpred_err2, subpred_err3;
     uint32_t x = sc->x;
@@ -1273,6 +1273,14 @@ static int squeeze_default_params(jxl_ctx *ctx, jxl_transform *tr,
     }
 #undef JXL_SQ_PUSH
 
+    /* Small enough that the default squeeze has no steps: keep nothing.
+       Storing the empty array with nsp == 0 leaked it, because the next
+       transform_apply (jxl_modular_transform_channels after the header
+       pass) took nsp == 0 to mean "not computed yet" and allocated again. */
+    if (n == 0) {
+        jxl_free(ctx, sp);
+        return 0;
+    }
     tr->sp = sp;
     tr->nsp = n;
     return 0;
@@ -2173,6 +2181,30 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
     width = targets[0].w;
     height = targets[0].h;
 
+    /* One channel, no delta entries, zero predictor: libjxl's InvPalette
+       takes a fast path there that clamps the index into the palette, so an
+       index outside it -- which only a corrupt stream produces -- reads the
+       first or last entry rather than the implicit delta or cube colours
+       the general rule gives. libjxl is the oracle; the differential fuzzer
+       found the difference (fuzz/crashes/diff). With more channels libjxl
+       uses the implicit colours, as the code below does. */
+    if (num_c == 1 && nb_deltas == 0 && tr->d_pred == JXL_PRED_ZERO &&
+        pal.w > 0) {
+        int32_t last = (int32_t)pal.w - 1;
+        for (y = 0; y < height; y++) {
+            int32_t *row0 = targets[0].data + (size_t)y * targets[0].stride;
+            for (x = 0; x < width; x++) {
+                int32_t index = row0[x];
+                if (index < 0) index = 0;
+                else if (index > last) index = last;
+                row0[x] = pal.data[index];
+            }
+        }
+        cl->chans[begin] = targets[0];   /* no member channels to put back */
+        rc = 0;
+        goto done;
+    }
+
     for (y = 0; y < height; y++) {
         int32_t *row0 = targets[0].data + (size_t)y * targets[0].stride;
         for (x = 0; x < width; x++) {
@@ -2995,7 +3027,7 @@ modular_decode_grad_wp_nec(jxl_mchan *ch, jxl_pred_state *ps,
                            shifted along are zero. */
                         uint32_t *se = se_row + (size_t)x * 4;
                         int64_t true_err =
-                            ((int64_t)v << 3) - ((int64_t)value << 3);
+                            ((int64_t)v * 8) - ((int64_t)value * 8);
                         int64_t d = true_err < 0 ? -true_err : true_err;
                         uint32_t e = (uint32_t)((d + 3) >> 3);
                         te_row[x] = (int32_t)true_err;

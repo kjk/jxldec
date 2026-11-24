@@ -5,6 +5,8 @@
 //   bun cmd/coverage.ts -cpu N       worker count (default: cores - 1)
 //   bun cmd/coverage.ts -all-fns     list every uncovered function, not the top 40
 //   bun cmd/coverage.ts -reuse       re-report from the profile already on disk
+//   bun cmd/coverage.ts -dir fuzz/corpus   every file in a directory instead
+//                                    (repeatable; any names, valid or not)
 //
 // Builds the clang coverage variant, decodes the corpus with it, merges the
 // profiles and prints two things: per-file line coverage, and the functions
@@ -15,7 +17,12 @@
 //
 // A function listed here is not necessarily broken. It means nothing verifies
 // it against libjxl, which is the state every one of those bugs was in.
-import { existsSync, mkdirSync, readdirSync, rmSync } from "fs";
+//
+// -dir points it at a fuzzer's corpus (fuzz/corpus, the whole-file target's)
+// to find the fuzzer's blind spots: code the mutated inputs never reach is
+// where seeds are missing. Invalid inputs are fine; a decode that fails
+// still counts what it ran.
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "fs";
 import { cpus, tmpdir } from "os";
 import { dirname, join } from "path";
 import { buildCoverage } from "./build";
@@ -28,6 +35,10 @@ const cpuIdx = argv.indexOf("-cpu");
 const NCPU = cpuIdx >= 0 ? parseInt(argv[cpuIdx + 1]) : Math.max(1, cpus().length - 1);
 const randIdx = argv.indexOf("-rand");
 const allFns = argv.includes("-all-fns");
+if (argv.includes("-h") || argv.includes("--help")) {
+  console.log("usage: bun cmd/coverage.ts [-rand N] [-dir DIR] [-cpu N] [-all-fns] [-reuse]");
+  process.exit(0);
+}
 
 const PROF_DIR = join(ROOT, "out", "clang_cov", "profraw");
 const MERGED = join(ROOT, "out", "clang_cov", "corpus.profdata");
@@ -35,11 +46,20 @@ const MERGED = join(ROOT, "out", "clang_cov", "corpus.profdata");
 await getDeps();
 const EXE = await buildCoverage();
 
-let files = corpusFiles();
+const dirs: string[] = [];
+for (let i = 0; i < argv.length; i++) if (argv[i] === "-dir" && argv[i + 1]) dirs.push(argv[++i]);
+let files = dirs.length === 0 ? corpusFiles() : dirs.flatMap((d) => {
+  if (!existsSync(d)) {
+    console.error(`coverage: no such directory: ${d}`);
+    process.exit(2);
+  }
+  return readdirSync(d).map((n) => join(d, n)).filter((f) => statSync(f).isFile());
+});
+if (dirs.length) console.log(`(${files.length} file(s) from ${dirs.join(", ")})`);
 if (randIdx >= 0) {
   const n = parseInt(argv[randIdx + 1] ?? "");
   if (!(n > 0)) {
-    console.error("usage: bun cmd/coverage.ts [-rand N] [-cpu N] [-all-fns] [-reuse]");
+    console.error("usage: bun cmd/coverage.ts [-rand N] [-dir DIR] [-cpu N] [-all-fns] [-reuse]");
     process.exit(2);
   }
   // Deterministic stride rather than a shuffle: a sample that changes between
@@ -175,7 +195,7 @@ const printGroup = (title: string, list: typeof dead, note: string) => {
   }
 };
 
-printGroup("decoder code the corpus never reaches", internal,
+printGroup(`decoder code ${dirs.length ? "these inputs" : "the corpus"} never reach${dirs.length ? "" : "es"}`, internal,
            "each of this run's bugs lived in a path exactly like these");
 printGroup("public API the harness never calls", api,
            "expected for entry points jxl_test.c has no use for");

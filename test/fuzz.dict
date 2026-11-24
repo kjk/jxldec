@@ -1,0 +1,32 @@
+# fuzz.dict -- libFuzzer / AFL++ dictionary for the whole-file and headers
+# targets (cmd/fuzz.ts passes it as -dict=).
+#
+# Only the container is byte-oriented: box sizes, four-character types and
+# the two signatures. The codestream inside is a bit-packed stream whose
+# fields start mid-byte, so it has no tokens to list; the structure-aware
+# mutator (test/fuzz_mutator.c) is what helps there.
+
+sig_codestream="\xff\x0a"
+sig_container="\x00\x00\x00\x0cJXL \x0d\x0a\x87\x0a"
+sig_box="JXL "
+ftyp="ftyp"
+ftyp_brand="jxl "
+ftyp_box="\x00\x00\x00\x14ftypjxl \x00\x00\x00\x00jxl "
+jxlc="jxlc"
+jxlp="jxlp"
+jxll="jxll"
+jxli="jxli"
+jbrd="jbrd"
+brob="brob"
+exif="Exif"
+xml="xml "
+jumb="jumb"
+# jxlp index with the "last part" bit set
+jxlp_last="\x80\x00\x00\x00"
+jxlp_first="\x00\x00\x00\x00"
+# box size 0 = to the end of the file; 1 = a 64-bit largesize follows
+box_size_to_end="\x00\x00\x00\x00"
+box_size_large="\x00\x00\x00\x01"
+# jxll level box payloads
+level_5="\x05"
+level_10="\x0a"

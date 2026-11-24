@@ -4,6 +4,9 @@ out/
 # fuzzing: corpus is generated/large. fuzz/crashes/ IS tracked, as regression
 # seeds -- a crash artifact is the only reproducer we have for it.
 fuzz/corpus/
+fuzz/corpus-*/
+fuzz/seeds/
+fuzz/logs/
 fuzz/corpus.min/
 fuzz/corpus.cmin/
 fuzz/corpus.precmin/

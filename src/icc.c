@@ -545,6 +545,7 @@ int jxl_read_icc(jxl_ctx *ctx, jxl_br *br, uint8_t **out, size_t *out_len) {
 
     *out = NULL;
     *out_len = 0;
+    JXL_FUZZ_SEED(JXL_SEED_ICC, br, jxl_br_bits_read(br), NULL, 0);
     if (read_icc_stream(ctx, br, &enc, &enc_len) != 0) return -1;
     rc = decode_icc(ctx, enc, enc_len, out, out_len);
     jxl_free(ctx, enc);

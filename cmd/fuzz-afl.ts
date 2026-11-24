@@ -7,6 +7,13 @@
 //   bun cmd/fuzz-afl.ts -cmin       minimize shared corpus with afl-cmin
 //   bun cmd/fuzz-afl.ts -V 60       stop after 60 seconds (smoke / CI)
 //
+// AFL++ is the second engine for the whole-file target, not a replacement:
+// its mutators differ from libFuzzer's, and CmpLog (on by default: a second
+// build of the harness, run by the main instance and, from 3 jobs, one
+// secondary) solves the comparisons against magic values that byte mutation
+// cannot. Both engines read and grow the same corpus. Linux / macOS only;
+// on Debian/Ubuntu: sudo apt install afl++.
+//
 // Shares the seed corpus with libFuzzer:
 //   fuzz/corpus/     seeds for both bun cmd/fuzz.ts and this script
 //   fuzz/afl-out/    AFL++ state (queue, hangs, crashes, fuzzer_stats) — gitignored
@@ -45,6 +52,7 @@ const FUZZ = resolve(import.meta.dir, "..", "fuzz");
 const CORPUS = join(FUZZ, "corpus");
 const CRASHES = join(FUZZ, "crashes");
 const AFL_OUT = join(FUZZ, "afl-out");
+const DICT = resolve(import.meta.dir, "..", "test", "fuzz.dict");
 
 function usage(): never {
   console.error(
@@ -55,7 +63,8 @@ function usage(): never {
   -repro FILE    replay a single crash artifact with the AFL harness and exit
   -import        merge AFL queue → fuzz/corpus and AFL crashes → fuzz/crashes
   -cmin          minimize fuzz/corpus with afl-cmin (writes corpus, keeps backup)
-  -no-asan       build without AddressSanitizer (faster)
+  -no-asan       build without AddressSanitizer and UBSan (faster)
+  -no-cmplog     do not build or use the CmpLog binary
   -V SEC         stop after SEC seconds of fuzz time (afl-fuzz -V)
   -clean         force rebuild of the AFL harness
   -h, --help
@@ -69,13 +78,14 @@ fuzz/afl-out/. On macOS run once: sudo afl-system-config
 
 const args = process.argv.slice(2);
 let jobs = 1;
-let maxLen = 1_000_000; // AFL++ default MAX_FILE; raise with care (shm budget)
+let maxLen = 262_144; // as cmd/fuzz.ts; seeds over it go in truncated
 let repro = "";
 let doImport = false;
 let cmin = false;
 let noAsan = false;
 let timeLimitSec = 0;
 let clean = false;
+let noCmplog = false;
 
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
@@ -87,6 +97,7 @@ for (let i = 0; i < args.length; i++) {
   else if (a === "-no-asan") noAsan = true;
   else if (a === "-V") timeLimitSec = intArg(args[++i], "-V");
   else if (a === "-clean") clean = true;
+  else if (a === "-no-cmplog") noCmplog = true;
   else if (a === "-h" || a === "--help") usage();
   else usage();
 }
@@ -359,6 +370,11 @@ if (campaignExists(AFL_OUT)) {
 }
 
 const aflFuzz = requireTool("afl-fuzz");
+// CmpLog companion binary (see buildAflFuzz): passed with -c to the main
+// instance, and to one secondary once there are three or more, which is how
+// AFL++ recommends spreading it -- every instance running it would halve
+// throughput for comparisons already solved.
+const cmplogExe = noCmplog ? null : await buildAflFuzz({ clean, cmplog: true });
 const env = baseAflEnv(mapSize);
 
 const beforeCrashes = new Set(listFiles(CRASHES));
@@ -379,6 +395,7 @@ function spawnAfl(
   role: "-M" | "-S",
   name: string,
   quiet: boolean,
+  cmplog = false,
 ): ReturnType<typeof Bun.spawn> {
   const resume = existsSync(join(AFL_OUT, name, "queue"));
   // Paths relative to cwd=FUZZ for shorter UI.
@@ -399,6 +416,10 @@ function spawnAfl(
     "25000",
     "-m",
     "none",
+    // The container's box types and signatures (test/fuzz.dict).
+    "-x",
+    DICT,
+    ...(cmplog && cmplogExe ? ["-c", cmplogExe] : []),
     ...(timeLimitSec > 0 ? ["-V", String(timeLimitSec)] : []),
     "--",
     exe,
@@ -413,10 +434,10 @@ function spawnAfl(
 
 // Always name the primary `-M main` so scaling from 1 → N jobs resumes cleanly
 // (AFL++ auto-names an unnamed instance `-S default`, which would orphan).
-children.push(spawnAfl("-M", "main", false));
+children.push(spawnAfl("-M", "main", false, true));
 for (let j = 1; j < jobs; j++) {
   const id = `secondary-${String(j).padStart(2, "0")}`;
-  children.push(spawnAfl("-S", id, true));
+  children.push(spawnAfl("-S", id, true, j === 1 && jobs >= 3));
 }
 
 const codes = await Promise.all(children.map((c) => c.exited));

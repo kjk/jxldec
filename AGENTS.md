@@ -86,25 +86,50 @@ PNGs to PNM in TypeScript. Don't re-investigate this.
   feature works: each decoder bug found so far lived in a path nothing
   exercised, and a function on that list is one nothing verifies against
   libjxl. `-reuse` re-reports from the profile already on disk (the decode is
-  the slow part, ~3 min).
-- `bun cmd/fuzz.ts -check` — replay every known reproducer once and exit:
-  `fuzz/crashes/` plus two external sets already sitting in `deps/`, libjxl's
-  OSS-Fuzz testcases and jxl-oxide's fuzz findings (about 120 inputs,
-  seconds). Run
-  it after touching a parser; it is the cheap half of the fuzzing story.
-- `bun cmd/fuzz.ts [-jobs N] [-runs N] [-repro FILE] [-minimize]` — libFuzzer
-  + ASan over `test/fuzz_target.c`, seeded from the corpus *and* those external
-  reproducers on first run.
-  `cmd/tests.ts` only ever feeds the decoder *valid* files, and a valid file
-  takes no error path — `jxl_errorf`, which every `JXL_ERR` funnels into, never
-  executes across the whole corpus. This covers what happens when the bytes
-  lie. `fuzz/corpus/` is the checkpoint (gitignored): Ctrl-C to stop, rerun to
-  resume. Artifacts land in `fuzz/crashes/`, which **is** tracked — replay one
-  with `-repro`.
-- `bun cmd/fuzz-afl.ts` — same harness via **AFL++** (macOS/*nix; needs
-  `brew install afl++`). Shares `fuzz/corpus/` with libFuzzer; AFL state is in
-  `fuzz/afl-out/` (gitignored). On exit (and with `-import`), queue/crashes
-  merge into the shared dirs. On macOS run once: `sudo afl-system-config`.
+  the slow part, ~3 min). `-dir fuzz/corpus` measures a fuzz corpus instead:
+  what the fuzzer never reaches is where it needs seeds.
+- `bun cmd/fuzz.ts -check [-msan]` — replay every known reproducer once,
+  through the target that found it, and exit: `fuzz/crashes/` (whole files)
+  and `fuzz/crashes/<target>/`, plus two external sets already sitting in
+  `deps/`, libjxl's OSS-Fuzz testcases and jxl-oxide's fuzz findings, which
+  also go through the differential target where it builds. Seconds. Run it
+  after touching a parser; it is the cheap half of the fuzzing story.
+- `bun cmd/fuzz.ts [-target T] [-msan] [-jobs N] [-runs N] [-time S]
+  [-repro FILE] [-minimize] [-reseed]` — libFuzzer. `cmd/tests.ts` only ever
+  feeds the decoder *valid* files, and a valid file takes no error path —
+  `jxl_errorf`, which every `JXL_ERR` funnels into, never executes across the
+  whole corpus. This covers what happens when the bytes lie. Targets
+  (`test/fuzz_*.c`):
+  - `doc` (default, `fuzz_target.c`) — whole files through the public API,
+    with the TOC-aware custom mutator (`fuzz_mutator.c`: mutates one section,
+    re-encodes the TOC so the frame still parses) and the container
+    dictionary (`test/fuzz.dict`). Renders at most two frames, nothing over
+    2 Mpx; max input 256 KB.
+  - `headers` — container, image header, ICC, every frame header and TOC;
+    no pixels. Thousands of inputs a second.
+  - `icc`, `entropy`, `modular` — one component on its own, fed a bitstream
+    that starts mid-byte (layout in `fuzz_common.h`). Seeds are cut from the
+    corpus at the bit each component starts: `-DJXL_FUZZ_SEEDS` compiles in
+    the `JXL_FUZZ_SEED` hooks and `test/fuzz_seeds.c` writes them out into
+    `fuzz/seeds/`. Every other build compiles the hooks to nothing.
+  - `diff` — differential against libjxl (Linux/macOS: it links libjxl's
+    static libraries, MSVC builds on Windows). Compares only when both
+    decoders succeed; aborts on different geometry, channels or frame count,
+    any integer-path sample (`fuzz_diff_ours.c` decides which frames are),
+    or a gross pixel error elsewhere. It finds wrong output, not crashes.
+  Sanitizers: ASan everywhere, plus UBSan off Windows (so every run, not
+  only replay, stops on undefined behaviour); `-msan` builds MemorySanitizer
+  instead (Linux). `fuzz/corpus/` (doc, shared with AFL++) and
+  `fuzz/corpus-<target>/` are the checkpoints (gitignored): Ctrl-C to stop,
+  rerun to resume; `-reseed` starts a corpus over. Artifacts land in
+  `fuzz/crashes/[<target>/]`, which **is** tracked — replay one with
+  `-repro` (and `-target`).
+- `bun cmd/fuzz-afl.ts` — the whole-file harness via **AFL++** (Linux/macOS;
+  `sudo apt install afl++` or `brew install afl++`), with a CmpLog companion
+  binary on the main instance and the container dictionary. Shares
+  `fuzz/corpus/` with libFuzzer; AFL state is in `fuzz/afl-out/`
+  (gitignored). On exit (and with `-import`), queue/crashes merge into the
+  shared dirs. On macOS run once: `sudo afl-system-config`.
 - `bun cmd/bench.ts <selection> [-runs N]` — times our decode against libjxl's,
   both in one process, single-threaded, best of N. Windows/MSVC only: it links
   libjxl's static libraries, which need `-MD` and `-DJXL_STATIC_DEFINE`.
@@ -338,6 +363,14 @@ current; it lists the exact pass rate and every known gap.
   libjxl's rule, both different in jxl-oxide.
 - The palette channel is `nb_colours + nb_deltas` wide (libjxl's encoder
   writes `nb_colours` with the deltas already subtracted).
+- A one-channel palette with no deltas and the zero predictor **clamps**
+  out-of-range indices into the palette (libjxl's InvPalette fast path); only
+  with more channels do they reach the implicit delta and cube colours.
+- The HLG OOTF ratio is libjxl's FastPowf even at zero or negative
+  luminance, where it saturates the noise; do not "fix" it to black.
+- Every TOC section is read with a reader that ends at the section, as in
+  libjxl: a sub-stream that needs more bits fails rather than reading on
+  into the next section.
 - A permutation-only RCT (rct_type 7, 14, ...) has to move samples. Swapping
   `jxl_mchan` views is invisible to everything that reads
   `jxl_modular.base[]`, and breaks squeeze's adjacency assumption.
