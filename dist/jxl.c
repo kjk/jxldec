@@ -235,6 +235,16 @@ static inline size_t jxl_br_bits_read(const jxl_br *br) {
     return br->byte_pos * 8 - (size_t)br->nbits;
 }
 
+enum { JXL_SEED_ICC = 0, JXL_SEED_ENTROPY = 1, JXL_SEED_MODULAR = 2 };
+#ifdef JXL_FUZZ_SEEDS
+void jxl_fuzz_seed(int kind, const jxl_br *br, size_t bitpos,
+                   const uint8_t *param, size_t param_len);
+#define JXL_FUZZ_SEED(kind, br, bitpos, param, len) \
+    jxl_fuzz_seed(kind, br, bitpos, param, len)
+#else
+#define JXL_FUZZ_SEED(kind, br, bitpos, param, len) ((void)0)
+#endif
+
 void jxl_br_init(jxl_br *br, const uint8_t *data, size_t len);
 void jxl_br_refill(jxl_br *br);
 
@@ -852,6 +862,7 @@ typedef enum {
 
 typedef struct {
     size_t offset;
+    size_t size;
 } jxl_toc_entry;
 
 typedef struct {
@@ -3110,6 +3121,16 @@ void jxl_dec_begin(jxl_dec *dec, jxl_br *br) {
 }
 
 int jxl_dec_init(jxl_ctx *ctx, jxl_dec *dec, jxl_br *br, uint32_t num_dist) {
+#ifdef JXL_FUZZ_SEEDS
+    {
+        uint8_t p[4];
+        p[0] = (uint8_t)num_dist;
+        p[1] = (uint8_t)(num_dist >> 8);
+        p[2] = (uint8_t)(num_dist >> 16);
+        p[3] = (uint8_t)(num_dist >> 24);
+        JXL_FUZZ_SEED(JXL_SEED_ENTROPY, br, jxl_br_bits_read(br), p, 4);
+    }
+#endif
     memset(dec, 0, sizeof(*dec));
     dec->ctx = ctx;
     dec->lz77_enabled = jxl_br_bool(br);
@@ -3890,6 +3911,7 @@ int jxl_read_icc(jxl_ctx *ctx, jxl_br *br, uint8_t **out, size_t *out_len) {
 
     *out = NULL;
     *out_len = 0;
+    JXL_FUZZ_SEED(JXL_SEED_ICC, br, jxl_br_bits_read(br), NULL, 0);
     if (read_icc_stream(ctx, br, &enc, &enc_len) != 0) return -1;
     rc = decode_icc(ctx, enc, enc_len, out, out_len);
     jxl_free(ctx, enc);
@@ -4352,11 +4374,13 @@ int jxl_read_toc(jxl_ctx *ctx, jxl_br *br, const jxl_frame_header *fh,
                 goto done;
             }
             toc->entries[i].offset = offs[b];
+            toc->entries[i].size = sizes[b];
         }
         jxl_free(ctx, offs);
     } else {
         for (i = 0; i < entry_count; i++) {
             toc->entries[i].offset = acc;
+            toc->entries[i].size = sizes[i];
             acc += sizes[i];
             toc->total_size += sizes[i];
         }
@@ -4906,7 +4930,7 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
 
     if ((te_w | te_n | te_nw | te_ne) == 0 && n == w && nw == w && ne == w &&
         (sc->default_wp || nn == n)) {
-        w3 = (int64_t)w << 3;
+        w3 = (int64_t)w * 8;
         out->subpred[0] = w3;
         out->subpred[1] = w3;
         out->subpred[2] = w3;
@@ -4945,11 +4969,11 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
     wt2 >>= log_weight; wt3 >>= log_weight;
     sum_weights = wt0 + wt1 + wt2 + wt3;
 
-    n3 = (int64_t)n << 3;
-    nw3 = (int64_t)nw << 3;
-    ne3 = (int64_t)ne << 3;
-    w3 = (int64_t)w << 3;
-    nn3 = (int64_t)nn << 3;
+    n3 = (int64_t)n * 8;
+    nw3 = (int64_t)nw * 8;
+    ne3 = (int64_t)ne * 8;
+    w3 = (int64_t)w * 8;
+    nn3 = (int64_t)nn * 8;
     sp0 = w3 + ne3 - n3;
     if (sc->default_wp) {
         sp1 = n3 - (((te_w + te_n + te_ne) * 16) >> 5);
@@ -5003,7 +5027,7 @@ static void sc_predict(const jxl_sc_pred *sc, int32_t n, int32_t nw, int32_t ne,
 }
 
 static void sc_record(jxl_sc_pred *sc, const jxl_sc_result *pred, int32_t sample) {
-    int64_t s = (int64_t)sample << 3;
+    int64_t s = (int64_t)sample * 8;
     int64_t true_err = pred->prediction - s;
     uint32_t subpred_err[4];
     uint32_t x = sc->x;
@@ -5060,7 +5084,7 @@ static void sc_record(jxl_sc_pred *sc, const jxl_sc_result *pred, int32_t sample
 
 static JXL_INLINE_HINT void
 sc_record_nec(jxl_sc_pred *sc, const jxl_sc_result *pred, int32_t sample) {
-    int64_t s = (int64_t)sample << 3;
+    int64_t s = (int64_t)sample * 8;
     int64_t true_err = pred->prediction - s;
     uint32_t subpred_err0, subpred_err1, subpred_err2, subpred_err3;
     uint32_t x = sc->x;
@@ -5508,6 +5532,10 @@ static int squeeze_default_params(jxl_ctx *ctx, jxl_transform *tr,
     }
 #undef JXL_SQ_PUSH
 
+    if (n == 0) {
+        jxl_free(ctx, sp);
+        return 0;
+    }
     tr->sp = sp;
     tr->nsp = n;
     return 0;
@@ -6366,6 +6394,23 @@ static int palette_inverse(jxl_ctx *ctx, jxl_transform *tr, jxl_chanlist *cl,
     width = targets[0].w;
     height = targets[0].h;
 
+    if (num_c == 1 && nb_deltas == 0 && tr->d_pred == JXL_PRED_ZERO &&
+        pal.w > 0) {
+        int32_t last = (int32_t)pal.w - 1;
+        for (y = 0; y < height; y++) {
+            int32_t *row0 = targets[0].data + (size_t)y * targets[0].stride;
+            for (x = 0; x < width; x++) {
+                int32_t index = row0[x];
+                if (index < 0) index = 0;
+                else if (index > last) index = last;
+                row0[x] = pal.data[index];
+            }
+        }
+        cl->chans[begin] = targets[0];
+        rc = 0;
+        goto done;
+    }
+
     for (y = 0; y < height; y++) {
         int32_t *row0 = targets[0].data + (size_t)y * targets[0].stride;
         for (x = 0; x < width; x++) {
@@ -7090,7 +7135,7 @@ modular_decode_grad_wp_nec(jxl_mchan *ch, jxl_pred_state *ps,
 
                         uint32_t *se = se_row + (size_t)x * 4;
                         int64_t true_err =
-                            ((int64_t)v << 3) - ((int64_t)value << 3);
+                            ((int64_t)v * 8) - ((int64_t)value * 8);
                         int64_t d = true_err < 0 ? -true_err : true_err;
                         uint32_t e = (uint32_t)((d + 3) >> 3);
                         te_row[x] = (int32_t)true_err;
@@ -10040,6 +10085,14 @@ typedef struct {
     int single;
 } jxl_sections;
 
+static void section_open(jxl_sections *s, uint32_t idx) {
+    const jxl_toc_entry *e = &s->toc->entries[idx];
+    size_t end = e->offset + e->size;
+    if (end < e->offset || end > s->cs_len) end = s->cs_len;
+    jxl_br_init(&s->br, s->cs, end);
+    jxl_br_seek_byte(&s->br, e->offset);
+}
+
 static void sections_init(jxl_sections *s, const uint8_t *cs, size_t cs_len,
                           const jxl_toc *toc) {
     s->cs = cs;
@@ -10047,7 +10100,7 @@ static void sections_init(jxl_sections *s, const uint8_t *cs, size_t cs_len,
     s->toc = toc;
     s->single = toc->count <= 1;
     jxl_br_init(&s->br, cs, cs_len);
-    if (s->single) jxl_br_seek_byte(&s->br, toc->entries[0].offset);
+    if (s->single) section_open(s, 0);
 }
 
 static jxl_br *section_reader(jxl_sections *s, jxl_toc_kind kind,
@@ -10056,8 +10109,7 @@ static jxl_br *section_reader(jxl_sections *s, jxl_toc_kind kind,
     if (s->single) return &s->br;
     idx = jxl_toc_index(s->toc, kind, pass_idx, group_idx);
     if (idx >= s->toc->count) return NULL;
-    jxl_br_init(&s->br, s->cs, s->cs_len);
-    jxl_br_seek_byte(&s->br, s->toc->entries[idx].offset);
+    section_open(s, idx);
     return &s->br;
 }
 
@@ -10510,6 +10562,9 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
 
     int late_ec_upsample = fh->upsampling != 1;
     int defer_up = 0;
+#ifdef JXL_FUZZ_SEEDS
+    size_t gm_bitpos = 0;
+#endif
     int any_ec_upsample = 0;
     uint32_t nspecs = 0, i, split;
     uint32_t color_w, color_h, group_dim, group_dim_shift;
@@ -10605,6 +10660,9 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         }
     }
 
+#ifdef JXL_FUZZ_SEEDS
+    gm_bitpos = jxl_br_bits_read(br);
+#endif
     if (jxl_br_bool(br)) {
         uint64_t num_channels = ncolor + meta->num_extra;
         uint64_t limit = 1024 + (uint64_t)fh->width * fh->height * num_channels / 16;
@@ -10646,6 +10704,22 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
         specs[base + i].vshift = actual;
     }
 
+#ifdef JXL_FUZZ_SEEDS
+
+    if (nspecs > 0 && nspecs <= 8) {
+        uint8_t p[2 + 8 * 5];
+        p[0] = (uint8_t)nspecs;
+        p[1] = (uint8_t)bits;
+        for (i = 0; i < nspecs; i++) {
+            p[2 + i * 5] = (uint8_t)specs[i].w;
+            p[3 + i * 5] = (uint8_t)(specs[i].w >> 8);
+            p[4 + i * 5] = (uint8_t)specs[i].h;
+            p[5 + i * 5] = (uint8_t)(specs[i].h >> 8);
+            p[6 + i * 5] = (uint8_t)specs[i].hshift;
+        }
+        JXL_FUZZ_SEED(JXL_SEED_MODULAR, br, gm_bitpos, p, 2 + nspecs * 5);
+    }
+#endif
     if (jxl_modular_init(ctx, &gmod, br, specs, nspecs,
                          has_global_ma ? &global_ma : NULL, bits) != 0)
         goto done;
@@ -15799,9 +15873,10 @@ static float tf_hlg(float v) {
 
 static float hlg_ootf_ratio(float y, float e) {
     float a, ratio;
-    if (!(y > 0.0f)) return 0.0f;
+    if (y != y) return 0.0f;
     a = fast_log2f(y) * e;
     if (a < -126.0f) a = -126.0f;
+    if (a > 30.0f) a = 30.0f;
     ratio = fast_pow2f(a);
     return ratio < 1e9f ? ratio : 1e9f;
 }
@@ -16079,17 +16154,18 @@ static void hlg_ootf_x4(float *r, float *g, float *b, size_t n,
                         const float lum[3], float e, size_t *pos) {
     const __m128 l0 = _mm_set1_ps(lum[0]), l1 = _mm_set1_ps(lum[1]);
     const __m128 l2 = _mm_set1_ps(lum[2]), ve = _mm_set1_ps(e);
-    const __m128 lo = _mm_set1_ps(-126.0f), cap = _mm_set1_ps(1e9f);
-    const __m128 zero = _mm_setzero_ps();
+    const __m128 lo = _mm_set1_ps(-126.0f), hi = _mm_set1_ps(30.0f);
+    const __m128 cap = _mm_set1_ps(1e9f);
     size_t i = *pos;
     for (; i + 4 <= n; i += 4) {
         __m128 vr = _mm_loadu_ps(r + i), vg = _mm_loadu_ps(g + i);
         __m128 vb = _mm_loadu_ps(b + i);
         __m128 y = _mm_add_ps(_mm_add_ps(_mm_mul_ps(l0, vr), _mm_mul_ps(l1, vg)),
                               _mm_mul_ps(l2, vb));
-        __m128 a = _mm_max_ps(_mm_mul_ps(fast_log2f_x4(y), ve), lo);
+        __m128 a = _mm_min_ps(_mm_max_ps(_mm_mul_ps(fast_log2f_x4(y), ve), lo),
+                              hi);
         __m128 ratio = _mm_min_ps(fast_pow2f_x4(a), cap);
-        ratio = _mm_and_ps(_mm_cmpgt_ps(y, zero), ratio);
+        ratio = _mm_and_ps(_mm_cmpord_ps(y, y), ratio);
         _mm_storeu_ps(r + i, _mm_mul_ps(vr, ratio));
         _mm_storeu_ps(g + i, _mm_mul_ps(vg, ratio));
         _mm_storeu_ps(b + i, _mm_mul_ps(vb, ratio));
@@ -16164,8 +16240,8 @@ static void hlg_ootf_x8(float *r, float *g, float *b, size_t n,
                         const float lum[3], float e, size_t *pos) {
     const __m256 l0 = _mm256_set1_ps(lum[0]), l1 = _mm256_set1_ps(lum[1]);
     const __m256 l2 = _mm256_set1_ps(lum[2]), ve = _mm256_set1_ps(e);
-    const __m256 lo = _mm256_set1_ps(-126.0f), cap = _mm256_set1_ps(1e9f);
-    const __m256 zero = _mm256_setzero_ps();
+    const __m256 lo = _mm256_set1_ps(-126.0f), hi = _mm256_set1_ps(30.0f);
+    const __m256 cap = _mm256_set1_ps(1e9f);
     size_t i = *pos;
     for (; i + 8 <= n; i += 8) {
         __m256 vr = _mm256_loadu_ps(r + i), vg = _mm256_loadu_ps(g + i);
@@ -16173,9 +16249,10 @@ static void hlg_ootf_x8(float *r, float *g, float *b, size_t n,
         __m256 y = _mm256_add_ps(
             _mm256_add_ps(_mm256_mul_ps(l0, vr), _mm256_mul_ps(l1, vg)),
             _mm256_mul_ps(l2, vb));
-        __m256 a = _mm256_max_ps(_mm256_mul_ps(fast_log2f_x8(y), ve), lo);
+        __m256 a = _mm256_min_ps(
+            _mm256_max_ps(_mm256_mul_ps(fast_log2f_x8(y), ve), lo), hi);
         __m256 ratio = _mm256_min_ps(fast_pow2f_x8(a), cap);
-        ratio = _mm256_and_ps(_mm256_cmp_ps(y, zero, _CMP_GT_OQ), ratio);
+        ratio = _mm256_and_ps(_mm256_cmp_ps(y, y, _CMP_ORD_Q), ratio);
         _mm256_storeu_ps(r + i, _mm256_mul_ps(vr, ratio));
         _mm256_storeu_ps(g + i, _mm256_mul_ps(vg, ratio));
         _mm256_storeu_ps(b + i, _mm256_mul_ps(vb, ratio));
