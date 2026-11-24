@@ -168,6 +168,37 @@ The first-frame checker skipped five inputs. A macOS build of
 both gray spot-colour fixtures. The macOS fuzz regression replay passed
 all 237 inputs.
 
+#### Faster 8x8 transforms and resampling
+
+A fresh M3 Pro Time Profiler run put 16% of VarDCT samples in DCT and 5.5%
+in dequantization. The fixed-size 8x8 NEON transform keeps the intermediate
+block in vectors across both passes, and the dequantizer converts and
+adjusts four coefficients at a time with exact division.
+
+The resampler interleaves independent accumulations. At 4x and 8x it packs
+weights for four adjacent output columns together, so a vector load feeds
+four independent input pixels and each result can be stored in output
+order. The scalar edge code reads the original weight layout. The packed
+copy adds up to 6.25 KiB per kernel at 8x.
+
+Apple M3 Pro, Apple Clang 21 at `-O3`. Each result is the median of five
+alternating trials of ten decodes after warmup. The baseline includes the
+first round of NEON kernels.
+
+| Input | Previous NEON | Updated NEON | Time saved |
+|---|---:|---:|---:|
+| `flower.v_d1` | 60.42 ms | 59.17 ms | 2.1% |
+| `flower.v_d05` | 52.64 ms | 47.69 ms | 9.4% |
+| `flower.v_rs2` | 37.42 ms | 37.27 ms | 0.4% |
+| `flower.v_rs4` | 21.39 ms | 19.47 ms | 9.0% |
+| `flower` at 8x resampling | 18.56 ms | 15.60 ms | 15.9% |
+
+All 1,290 first-frame outputs were byte-identical to the previous NEON
+build. Against `djxl`, the worst difference was one 8-bit step across
+1,285 comparable inputs. The all-frame libjxl comparison passed on 29
+fixtures. AddressSanitizer abort checks passed on ordinary VarDCT and an
+8x-resampled image.
+
 ### Scanned pages: row-interleaved EPF and a flat-neighbourhood WP shortcut
 Driven by two 143-page comic archives from SumatraPDF issue 6245, 3072x4096
 each: one lossless 8-bit gray (Modular, palette + weighted predictor), one

@@ -337,6 +337,43 @@ static void dct4_v4(const dct_vec4 in[4], dct_vec4 out[4], int inverse) {
     }
 }
 
+static JXL_INLINE_HINT void dct8_v4(dct_vec4 io[8], int inverse) {
+    const dct_vec4 sqrt2 = DCT_V4_SPLAT(JXL_SQRT2);
+    const dct_vec4 half_v = DCT_V4_SPLAT(0.5f);
+    int i;
+    dct_vec4 in0[4], in1[4], out0[4], out1[4];
+    if (!inverse) {
+        for (i = 0; i < 4; i++) {
+            in0[i] = DCT_V4_MUL(DCT_V4_ADD(io[i], io[7 - i]), half_v);
+            in1[i] = DCT_V4_MUL(
+                DCT_V4_MUL(DCT_V4_SUB(io[i], io[7 - i]),
+                           DCT_V4_SPLAT(sec_half_8[i])),
+                half_v);
+        }
+        dct4_v4(in0, out0, 0);
+        dct4_v4(in1, out1, 0);
+        for (i = 0; i < 4; i++) io[i * 2] = out0[i];
+        out1[0] = DCT_V4_MUL(out1[0], sqrt2);
+        for (i = 0; i < 3; i++)
+            io[i * 2 + 1] = DCT_V4_ADD(out1[i], out1[i + 1]);
+        io[7] = out1[3];
+    } else {
+        in0[0] = io[0]; in0[1] = io[2];
+        in0[2] = io[4]; in0[3] = io[6];
+        in1[0] = DCT_V4_MUL(io[1], sqrt2);
+        in1[1] = DCT_V4_ADD(io[3], io[1]);
+        in1[2] = DCT_V4_ADD(io[5], io[3]);
+        in1[3] = DCT_V4_ADD(io[7], io[5]);
+        dct4_v4(in0, out0, 1);
+        dct4_v4(in1, out1, 1);
+        for (i = 0; i < 4; i++) {
+            dct_vec4 r = DCT_V4_MUL(out1[i], DCT_V4_SPLAT(sec_half_8[i]));
+            io[i] = DCT_V4_ADD(out0[i], r);
+            io[7 - i] = DCT_V4_SUB(out0[i], r);
+        }
+    }
+}
+
 static void dct_1d_v4(dct_vec4 *io, int n, dct_vec4 *scratch, int inverse) {
     const dct_vec4 sqrt2 = DCT_V4_SPLAT(JXL_SQRT2);
     const dct_vec4 half_v = DCT_V4_SPLAT(0.5f);
@@ -357,37 +394,7 @@ static void dct_1d_v4(dct_vec4 *io, int n, dct_vec4 *scratch, int inverse) {
         return;
     }
     if (n == 8) {
-        dct_vec4 in0[4], in1[4], out0[4], out1[4];
-        if (!inverse) {
-            for (i = 0; i < 4; i++) {
-                in0[i] = DCT_V4_MUL(DCT_V4_ADD(io[i], io[7 - i]), half_v);
-                in1[i] = DCT_V4_MUL(
-                    DCT_V4_MUL(DCT_V4_SUB(io[i], io[7 - i]),
-                               DCT_V4_SPLAT(sec_half_8[i])),
-                    half_v);
-            }
-            dct4_v4(in0, out0, 0);
-            dct4_v4(in1, out1, 0);
-            for (i = 0; i < 4; i++) io[i * 2] = out0[i];
-            out1[0] = DCT_V4_MUL(out1[0], sqrt2);
-            for (i = 0; i < 3; i++)
-                io[i * 2 + 1] = DCT_V4_ADD(out1[i], out1[i + 1]);
-            io[7] = out1[3];
-        } else {
-            in0[0] = io[0]; in0[1] = io[2];
-            in0[2] = io[4]; in0[3] = io[6];
-            in1[0] = DCT_V4_MUL(io[1], sqrt2);
-            in1[1] = DCT_V4_ADD(io[3], io[1]);
-            in1[2] = DCT_V4_ADD(io[5], io[3]);
-            in1[3] = DCT_V4_ADD(io[7], io[5]);
-            dct4_v4(in0, out0, 1);
-            dct4_v4(in1, out1, 1);
-            for (i = 0; i < 4; i++) {
-                dct_vec4 r = DCT_V4_MUL(out1[i], DCT_V4_SPLAT(sec_half_8[i]));
-                io[i] = DCT_V4_ADD(out0[i], r);
-                io[7 - i] = DCT_V4_SUB(out0[i], r);
-            }
-        }
+        dct8_v4(io, inverse);
         return;
     }
     {
@@ -905,6 +912,32 @@ static void dct_rows4(float *data, size_t stride, int w, int inverse) {
 }
 #endif
 
+#ifdef JXL_DCT_NEON
+/* Keep the intermediate 8x8 block in vectors between the two passes. */
+static JXL_INLINE_HINT void dct8x8_neon(float *data, size_t stride, int inverse) {
+    dct_vec4 cols[2][8];
+    int x, y, i;
+    for (y = 0; y < 8; y += 4) {
+        dct_vec4 rows[8];
+        for (x = 0; x < 8; x += 4) {
+            for (i = 0; i < 4; i++)
+                rows[x + i] = vld1q_f32(data + (size_t)(y + i) * stride + x);
+            dct_transpose4_neon(rows + x, rows + x + 1, rows + x + 2, rows + x + 3);
+        }
+        dct8_v4(rows, inverse);
+        for (x = 0; x < 8; x += 4) {
+            dct_transpose4_neon(rows + x, rows + x + 1, rows + x + 2, rows + x + 3);
+            for (i = 0; i < 4; i++) cols[x / 4][y + i] = rows[x + i];
+        }
+    }
+    for (x = 0; x < 2; x++) {
+        dct8_v4(cols[x], inverse);
+        for (y = 0; y < 8; y++)
+            vst1q_f32(data + (size_t)y * stride + 4 * x, cols[x][y]);
+    }
+}
+#endif
+
 /* `nz_rows` is how many leading rows can hold a nonzero coefficient. The row
    pass of an all-zero row leaves it zero, so those rows are skipped; a block
    that received no HF coefficients has only its LF corner filled in, an
@@ -1013,6 +1046,13 @@ static void dct_2d_rows(float *data, size_t stride, int w, int h, int inverse,
 }
 
 void jxl_dct_2d(float *data, size_t stride, int w, int h, int inverse) {
+#ifdef JXL_DCT_NEON
+    if (w == 8 && h == 8) {
+        if (inverse) dct8x8_neon(data, stride, 1);
+        else dct8x8_neon(data, stride, 0);
+        return;
+    }
+#endif
     dct_2d_rows(data, stride, w, h, inverse, h);
 }
 

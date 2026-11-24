@@ -1765,6 +1765,23 @@ void jxl_dequant_varblock(float *coeff, size_t stride, int tr, int32_t hf_mul,
                 _mm_storeu_ps(row + x, v);
             }
         }
+#elif defined(JXL_HAVE_NEON) && !defined(JXL_VARDCT_FORCE_SCALAR)
+        {
+            const float32x4_t numerator = vdupq_n_f32(quant_bias_numerator);
+            const float32x4_t one = vdupq_n_f32(1.0f);
+            for (; x + 4 <= w; x += 4) {
+                /* Coefficients are integers stored in the float plane. */
+                int32x4_t qn = vreinterpretq_s32_f32(vld1q_f32(row + x));
+                float32x4_t v = vcvtq_f32_s32(qn);
+                uint32x4_t small = vcleq_f32(vabsq_f32(v), one);
+                float32x4_t biased = v * quant_bias;
+                /* Discard the quotient in lanes where |v| <= 1. */
+                float32x4_t adjusted = v - vdivq_f32(numerator, v);
+                v = vbslq_f32(small, biased, adjusted);
+                v *= vld1q_f32(mrow + x);
+                vst1q_f32(row + x, v * mul);
+            }
+        }
 #endif
         for (; x < w; x++) {
             int32_t qn = *(int32_t *)&row[x];

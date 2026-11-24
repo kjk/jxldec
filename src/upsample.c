@@ -507,8 +507,14 @@ static void up_block8(const float *const *srow, uint32_t x, uint32_t N,
 #endif
 
 #ifdef JXL_UPSAMPLE_NEON
-/* Load each tap once per group. The output columns share the loaded values,
-   with the same accumulation order and FP contraction setting as up_dot25. */
+static inline float32x4_t up_clamp4_neon(float32x4_t v, float32x4_t lo,
+                                       float32x4_t hi) {
+    v = vbslq_f32(vcltq_f32(v, lo), lo, v);
+    return vbslq_f32(vcgtq_f32(v, hi), hi, v);
+}
+
+/* Load each tap once per group and keep independent dot products in flight.
+   Every accumulator still visits the 25 taps in the order of up_dot25. */
 static void up_block4_neon(const float *const *srow, uint32_t x, uint32_t n,
                            const float *kernel, float *const *dst_rows) {
     float32x4_t taps[25];
@@ -525,31 +531,44 @@ static void up_block4_neon(const float *const *srow, uint32_t x, uint32_t n,
             hi = vbslq_f32(vcgtq_f32(v, hi), v, hi);
         }
     }
+    if (n == 2) {
+        for (oy = 0; oy < 2; oy++, kernel += 2 * 25) {
+            float32x4_t a = vdupq_n_f32(0.0f), b = a;
+            for (t = 0; t < 25; t++) {
+                a += taps[t] * kernel[t];
+                b += taps[t] * kernel[25 + t];
+            }
+            float32x4x2_t pixels = {{up_clamp4_neon(a, lo, hi),
+                                     up_clamp4_neon(b, lo, hi)}};
+            vst2q_f32(dst_rows[oy] + (size_t)x * 2, pixels);
+        }
+        return;
+    }
+
+    /* The packed weights put four adjacent output columns in a vector.
+       Each accumulator belongs to one input pixel, so its store is already
+       in output order. */
+    kernel += (size_t)n * n * 25;
     for (oy = 0; oy < n; oy++) {
         float *dst = dst_rows[oy] + (size_t)x * n;
-        float32x4_t out[8];
-        for (ox = 0; ox < n; ox++, kernel += 25) {
-            float32x4_t sum = vdupq_n_f32(0.0f);
-            for (t = 0; t < 25; t++)
-                sum += taps[t] * kernel[t];
-            sum = vbslq_f32(vcltq_f32(sum, lo), lo, sum);
-            out[ox] = vbslq_f32(vcgtq_f32(sum, hi), hi, sum);
-        }
-        if (n == 2) {
-            float32x4x2_t pixels = {{out[0], out[1]}};
-            vst2q_f32(dst, pixels);
-        } else if (n == 4) {
-            float32x4x4_t pixels = {{out[0], out[1], out[2], out[3]}};
-            vst4q_f32(dst, pixels);
-        } else {
-            /* Each interleaved store writes two complete 8-wide pixels. */
-            float32x4x4_t lo_pixels = {0}, hi_pixels = {0};
-            for (ox = 0; ox < 4; ox++) {
-                lo_pixels.val[ox] = vzip1q_f32(out[ox], out[ox + 4]);
-                hi_pixels.val[ox] = vzip2q_f32(out[ox], out[ox + 4]);
+        for (ox = 0; ox < n; ox += 4, kernel += 4 * 25) {
+            float32x4_t a = vdupq_n_f32(0.0f), b = a, c = a, d = a;
+            for (t = 0; t < 25; t++) {
+                float32x4_t k = vld1q_f32(kernel + 4 * t);
+                float32x4_t v = taps[t];
+                a += k * vgetq_lane_f32(v, 0);
+                b += k * vgetq_lane_f32(v, 1);
+                c += k * vgetq_lane_f32(v, 2);
+                d += k * vgetq_lane_f32(v, 3);
             }
-            vst4q_f32(dst, lo_pixels);
-            vst4q_f32(dst + 16, hi_pixels);
+            vst1q_f32(dst + ox, up_clamp4_neon(a, vdupq_laneq_f32(lo, 0),
+                                                 vdupq_laneq_f32(hi, 0)));
+            vst1q_f32(dst + ox + n, up_clamp4_neon(b, vdupq_laneq_f32(lo, 1),
+                                                     vdupq_laneq_f32(hi, 1)));
+            vst1q_f32(dst + ox + 2 * n, up_clamp4_neon(c, vdupq_laneq_f32(lo, 2),
+                                                         vdupq_laneq_f32(hi, 2)));
+            vst1q_f32(dst + ox + 3 * n, up_clamp4_neon(d, vdupq_laneq_f32(lo, 3),
+                                                         vdupq_laneq_f32(hi, 3)));
         }
     }
 }
@@ -564,11 +583,33 @@ static const float *weights_for(const jxl_image_metadata *meta, uint32_t shift) 
 
 float *jxl_upsample_kernel(jxl_ctx *ctx, uint32_t shift,
                             const jxl_image_metadata *meta) {
-    uint32_t N = 1u << shift;
+    uint32_t N;
+    size_t count;
     float *kernel;
     if (shift == 0 || shift > 3) return NULL;
-    kernel = (float *)jxl_calloc(ctx, (size_t)N * N * 25, sizeof(float));
-    if (kernel) build_kernel(kernel, shift, weights_for(meta, shift));
+    N = 1u << shift;
+    count = (size_t)N * N * 25;
+#ifdef JXL_UPSAMPLE_NEON
+    kernel = (float *)jxl_calloc(ctx, shift > 1 ? count * 2 : count, sizeof(float));
+#else
+    kernel = (float *)jxl_calloc(ctx, count, sizeof(float));
+#endif
+    if (!kernel) return NULL;
+    build_kernel(kernel, shift, weights_for(meta, shift));
+#ifdef JXL_UPSAMPLE_NEON
+    if (shift > 1) {
+        /* Keep the regular weights for scalar edge pixels. Pack the second
+           copy in groups of four phases with contiguous weights per tap. */
+        size_t base;
+        for (base = 0; base < count; base += 4 * 25) {
+            size_t tap, phase;
+            for (tap = 0; tap < 25; tap++)
+                for (phase = 0; phase < 4; phase++)
+                    kernel[count + base + 4 * tap + phase] =
+                        kernel[base + 25 * phase + tap];
+        }
+    }
+#endif
     return kernel;
 }
 
