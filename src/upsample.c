@@ -69,6 +69,9 @@ static void build_kernel(float *kernel, uint32_t shift, const float *w) {
 #include <emmintrin.h>
 #include <immintrin.h>
 #endif
+#if defined(JXL_HAVE_NEON) && !defined(JXL_UPSAMPLE_FORCE_SCALAR)
+#define JXL_UPSAMPLE_NEON 1
+#endif
 
 /* These two run only where up_block4 below cannot: the first two and last
    two columns of a row, the last partial block of a row or column, and any
@@ -503,6 +506,55 @@ static void up_block8(const float *const *srow, uint32_t x, uint32_t N,
 }
 #endif
 
+#ifdef JXL_UPSAMPLE_NEON
+/* Load each tap once per group. The output columns share the loaded values,
+   with the same accumulation order and FP contraction setting as up_dot25. */
+static void up_block4_neon(const float *const *srow, uint32_t x, uint32_t n,
+                           const float *kernel, float *const *dst_rows) {
+    float32x4_t taps[25];
+    float32x4_t lo = vld1q_f32(srow[0] + x - 2), hi = lo;
+    uint32_t oy, ox;
+    int py, px, t = 0;
+
+    for (py = 0; py < 5; py++) {
+        const float *r = srow[py] + x - 2;
+        for (px = 0; px < 5; px++, t++) {
+            float32x4_t v = vld1q_f32(r + px);
+            taps[t] = v;
+            lo = vbslq_f32(vcltq_f32(v, lo), v, lo);
+            hi = vbslq_f32(vcgtq_f32(v, hi), v, hi);
+        }
+    }
+    for (oy = 0; oy < n; oy++) {
+        float *dst = dst_rows[oy] + (size_t)x * n;
+        float32x4_t out[8];
+        for (ox = 0; ox < n; ox++, kernel += 25) {
+            float32x4_t sum = vdupq_n_f32(0.0f);
+            for (t = 0; t < 25; t++)
+                sum += taps[t] * kernel[t];
+            sum = vbslq_f32(vcltq_f32(sum, lo), lo, sum);
+            out[ox] = vbslq_f32(vcgtq_f32(sum, hi), hi, sum);
+        }
+        if (n == 2) {
+            float32x4x2_t pixels = {{out[0], out[1]}};
+            vst2q_f32(dst, pixels);
+        } else if (n == 4) {
+            float32x4x4_t pixels = {{out[0], out[1], out[2], out[3]}};
+            vst4q_f32(dst, pixels);
+        } else {
+            /* Each interleaved store writes two complete 8-wide pixels. */
+            float32x4x4_t lo_pixels = {0}, hi_pixels = {0};
+            for (ox = 0; ox < 4; ox++) {
+                lo_pixels.val[ox] = vzip1q_f32(out[ox], out[ox + 4]);
+                hi_pixels.val[ox] = vzip2q_f32(out[ox], out[ox + 4]);
+            }
+            vst4q_f32(dst, lo_pixels);
+            vst4q_f32(dst + 16, hi_pixels);
+        }
+    }
+}
+#endif
+
 /* Picks the weight set for a shift of 1, 2 or 3. */
 static const float *weights_for(const jxl_image_metadata *meta, uint32_t shift) {
     if (shift == 1) return meta->up2;
@@ -527,6 +579,8 @@ void jxl_upsample_rows(const jxl_fplane *p, uint32_t shift,
     uint32_t w = p->w, h = p->h, x;
 #ifdef JXL_UPSAMPLE_SSE2
     const int use_avx2 = jxl_has_avx2();
+#endif
+#if defined(JXL_UPSAMPLE_SSE2) || defined(JXL_UPSAMPLE_NEON)
     /* Whether this input row's whole N-row output block is inside the
        crop -- the wide paths below all write N full rows. */
     const int y_full = (uint64_t)(y + 1) * N <= out_h;
@@ -547,21 +601,27 @@ void jxl_upsample_rows(const jxl_fplane *p, uint32_t shift,
         int ix;
         int n = 0;
 
-#ifdef JXL_UPSAMPLE_SSE2
+#if defined(JXL_UPSAMPLE_SSE2) || defined(JXL_UPSAMPLE_NEON)
         /* Four (or eight) at a time when they are all interior -- no
            mirroring, so the taps are plain contiguous loads -- and all of
            them write a whole N-wide block inside the crop. The eight-wide
            guard needs four more input samples of margin on the right for
            the last tap, and four more output blocks inside the crop. */
         if (y_full) {
+#ifdef JXL_UPSAMPLE_SSE2
             if (use_avx2 && x >= 2 && x + 10 <= w &&
                 (uint64_t)(x + 8) * N <= out_w) {
                 up_block8(srow, x, N, kernel, drows, N);
                 x += 8;
                 continue;
             }
+#endif
             if (x >= 2 && x + 6 <= w && (uint64_t)(x + 4) * N <= out_w) {
+#ifdef JXL_UPSAMPLE_NEON
+                up_block4_neon(srow, x, N, kernel, drows);
+#else
                 up_block4(srow, x, N, kernel, drows, N);
+#endif
                 x += 4;
                 continue;
             }

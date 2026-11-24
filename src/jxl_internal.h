@@ -84,6 +84,12 @@ int jxl_has_avx2(void);
    fp-contract pass from changing the arithmetic in the other AVX2 paths. */
 int jxl_has_avx2_fma(void);
 
+/* AArch64 Advanced SIMD with vector floating-point division. */
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(JXL_NO_NEON)
+#define JXL_HAVE_NEON 1
+#include <arm_neon.h>
+#endif
+
 /* AVX2 kernels sit beside their SSE2 twins in the same translation unit so
    the dist/ amalgamation stays one file. MSVC needs nothing; clang and gcc
    need the target attribute per function. */

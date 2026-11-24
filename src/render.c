@@ -80,6 +80,53 @@ static uint32_t quantize(float v, uint32_t maxval) {
     return (uint32_t)s;
 }
 
+#if defined(JXL_HAVE_NEON) && !defined(JXL_RENDER_FORCE_SCALAR)
+#define JXL_RENDER_NEON 1
+
+static inline uint16x4_t quantize4_neon(const float *p) {
+    float32x4_t s = vld1q_f32(p) * 255.0f + 0.5f;
+    /* Clamp NaN and negative input to zero, then saturate positive input. */
+    s = vmaxnmq_f32(s, vdupq_n_f32(0.0f));
+    return vmovn_u32(vcvtq_u32_f32(vminnmq_f32(s, vdupq_n_f32(255.0f))));
+}
+
+static inline uint8x8_t quantize8_neon(const float *p, int reverse) {
+    uint16x8_t samples = vcombine_u16(quantize4_neon(p), quantize4_neon(p + 4));
+    uint8x8_t v = vmovn_u16(samples);
+    return reverse ? vrev64_u8(v) : v;
+}
+
+static JXL_INLINE_HINT uint32_t write_row8_neon(
+    const float *r, const float *g, const float *b, const float *a,
+    uint8_t *dst, uint32_t w, int ncomp, int reverse) {
+    uint32_t x;
+    for (x = 0; x + 8 <= w; x += 8) {
+        uint32_t sx = reverse ? w - x - 8 : x;
+        uint8x8_t rv = quantize8_neon(r + sx, reverse);
+        uint8x8_t av = vdup_n_u8(255);
+        if ((ncomp == 2 || ncomp == 4) && a)
+            av = quantize8_neon(a + sx, reverse);
+        if (ncomp == 1) {
+            vst1_u8(dst + x, rv);
+        } else if (ncomp == 2) {
+            uint8x8x2_t pixels = {{rv, av}};
+            vst2_u8(dst + (size_t)x * 2, pixels);
+        } else {
+            uint8x8_t gv = quantize8_neon(g + sx, reverse);
+            uint8x8_t bv = quantize8_neon(b + sx, reverse);
+            if (ncomp == 3) {
+                uint8x8x3_t pixels = {{rv, gv, bv}};
+                vst3_u8(dst + (size_t)x * 3, pixels);
+            } else {
+                uint8x8x4_t pixels = {{rv, gv, bv, av}};
+                vst4_u8(dst + (size_t)x * 4, pixels);
+            }
+        }
+    }
+    return x;
+}
+#endif
+
 /* SSE2 is baseline on x64. Quantization is vectorised for all formats, and
    the common RGB24/RGBA32 cases pack four complete pixels at once. Strided
    orientations gather four samples before doing the same SIMD arithmetic.
@@ -645,6 +692,20 @@ static int write_pixels(jxl_ctx *ctx, jxl_doc *doc, jxl_fimage *img,
             }
         }
         ox = 0;
+#ifdef JXL_RENDER_NEON
+        if (direct && !wide && !transposed) {
+            const float *first = !gray && bgr ? pb : pr;
+            const float *third = bgr ? pr : pb;
+            if (ncomp == 1)
+                ox = write_row8_neon(first, pg, third, pa, row8, ow, 1, reverse_x);
+            else if (ncomp == 2)
+                ox = write_row8_neon(first, pg, third, pa, row8, ow, 2, reverse_x);
+            else if (ncomp == 3)
+                ox = write_row8_neon(first, pg, third, pa, row8, ow, 3, reverse_x);
+            else
+                ox = write_row8_neon(first, pg, third, pa, row8, ow, 4, reverse_x);
+        }
+#endif
 #ifdef JXL_RENDER_SSE2
         /* Quantise four pixels' worth of each plane up front; the store loop
            below reads those results instead of calling quantize(). Horizontal

@@ -125,6 +125,49 @@ found. The tool was called `samply` until it was renamed, so log entries
 below that date the rename refer to it by the old name; the invocation and
 the report format are the same.
 
+### Apple Silicon NEON
+
+Xcode Instruments Time Profiler (`xcrun xctrace`) sampled repeated decodes on
+an Apple M3 Pro. In the scalar `flower.v_d1` trace, EPF accounted for 26%
+of CPU samples and DCT for 27%, including its row and column dispatch.
+Upsampling accounted for 66% on `flower.v_rs4`. Output writing and
+quantization accounted for 18% on the lossless `flower.m_e1`.
+
+The ARM64 build now uses NEON for EPF interiors, both DCT passes, 2x/4x/8x
+upsampling, sRGB encoding, and ordered 8-bit output rows. NEON interleaved
+stores pack RGB and alpha directly. The vector floating-point expressions
+follow the scalar operation order and compiler contraction setting.
+Build with `-DJXL_NO_NEON` to compare against the ARM64 scalar paths.
+
+The table reports wall time per decode on the M3 Pro with Apple Clang 21
+at `-O3`, measured before the TOC reader and HLG changes in `c658ed2`.
+Each result is the median of seven runs per executable after
+warmup, alternating scalar and NEON order. Each run opens the input once
+and decodes it repeatedly through `test/jxl_prof.c`.
+
+| Input | Scalar | NEON | Speedup |
+|---|---:|---:|---:|
+| `flower.v_d1` | 184.77 ms | 93.81 ms | 1.97x |
+| `flower.v_rs2` | 145.62 ms | 55.33 ms | 2.63x |
+| `flower.v_rs4` | 99.96 ms | 32.38 ms | 3.09x |
+| `flower.m_e1` | 71.20 ms | 60.27 ms | 1.18x |
+| `flower.v_d1 -bgra` | 180.18 ms | 89.84 ms | 2.01x |
+| `flower_small.rgba.v_d1 -bgra` | 34.22 ms | 27.30 ms | 1.25x |
+
+In the follow-up trace for `flower.v_d1`, EPF accounted for 15% of CPU
+samples and DCT for 16%. On `flower.m_e1`, the output and quantization
+functions accounted for 4% and entropy decoding dominated. Upsampling
+remained the largest stage on `flower.v_rs4` at 57% of samples.
+
+After applying the NEON changes over `c658ed2`, the 1,289 first-frame
+outputs were byte-identical to the ARM64 scalar build, including an extra
+8x-resampled image. Against `djxl`, 395 were byte-exact and 889 were
+within tolerance with a worst peak of one 8-bit step.
+The first-frame checker skipped five inputs. A macOS build of
+`test/jxl_ref.c` verified every frame of the 27 conformance inputs and
+both gray spot-colour fixtures. The macOS fuzz regression replay passed
+all 237 inputs.
+
 ### Scanned pages: row-interleaved EPF and a flat-neighbourhood WP shortcut
 Driven by two 143-page comic archives from SumatraPDF issue 6245, 3072x4096
 each: one lossless 8-bit gray (Modular, palette + weighted predictor), one

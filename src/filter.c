@@ -227,6 +227,54 @@ static const int8_t epf_dist_2[1][2] = {{0,0}};
    compile-time constant and instantiated twice through a force-inlined
    wrapper, so the three-channel path compiles to what it was. */
 #define JXL_EPF_NCH(gray) ((gray) ? 1 : 3)
+#if defined(JXL_HAVE_NEON) && !defined(JXL_EPF_FORCE_SCALAR)
+#define JXL_EPF_NEON 1
+
+/* Four interior samples share sigma and have the same relative tap offsets.
+   The caller specializes the tap counts and channel count for each pass.
+   Vector multiply-add expressions follow the scalar contraction setting. */
+static JXL_INLINE_HINT void epf_quad_neon(
+    float *in[3], float *out[3], size_t offset, const ptrdiff_t *koff,
+    const ptrdiff_t *doff, int nkernel, int ndist, const float cscale[3],
+    float32x4_t nis, int gray) {
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    float32x4_t center[3][5], sum[3], weights = one;
+    int c, d, k;
+
+    for (c = 0; c < JXL_EPF_NCH(gray); c++) {
+        const float *p = in[c] + offset;
+        sum[c] = vld1q_f32(p);
+        for (d = 0; d < ndist; d++) center[c][d] = vld1q_f32(p + doff[d]);
+    }
+    for (k = 0; k < nkernel; k++) {
+        float32x4_t dist = zero, tap[3];
+        float32x4_t weight;
+        for (c = 0; c < JXL_EPF_NCH(gray); c++) {
+            const float *p = in[c] + offset + koff[k];
+            float32x4_t sad = zero;
+            for (d = 0; d < ndist; d++) {
+                float32x4_t diff = vabdq_f32(vld1q_f32(p + doff[d]), center[c][d]);
+                sad = vaddq_f32(sad, diff);
+            }
+            dist += sad * cscale[c];
+            if (gray) {
+                dist += sad * cscale[1];
+                dist += sad * cscale[2];
+            }
+            tap[c] = vld1q_f32(p);
+        }
+        weight = vmaxq_f32(one + dist * nis, zero);
+        weights = vaddq_f32(weights, weight);
+        for (c = 0; c < JXL_EPF_NCH(gray); c++)
+            sum[c] += weight * tap[c];
+    }
+    weights = vdivq_f32(one, weights);
+    for (c = 0; c < JXL_EPF_NCH(gray); c++)
+        vst1q_f32(out[c] + offset, vmulq_f32(sum[c], weights));
+}
+#endif
+
 #ifdef JXL_EPF_SSE2
 /* epf_pass, eight samples at a time. This is the densest arithmetic in the
    decoder -- step 0 is 12 kernel taps x 5 SAD offsets x 3 channels per
@@ -1143,6 +1191,34 @@ static JXL_INLINE_HINT int epf_pass_impl(
                 sw = _mm_div_ps(_mm_set1_ps(1.0f), sw);
                 for (c = 0; c < JXL_EPF_NCH(gray); c++) {
                     _mm_storeu_ps(out[c] + row + x, _mm_mul_ps(sum4[c], sw));
+                }
+                x += 4;
+                continue;
+            }
+#endif
+#ifdef JXL_EPF_NEON
+            if (y_inside && (x & 3u) == 0 &&
+                x >= (uint32_t)pad && x + 3 + (uint32_t)pad < w) {
+                if (sigma_val != 0.0f) {
+                    float32x4_t sm = vdupq_n_f32(step_mul);
+                    float32x4_t nis;
+                    if (is_y_border) sm = vdupq_n_f32(border_mul);
+                    else if (x & 4u) sm = vsetq_lane_f32(border_mul, sm, 3);
+                    else sm = vsetq_lane_f32(border_mul, sm, 0);
+                    nis = vmulq_n_f32(sm, sigma_val);
+                    if (step == 0)
+                        epf_quad_neon(in, out, row + x, koff, doff, 12, 5,
+                                      cscale, nis, gray);
+                    else if (step == 1)
+                        epf_quad_neon(in, out, row + x, koff, doff, 4, 5,
+                                      cscale, nis, gray);
+                    else
+                        epf_quad_neon(in, out, row + x, koff, doff, 4, 1,
+                                      cscale, nis, gray);
+                } else if (copy_row[x / 8]) {
+                    for (c = 0; c < JXL_EPF_NCH(gray); c++)
+                        memcpy(out[c] + row + x, in[c] + row + x,
+                               4 * sizeof(float));
                 }
                 x += 4;
                 continue;

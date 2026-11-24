@@ -24,6 +24,9 @@
 #include <emmintrin.h>
 #include <immintrin.h>
 #endif
+#if defined(JXL_HAVE_NEON) && !defined(JXL_COLOR_FORCE_SCALAR)
+#define JXL_COLOR_NEON 1
+#endif
 
 #ifdef JXL_COLOR_SSE2
 JXL_TARGET_AVX2
@@ -202,6 +205,41 @@ static float tf_srgb(float s) {
     out = (fv <= 0.0031308f) ? small : acc;
     return bits_to_float(float_to_bits(out) | sign);
 }
+
+#ifdef JXL_COLOR_NEON
+static size_t tf_srgb_neon(float *v, size_t n) {
+    const uint8x16_t upper = vld1q_u8(srgb_powtable_upper);
+    const uint8x16_t lower = vld1q_u8(srgb_powtable_lower);
+    size_t i;
+    for (i = 0; i + 4 <= n; i += 4) {
+        uint32x4_t bits = vreinterpretq_u32_f32(vld1q_f32(v + i));
+        uint32x4_t sign = vandq_u32(bits, vdupq_n_u32(0x80000000u));
+        uint32x4_t mag = veorq_u32(bits, sign);
+        float32x4_t f = vreinterpretq_f32_u32(mag);
+        float32x4_t adj = vreinterpretq_f32_u32(vandq_u32(
+            vorrq_u32(mag, vdupq_n_u32(0x3e800000u)), vdupq_n_u32(0x3effffffu)));
+        float32x4_t p;
+        uint32x4_t index = vandq_u32(vsubq_u32(vshrq_n_u32(mag, 23),
+                                            vdupq_n_u32(118)), vdupq_n_u32(15));
+        /* TBL returns zero for the three out-of-range bytes in each lane. */
+        uint8x16_t lookup = vreinterpretq_u8_u32(
+            vorrq_u32(index, vdupq_n_u32(0x80808000u)));
+        uint32x4_t hi = vreinterpretq_u32_u8(vqtbl1q_u8(upper, lookup));
+        uint32x4_t lo = vreinterpretq_u32_u8(vqtbl1q_u8(lower, lookup));
+        uint32x4_t mul = vorrq_u32(vdupq_n_u32(0x40000000u),
+                                  vorrq_u32(vshlq_n_u32(hi, 18), vshlq_n_u32(lo, 10)));
+        p = adj * 0.059914046f - 0.10889456f;
+        p = p * adj + 0.107963754f;
+        p = p * adj + 0.018092343f;
+        p = p * vreinterpretq_f32_u32(mul) - 0.055f;
+        p = vbslq_f32(vcleq_f32(f, vdupq_n_f32(0.0031308f)),
+                      vmulq_n_f32(f, 12.92f), p);
+        vst1q_f32(v + i, vreinterpretq_f32_u32(
+            vorrq_u32(vreinterpretq_u32_f32(p), sign)));
+    }
+    return i;
+}
+#endif
 
 /* pow(x, 0.45) for the BT.709 curve, as exp2(0.45 * log2(x)).
  *
@@ -821,6 +859,8 @@ void jxl_linear_to_tf(float *v, size_t n, const jxl_colour_encoding *enc,
             if (jxl_has_avx2()) tf_srgb_x8(v, n, &i);
 #endif
             tf_srgb_x4(v, n, &i);
+#elif defined(JXL_COLOR_NEON)
+            i = tf_srgb_neon(v, n);
 #endif
             for (; i < n; i++) v[i] = tf_srgb(v[i]);
             break;
